@@ -1,0 +1,58 @@
+# claude-toolkit
+
+Personal Claude Code toolset — the `ralph` fresh-context implementation loop, plus the
+slash commands built around it. Bundled so it's a one-command setup on any machine
+(new laptop, an interview machine, a fresh sandbox), not a pile of dotfiles to remember.
+
+## What's in here
+
+- **`bin/ralph`** — fresh-context implementation loop against a `SPEC.md` checklist.
+  Every attempt is a genuinely fresh `claude -p` call; git history is the only memory
+  between attempts. See `ralph --help` once installed.
+- **`commands/ralph-spec.md`** — `/ralph-spec`, generates the `SPEC.md` checklist `ralph`
+  consumes, from a feature description or an existing plan doc.
+- **`commands/tdd-audit.md`** — `/tdd-audit`, diagnoses existing test coverage and
+  conventions for a target before any planning happens.
+- **`commands/tdd-plan.md`** — `/tdd-plan`, builds a test-case checklist (baseline: nulls,
+  empty collections, boundary values, error paths, plus code-specific cases) and stops
+  for approval before any test code is written.
+- **`commands/tdd-generate.md`** — `/tdd-generate`, writes and runs the tests for an
+  approved `/tdd-plan` checklist. Deliberately does not automate "break the implementation
+  to prove the tests catch it" — that's left as a manual, live step by design.
+
+`/tdd-audit` → `/tdd-plan` → `/tdd-generate` are meant to be run in that order, in the same
+conversation, on live/attended code review — unlike `ralph`, which runs unattended.
+
+## Prerequisites
+
+- `git` (all four commands rely on it — `ralph` for its inter-attempt memory, the others
+  for detecting existing conventions)
+- The `claude` CLI (Claude Code) installed and on `PATH`
+- `bash`
+
+## Install
+
+```sh
+git clone <this-repo-url> ~/claude-toolkit   # or wherever
+cd ~/claude-toolkit
+./install.sh
+```
+
+Copies `bin/ralph` to `~/.local/bin/ralph` and each `commands/*.md` to
+`~/.claude/commands/`. Safe to re-run.
+
+## Update
+
+```sh
+cd ~/claude-toolkit
+git pull
+./install.sh
+```
+
+## Uninstall
+
+```sh
+rm ~/.local/bin/ralph
+rm ~/.claude/commands/ralph-spec.md ~/.claude/commands/tdd-audit.md \
+   ~/.claude/commands/tdd-plan.md ~/.claude/commands/tdd-generate.md
+```

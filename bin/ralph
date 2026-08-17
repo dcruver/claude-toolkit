@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# ralph — fresh-context implementation loop against a spec.
+#
+# Unlike continuity-based loops (e.g. the Ralph Wiggum plugin), every
+# attempt is a genuinely fresh `claude -p` call with zero conversational
+# memory. Since nothing carries over, ALL state that matters must live on
+# disk — the spec's checklist, git history, and test results are the only
+# memory a fresh attempt has.
+#
+# Control flow: for each checklist item, retry it (fresh context each time)
+# up to --max-attempts times, checking success by whether tests pass and
+# the item gets checked off. Succeed -> advance to the next item. Exhaust
+# attempts without success -> stop the whole run for human review; a task
+# that fresh-context retries can't crack needs a person, not another retry.
+#
+# Usage: ralph [--spec SPEC.md] [--max-attempts N] [--items N] [--review-gate full|light|none] [--model MODEL]
+#   --max-attempts N   retries allowed on a SINGLE item before giving up on it (default 3)
+#   --items N          how many items to complete this run before stopping and
+#                       returning control (default: unlimited — run to completion).
+#                       Use --items 1 to pair on one item at a time: review what
+#                       happened, then re-invoke for the next.
+#   --review-gate MODE what an attempt must clear, beyond tests, before an item
+#                       can be checked off (default: full):
+#                         full  - all four /review-team roles (correctness,
+#                                 security, performance, style), adversarially
+#                                 verified. Any surviving finding blocks.
+#                         light - correctness + security only, still
+#                                 adversarially verified. Cheaper, less coverage.
+#                         none  - tests-only gate (no review-team involvement).
+#                       ponytail-audit-style opinions never gate, in any mode —
+#                       they're informational, same as in /review-team itself.
+#
+# Relies on --permission-mode auto being valid in your environment (verified
+# via `claude --help` at write time) — headless -p calls can't answer
+# interactive prompts, so this is passed explicitly rather than assumed.
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+ralph — fresh-context implementation loop against a spec
+
+Every attempt is a genuinely fresh `claude -p` call with zero conversational
+memory. All state that matters lives on disk: the spec's checklist, git
+history, and test results. For each checklist item, ralph retries it (fresh
+context each time) until it passes, then advances to the next item.
+
+Usage: ralph [options]
+
+Options:
+  --spec FILE            Checklist spec to work from (default: SPEC.md)
+  --max-attempts N        Retries allowed on a SINGLE item before giving up
+                          on it and stopping for human review (default: 3)
+  --items N               How many items to complete this run before
+                          stopping and returning control (default:
+                          unlimited — run to completion). Use --items 1 to
+                          pair on one item at a time.
+  --review-gate MODE      What an attempt must clear, beyond tests, before
+                          an item can be checked off (default: full):
+                            full   all four /review-team roles
+                                   (correctness, security, performance,
+                                   style), adversarially verified. Any
+                                   surviving finding blocks.
+                            light  correctness + security only, still
+                                   adversarially verified.
+                            none   tests-only gate, no review-team.
+                          ponytail-audit-style opinions never gate, in any
+                          mode — informational only, same as /review-team.
+  --model MODEL           Model to use for each attempt (default: unset,
+                          inherits claude's own default)
+  -h, --help              Show this help and exit
+
+Requires a git repo (run /onboard or git init first) — git history is the
+only memory a fresh attempt has of what came before it.
+
+Progress: .ralph/run.log (one line per attempt), .ralph/logs/item-NNN-attempt-N.log
+(full transcript per attempt).
+EOF
+}
+
+SPEC="SPEC.md"
+MAX_ATTEMPTS=3
+ITEMS_LIMIT=0   # 0 = unlimited
+MODEL=""
+REVIEW_GATE="full"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --spec) SPEC="$2"; shift 2 ;;
+    --max-attempts) MAX_ATTEMPTS="$2"; shift 2 ;;
+    --items) ITEMS_LIMIT="$2"; shift 2 ;;
+    --review-gate) REVIEW_GATE="$2"; shift 2 ;;
+    --model) MODEL="$2"; shift 2 ;;
+    *) echo "ralph: unknown flag: $1" >&2; usage >&2; exit 1 ;;
+  esac
+done
+
+case "$REVIEW_GATE" in
+  full|light|none) ;;
+  *) echo "ralph: --review-gate must be full, light, or none (got: $REVIEW_GATE)" >&2; exit 1 ;;
+esac
+
+if [[ ! -f "$SPEC" ]]; then
+  echo "ralph: $SPEC not found. Write a checklist spec first (one '- [ ] task' per item). See 'ralph --help'." >&2
+  exit 1
+fi
+
+if ! git rev-parse --git-dir > /dev/null 2>&1; then
+  echo "ralph: not a git repo. Run /onboard or git init first — ralph relies on git history as memory between attempts." >&2
+  exit 1
+fi
+
+mkdir -p .ralph/logs
+RUN_LOG=".ralph/run.log"
+
+remaining_items() {
+  grep -cE '^[[:space:]]*-[[:space:]]\[[[:space:]]\]' "$SPEC" 2>/dev/null || true
+}
+next_item_text() {
+  grep -m 1 -E '^[[:space:]]*-[[:space:]]\[[[:space:]]\]' "$SPEC" | sed -E 's/^[[:space:]]*-[[:space:]]\[[[:space:]]\][[:space:]]*//'
+}
+
+MODEL_FLAG=()
+[[ -n "$MODEL" ]] && MODEL_FLAG=(--model "$MODEL")
+
+echo "ralph: starting. $(remaining_items) unchecked item(s) in $SPEC." | tee -a "$RUN_LOG"
+
+ITEMS_DONE=0
+while true; do
+  REMAINING=$(remaining_items)
+  if [[ "$REMAINING" -eq 0 ]]; then
+    echo "ralph: no unchecked items remain in $SPEC. Done." | tee -a "$RUN_LOG"
+    exit 0
+  fi
+  if [[ "$ITEMS_LIMIT" -gt 0 && "$ITEMS_DONE" -ge "$ITEMS_LIMIT" ]]; then
+    echo "ralph: completed $ITEMS_DONE item(s) as requested (--items $ITEMS_LIMIT). $REMAINING item(s) still remain — re-invoke to continue." | tee -a "$RUN_LOG"
+    exit 0
+  fi
+
+  ITEM_TEXT=$(next_item_text)
+  echo "ralph: next item — \"$ITEM_TEXT\"" | tee -a "$RUN_LOG"
+
+  case "$REVIEW_GATE" in
+    full)
+      REVIEW_STEP="4. Tests passing is necessary but not sufficient. Run \`/review-team roles=correctness,security,performance,style audit=false\` on your changes (its adversarial verification is what makes a finding count — don't skip that part). If any finding survives, fix it, re-run tests, and re-review, all within this same attempt if you can. Only once review comes back with no surviving findings do you move to step 5."
+      ;;
+    light)
+      REVIEW_STEP="4. Tests passing is necessary but not sufficient. Run \`/review-team roles=correctness,security audit=false\` on your changes (its adversarial verification is what makes a finding count — don't skip that part). If any finding survives, fix it, re-run tests, and re-review, all within this same attempt if you can. Only once review comes back with no surviving findings do you move to step 5."
+      ;;
+    none)
+      REVIEW_STEP="4. (No review gate configured — tests passing alone is sufficient. Move to step 5.)"
+      ;;
+  esac
+
+  ITEM_SUCCEEDED=false
+  for ((attempt=1; attempt<=MAX_ATTEMPTS; attempt++)); do
+    BEFORE_SHA=$(git rev-parse HEAD)
+    LOG_FILE=".ralph/logs/item-$(printf '%03d' $((ITEMS_DONE+1)))-attempt-$attempt.log"
+
+    PROMPT="You are one fresh-context attempt at a single task from $SPEC. You have NO memory of previous attempts — everything you need is in this repository's current state.
+
+TASK: $ITEM_TEXT
+
+1. Read \`git log --oneline -20\` — if a prior attempt on this exact task left partial work or a note, pick up from there instead of starting over blind.
+2. Implement (or continue/fix) this task completely, including tests.
+3. Run the test suite. If it doesn't pass, that's your only job this attempt — get it passing, or if you can't, skip to step 5.
+$REVIEW_STEP
+5. If everything in steps 3-4 that applies is clean: check off this item in $SPEC (change its '- [ ] $ITEM_TEXT' to '- [x] $ITEM_TEXT'), and commit everything with a specific message.
+6. If it does NOT pass after your best effort this attempt: commit whatever partial progress is safe to commit, with a clear message describing exactly what you tried, what's still failing (test failures or unresolved review findings), so the next attempt isn't starting from zero. Do NOT check off the item.
+
+Work on ONLY this task. Do not start any other item, do not refactor unrelated code."
+
+    claude -p "$PROMPT" --permission-mode auto "${MODEL_FLAG[@]}" > "$LOG_FILE" 2>&1 || true
+
+    AFTER_SHA=$(git rev-parse HEAD)
+    NEW_REMAINING=$(remaining_items)
+
+    if [[ "$NEW_REMAINING" -lt "$REMAINING" ]]; then
+      echo "ralph: item done on attempt $attempt/$MAX_ATTEMPTS — $(git log -1 --format='%h %s')" | tee -a "$RUN_LOG"
+      ITEM_SUCCEEDED=true
+      ITEMS_DONE=$((ITEMS_DONE + 1))
+      break
+    elif [[ "$BEFORE_SHA" == "$AFTER_SHA" ]]; then
+      echo "ralph: attempt $attempt/$MAX_ATTEMPTS made no commit at all. See $LOG_FILE." | tee -a "$RUN_LOG"
+    else
+      echo "ralph: attempt $attempt/$MAX_ATTEMPTS committed partial progress, item not yet passing. See $LOG_FILE." | tee -a "$RUN_LOG"
+    fi
+  done
+
+  if [[ "$ITEM_SUCCEEDED" != "true" ]]; then
+    echo "ralph: exhausted $MAX_ATTEMPTS attempts on \"$ITEM_TEXT\" without success — stopping for human review. Check $SPEC's notes and the .ralph/logs/item-$(printf '%03d' $((ITEMS_DONE+1)))-attempt-*.log files." | tee -a "$RUN_LOG"
+    exit 2
+  fi
+done
