@@ -37,4 +37,4 @@ esac
 
 echo
 echo "Done. Verify with: ralph --help"
-echo "And in Claude Code: /ralph-spec, /tdd-audit, /tdd-plan, /tdd-generate should now be available."
+echo "And in Claude Code: /onboard, /ralph-spec, /tdd-audit, /tdd-plan, /tdd-generate, /adversarial-pair should now be available."

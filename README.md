@@ -22,6 +22,11 @@ slash commands built around it. Bundled so it's a one-command setup on any machi
 - **`commands/tdd-generate.md`** — `/tdd-generate`, writes and runs the tests for an
   approved `/tdd-plan` checklist. Deliberately does not automate "break the implementation
   to prove the tests catch it" — that's left as a manual, live step by design.
+- **`commands/adversarial-pair.md`** — `/adversarial-pair`, designs and launches a
+  producer-vs-critic(s) `Workflow`: one artifact against a critic panel, or many
+  independent items each in its own isolated loop (so cross-item anchoring/bleed-through
+  can't bias the result), iterating until approved or rounds run out. No git dependency —
+  unlike `ralph`, it doesn't mutate a shared codebase, so it works on plain documents too.
 
 `/tdd-audit` → `/tdd-plan` → `/tdd-generate` are meant to be run in that order, in the same
 conversation, on live/attended code review — unlike `ralph`, which runs unattended.
@@ -30,8 +35,9 @@ clone, an interview machine, a repo with no `CLAUDE.md` yet).
 
 ## Prerequisites
 
-- `git` (every command relies on it — `ralph` for its inter-attempt memory, `onboard` for
-  its baseline commit, the rest for detecting existing conventions)
+- `git` (every command except `/adversarial-pair` relies on it — `ralph` for its
+  inter-attempt memory, `onboard` for its baseline commit, the tdd-* commands for
+  detecting existing conventions)
 - The `claude` CLI (Claude Code) installed and on `PATH`
 - `bash`
 
@@ -60,5 +66,5 @@ git pull
 rm ~/.local/bin/ralph
 rm ~/.claude/commands/onboard.md ~/.claude/commands/ralph-spec.md \
    ~/.claude/commands/tdd-audit.md ~/.claude/commands/tdd-plan.md \
-   ~/.claude/commands/tdd-generate.md
+   ~/.claude/commands/tdd-generate.md ~/.claude/commands/adversarial-pair.md
 ```
