@@ -6,6 +6,9 @@ slash commands built around it. Bundled so it's a one-command setup on any machi
 
 ## What's in here
 
+- **`commands/onboard.md`** — `/onboard`, first contact with unfamiliar code: git baseline,
+  `CLAUDE.md` generated from a real scan (never guessed commands/conventions), and a
+  verified build/run of the untouched baseline. Stops before any planning or editing.
 - **`bin/ralph`** — fresh-context implementation loop against a `SPEC.md` checklist.
   Every attempt is a genuinely fresh `claude -p` call; git history is the only memory
   between attempts. See `ralph --help` once installed.
@@ -22,11 +25,13 @@ slash commands built around it. Bundled so it's a one-command setup on any machi
 
 `/tdd-audit` → `/tdd-plan` → `/tdd-generate` are meant to be run in that order, in the same
 conversation, on live/attended code review — unlike `ralph`, which runs unattended.
+`/onboard` is the natural step before any of them when the code is unfamiliar (a fresh
+clone, an interview machine, a repo with no `CLAUDE.md` yet).
 
 ## Prerequisites
 
-- `git` (all four commands rely on it — `ralph` for its inter-attempt memory, the others
-  for detecting existing conventions)
+- `git` (every command relies on it — `ralph` for its inter-attempt memory, `onboard` for
+  its baseline commit, the rest for detecting existing conventions)
 - The `claude` CLI (Claude Code) installed and on `PATH`
 - `bash`
 
@@ -53,6 +58,7 @@ git pull
 
 ```sh
 rm ~/.local/bin/ralph
-rm ~/.claude/commands/ralph-spec.md ~/.claude/commands/tdd-audit.md \
-   ~/.claude/commands/tdd-plan.md ~/.claude/commands/tdd-generate.md
+rm ~/.claude/commands/onboard.md ~/.claude/commands/ralph-spec.md \
+   ~/.claude/commands/tdd-audit.md ~/.claude/commands/tdd-plan.md \
+   ~/.claude/commands/tdd-generate.md
 ```
