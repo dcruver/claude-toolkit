@@ -27,11 +27,30 @@ slash commands built around it. Bundled so it's a one-command setup on any machi
   independent items each in its own isolated loop (so cross-item anchoring/bleed-through
   can't bias the result), iterating until approved or rounds run out. No git dependency —
   unlike `ralph`, it doesn't mutate a shared codebase, so it works on plain documents too.
+- **`commands/clarify.md`** — `/clarify`, restates the ask, surfaces constraints and
+  edge cases, and states assumptions out loud *before* any code gets written. No code in
+  its own output — clarification only.
+- **`commands/explain.md`** — `/explain`, narrates a completed change in plain,
+  spoken-out-loud language (what it does, why this approach, anything non-obvious) in
+  under 30 seconds. For explaining a diff to someone watching, not for documentation.
+- **`commands/critique.md`** — `/critique`, an opinionated keep/change/why review of a
+  just-made (often AI-generated) change, ending in a ship/fix/redo call. Single inline
+  turn, sized for immediately after a diff — not a launched job like `/adversarial-pair`.
+- **`commands/tighten.md`** — `/tighten`, proposes concrete surgical hand-edits (exact
+  lines, replacement, reason) to tighten a diff that's more generic or verbose than the
+  moment calls for — several small edits a human could type by hand, not a regeneration.
 
 `/tdd-audit` → `/tdd-plan` → `/tdd-generate` are meant to be run in that order, in the same
 conversation, on live/attended code review — unlike `ralph`, which runs unattended.
 `/onboard` is the natural step before any of them when the code is unfamiliar (a fresh
 clone, an interview machine, a repo with no `CLAUDE.md` yet).
+
+`/clarify` → (make the change) → `/explain` → `/critique` → `/tighten` is a lighter,
+faster loop than the `/tdd-*` pipeline — built for live/spoken narration (e.g. a
+pair-programming interview) rather than formal, approval-gated test planning. Reach for
+`/testcases`-style coverage via `/tdd-plan` instead when you have time for the full
+`/tdd-audit` → `/tdd-plan` ceremony; use `/clarify`/`/explain`/`/critique`/`/tighten` when
+you don't.
 
 ## Prerequisites
 
@@ -66,5 +85,7 @@ git pull
 rm ~/.local/bin/ralph
 rm ~/.claude/commands/onboard.md ~/.claude/commands/ralph-spec.md \
    ~/.claude/commands/tdd-audit.md ~/.claude/commands/tdd-plan.md \
-   ~/.claude/commands/tdd-generate.md ~/.claude/commands/adversarial-pair.md
+   ~/.claude/commands/tdd-generate.md ~/.claude/commands/adversarial-pair.md \
+   ~/.claude/commands/clarify.md ~/.claude/commands/explain.md \
+   ~/.claude/commands/critique.md ~/.claude/commands/tighten.md
 ```
