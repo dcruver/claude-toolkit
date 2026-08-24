@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker compose ps *)",
+      "Bash(docker compose logs *)",
+      "Bash(docker compose config *)",
+      "Bash(ss *)",
+      "Bash(du *)",
+      "Bash(git rev-list *)",
+      "Bash(git check-ignore *)",
+      "Bash(kubectl get *)",
+      "Bash(kubectl kustomize *)"
+    ]
+  }
+}

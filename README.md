@@ -39,6 +39,11 @@ slash commands built around it. Bundled so it's a one-command setup on any machi
 - **`commands/tighten.md`** — `/tighten`, proposes concrete surgical hand-edits (exact
   lines, replacement, reason) to tighten a diff that's more generic or verbose than the
   moment calls for — several small edits a human could type by hand, not a regeneration.
+- **`permissions.json`** — a generic, client-agnostic read-only allowlist (`docker
+  compose ps/logs/config`, `ss`, `du`, `git rev-list`, `git check-ignore`, `kubectl
+  get`/`kustomize`) that `install.sh` merges into `~/.claude/settings.json`'s
+  `permissions.allow` so these don't stop and ask on every new machine. Not a slash
+  command — see **Permissions** below.
 
 `/tdd-audit` → `/tdd-plan` → `/tdd-generate` are meant to be run in that order, in the same
 conversation, on live/attended code review — unlike `ralph`, which runs unattended.
@@ -59,6 +64,9 @@ you don't.
   detecting existing conventions)
 - The `claude` CLI (Claude Code) installed and on `PATH`
 - `bash`
+- `jq`, optional — only used to merge `permissions.json` into `~/.claude/settings.json`;
+  `install.sh` skips that step and warns (printing the entries to add by hand) if `jq`
+  isn't found. Everything else installs regardless.
 
 ## Install
 
@@ -68,8 +76,18 @@ cd ~/claude-toolkit
 ./install.sh
 ```
 
-Copies `bin/ralph` to `~/.local/bin/ralph` and each `commands/*.md` to
-`~/.claude/commands/`. Safe to re-run.
+Copies `bin/ralph` to `~/.local/bin/ralph`, each `commands/*.md` to
+`~/.claude/commands/`, and merges `permissions.json` into `~/.claude/settings.json`
+(see **Permissions** below). Safe to re-run.
+
+## Permissions
+
+`install.sh` unions `permissions.json`'s `permissions.allow` entries into
+`~/.claude/settings.json`, deduped, via `jq`. It only ever adds to that array — it never
+removes an entry, and it never touches any other key in `settings.json` (`model`,
+`theme`, MCP tool permissions, `autoMode` context, etc.), so machine-specific settings
+already there are left alone. Safe to re-run; re-running never produces duplicates.
+If `~/.claude/settings.json` doesn't exist yet, it's created.
 
 ## Update
 

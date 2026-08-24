@@ -21,6 +21,28 @@ for f in "$TOOLKIT_DIR"/commands/*.md; do
 done
 
 echo
+SETTINGS_FILE="$HOME/.claude/settings.json"
+PERMISSIONS_FILE="$TOOLKIT_DIR/permissions.json"
+if command -v jq > /dev/null 2>&1; then
+  [ -f "$SETTINGS_FILE" ] || echo '{}' > "$SETTINGS_FILE"
+  TMP_SETTINGS="$(mktemp)"
+  # Union this toolkit's generic read-only allowlist into settings.json's
+  # permissions.allow, deduped, without touching anything else already there
+  # (model, theme, MCP permissions, etc.) — `*` replaces arrays wholesale
+  # rather than merging them, so the union has to be computed explicitly first.
+  jq -s '
+    .[0].permissions.allow as $new |
+    .[1] * {permissions: {allow: (((.[1].permissions.allow // []) + $new) | unique)}}
+  ' "$PERMISSIONS_FILE" "$SETTINGS_FILE" > "$TMP_SETTINGS" \
+    && mv "$TMP_SETTINGS" "$SETTINGS_FILE" \
+    && echo "  merged generic read-only permissions -> $SETTINGS_FILE"
+else
+  echo "WARNING: 'jq' not found — skipped merging the generic permission allowlist into $SETTINGS_FILE." >&2
+  echo "  Add these to permissions.allow by hand for fewer approval prompts:" >&2
+  sed 's/^/    /' "$PERMISSIONS_FILE" >&2
+fi
+
+echo
 # Sanity checks — warn, don't fail the install over these.
 if ! command -v claude > /dev/null 2>&1; then
   echo "WARNING: 'claude' CLI not found on PATH. Install Claude Code before these commands are usable." >&2
