@@ -9,11 +9,17 @@ slash commands built around it. Bundled so it's a one-command setup on any machi
 - **`commands/onboard.md`** — `/onboard`, first contact with unfamiliar code: git baseline,
   `CLAUDE.md` generated from a real scan (never guessed commands/conventions), and a
   verified build/run of the untouched baseline. Stops before any planning or editing.
-- **`bin/ralph`** — fresh-context implementation loop against a `SPEC.md` checklist.
-  Every attempt is a genuinely fresh `claude -p` call; git history is the only memory
-  between attempts. See `ralph --help` once installed.
-- **`commands/ralph-spec.md`** — `/ralph-spec`, generates the `SPEC.md` checklist `ralph`
-  consumes, from a feature description or an existing plan doc.
+- **`bin/ralph`** — fresh-context implementation loop against a `PLAN.md` checklist
+  (design reference lives separately in `SPEC.md`, written once, never edited by
+  ralph). Most items are a genuinely fresh `claude -p` call; git history is the only
+  memory between attempts. A `[mvn]` item type lets `/ralph-spec` hand off deterministic
+  Maven-plugin work (OpenRewrite recipes, Spotless, Checkstyle, dependency bumps) that
+  ralph runs directly — zero LLM turns, ralph itself checks it off and commits on
+  success, and leaves the tree dirty for inspection on failure. See `ralph --help` once
+  installed.
+- **`commands/ralph-spec.md`** — `/ralph-spec`, generates `SPEC.md` (design reference)
+  and `PLAN.md` (checklist, both item types) that `ralph --plan PLAN.md` consumes, from
+  a feature description or an existing plan doc.
 - **`commands/tdd-audit.md`** — `/tdd-audit`, diagnoses existing test coverage and
   conventions for a target before any planning happens.
 - **`commands/tdd-plan.md`** — `/tdd-plan`, builds a test-case checklist (baseline: nulls,

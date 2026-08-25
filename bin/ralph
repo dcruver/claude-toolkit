@@ -1,26 +1,59 @@
 #!/usr/bin/env bash
-# ralph — fresh-context implementation loop against a spec.
+# ralph — fresh-context implementation loop against a checklist.
 #
 # Unlike continuity-based loops (e.g. the Ralph Wiggum plugin), every
 # attempt is a genuinely fresh `claude -p` call with zero conversational
 # memory. Since nothing carries over, ALL state that matters must live on
-# disk — the spec's checklist, git history, and test results are the only
+# disk — the PLAN.md checklist, git history, and test results are the only
 # memory a fresh attempt has.
 #
-# Control flow: for each checklist item, retry it (fresh context each time)
-# up to --max-attempts times, checking success by whether tests pass and
-# the item gets checked off. Succeed -> advance to the next item. Exhaust
-# attempts without success -> stop the whole run for human review; a task
-# that fresh-context retries can't crack needs a person, not another retry.
+# Two files, two owners:
+#   SPEC.md  design reference, written once by /ralph-spec. Nothing —
+#            not ralph, not a claude -p attempt, not a [mvn] item — ever
+#            edits it again. ralph's own bash never even opens it.
+#   PLAN.md  the checklist ralph actually reads and mutates. Pure run
+#            state (which items are done), safe for either a claude -p
+#            session or ralph's own bash to check off, depending on the
+#            item's type below.
 #
-# Usage: ralph [--spec SPEC.md] [--max-attempts N] [--items N] [--review-gate full|light|none] [--model MODEL]
+# Item types in PLAN.md:
+#   normal item   `- [ ] <task> ... <verify command>`
+#                 A fresh `claude -p` session implements it, tests it,
+#                 clears --review-gate, checks it off in PLAN.md, and
+#                 commits. ralph's own bash never edits PLAN.md for these.
+#   [mvn] item    `- [ ] [mvn] <description> :: goal=<groupId:artifactId:version:goal>
+#                 [prop=<key>=<value>]... [pom=<path>] then=<verify command>`
+#                 ralph assembles and runs the `mvn` invocation itself from
+#                 those fields — NO claude -p call, NO --review-gate. On
+#                 success, ralph itself flips that exact line's checkbox and
+#                 commits — a real behavior change from the "delegate all
+#                 mutation to the LLM" model above, scoped only to [mvn]
+#                 items in PLAN.md (SPEC.md is never touched by either
+#                 item type). On failure, the working tree is left exactly
+#                 as the run left it — no auto-discard — since Maven plugin
+#                 goals are expected to be idempotent and a human reviewing
+#                 an exhausted run needs real evidence, not a clean slate.
+#                 Intended for deterministic, plugin-shaped work (an
+#                 OpenRewrite recipe, a Spotless/Checkstyle pass, a
+#                 versions-maven-plugin bump) — never bespoke logic. Maven
+#                 only; Gradle's equivalent conventions are out of scope.
+#
+# Control flow: for each checklist item, retry it up to --max-attempts
+# times, checking success by exit code ([mvn] items) or by whether the
+# item got checked off (normal items). Succeed -> advance to the next
+# item. Exhaust attempts without success -> stop the whole run for human
+# review; a task that fresh-context retries (or a deterministic command)
+# can't crack needs a person, not another retry.
+#
+# Usage: ralph [--plan PLAN.md] [--max-attempts N] [--items N] [--review-gate full|light|none] [--model MODEL]
 #   --max-attempts N   retries allowed on a SINGLE item before giving up on it (default 3)
 #   --items N          how many items to complete this run before stopping and
 #                       returning control (default: unlimited — run to completion).
 #                       Use --items 1 to pair on one item at a time: review what
 #                       happened, then re-invoke for the next.
-#   --review-gate MODE what an attempt must clear, beyond tests, before an item
-#                       can be checked off (default: full):
+#   --review-gate MODE what a normal (non-[mvn]) attempt must clear, beyond tests,
+#                       before an item can be checked off (default: full). No-op
+#                       for [mvn] items — nothing to gate, no LLM runs.
 #                         full  - all four /review-team roles (correctness,
 #                                 security, performance, style), adversarially
 #                                 verified. Any surviving finding blocks.
@@ -38,25 +71,30 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-ralph — fresh-context implementation loop against a spec
+ralph — fresh-context implementation loop against a checklist
 
 Every attempt is a genuinely fresh `claude -p` call with zero conversational
-memory. All state that matters lives on disk: the spec's checklist, git
+memory. All state that matters lives on disk: the PLAN.md checklist, git
 history, and test results. For each checklist item, ralph retries it (fresh
 context each time) until it passes, then advances to the next item.
+
+SPEC.md (design reference, written once by /ralph-spec) and PLAN.md (the
+checklist ralph reads/mutates) are separate files — ralph never opens
+SPEC.md itself.
 
 Usage: ralph [options]
 
 Options:
-  --spec FILE            Checklist spec to work from (default: SPEC.md)
+  --plan FILE             Checklist to work from (default: PLAN.md)
   --max-attempts N        Retries allowed on a SINGLE item before giving up
                           on it and stopping for human review (default: 3)
   --items N               How many items to complete this run before
                           stopping and returning control (default:
                           unlimited — run to completion). Use --items 1 to
                           pair on one item at a time.
-  --review-gate MODE      What an attempt must clear, beyond tests, before
-                          an item can be checked off (default: full):
+  --review-gate MODE      What a normal (non-[mvn]) attempt must clear,
+                          beyond tests, before an item can be checked off
+                          (default: full). No-op for [mvn] items.
                             full   all four /review-team roles
                                    (correctness, security, performance,
                                    style), adversarially verified. Any
@@ -73,12 +111,20 @@ Options:
 Requires a git repo (run /onboard or git init first) — git history is the
 only memory a fresh attempt has of what came before it.
 
+Item types (see PLAN.md itself, or the header comment in this script, for
+the full [mvn] field syntax):
+  normal item   claude -p implements/tests/reviews/checks off/commits.
+  [mvn] item    `- [ ] [mvn] <desc> :: goal=... [prop=...]... [pom=...] then=...`
+                ralph assembles and runs `mvn` directly, no LLM call. On
+                success ralph itself checks it off and commits; on failure
+                the tree is left dirty for inspection.
+
 Progress: .ralph/run.log (one line per attempt), .ralph/logs/item-NNN-attempt-N.log
 (full transcript per attempt).
 EOF
 }
 
-SPEC="SPEC.md"
+PLAN="PLAN.md"
 MAX_ATTEMPTS=3
 ITEMS_LIMIT=0   # 0 = unlimited
 MODEL=""
@@ -87,7 +133,7 @@ REVIEW_GATE="full"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
-    --spec) SPEC="$2"; shift 2 ;;
+    --plan) PLAN="$2"; shift 2 ;;
     --max-attempts) MAX_ATTEMPTS="$2"; shift 2 ;;
     --items) ITEMS_LIMIT="$2"; shift 2 ;;
     --review-gate) REVIEW_GATE="$2"; shift 2 ;;
@@ -101,8 +147,8 @@ case "$REVIEW_GATE" in
   *) echo "ralph: --review-gate must be full, light, or none (got: $REVIEW_GATE)" >&2; exit 1 ;;
 esac
 
-if [[ ! -f "$SPEC" ]]; then
-  echo "ralph: $SPEC not found. Write a checklist spec first (one '- [ ] task' per item). See 'ralph --help'." >&2
+if [[ ! -f "$PLAN" ]]; then
+  echo "ralph: $PLAN not found. Write a checklist (one '- [ ] task' per item) at $PLAN — typically generated by /ralph-spec alongside SPEC.md. See 'ralph --help'." >&2
   exit 1
 fi
 
@@ -115,22 +161,71 @@ mkdir -p .ralph/logs
 RUN_LOG=".ralph/run.log"
 
 remaining_items() {
-  grep -cE '^[[:space:]]*-[[:space:]]\[[[:space:]]\]' "$SPEC" 2>/dev/null || true
+  grep -cE '^[[:space:]]*-[[:space:]]\[[[:space:]]\]' "$PLAN" 2>/dev/null || true
 }
 next_item_text() {
-  grep -m 1 -E '^[[:space:]]*-[[:space:]]\[[[:space:]]\]' "$SPEC" | sed -E 's/^[[:space:]]*-[[:space:]]\[[[:space:]]\][[:space:]]*//'
+  grep -m 1 -E '^[[:space:]]*-[[:space:]]\[[[:space:]]\]' "$PLAN" | sed -E 's/^[[:space:]]*-[[:space:]]\[[[:space:]]\][[:space:]]*//'
+}
+next_item_line_number() {
+  grep -n -m 1 -E '^[[:space:]]*-[[:space:]]\[[[:space:]]\]' "$PLAN" | cut -d: -f1
+}
+
+is_mvn_item() {  # $1 = item text (post checkbox-strip)
+  [[ "$1" =~ ^\[mvn\][[:space:]] ]]
+}
+
+# Parses a [mvn] item's text into MVN_DESC, MVN_GOAL, MVN_PROPS[], MVN_POM,
+# MVN_THEN. Field values must not contain spaces (same constraint Maven's
+# own -D flag has) except `then=`, which is required to be the LAST field
+# and consumes everything to end of line, unsplit.
+mvn_item_fields() {
+  local body rest token
+  body="${1#\[mvn\] }"
+  MVN_DESC="${body%% ::*}"
+  rest="${body#*:: }"
+  MVN_GOAL=""
+  MVN_PROPS=()
+  MVN_POM=""
+  MVN_THEN=""
+  while [[ "$rest" != then=* ]]; do
+    if [[ -z "$rest" ]]; then
+      echo "ralph: malformed [mvn] item — missing required 'then=' field. See $PLAN: \"$1\"" >&2
+      exit 1
+    fi
+    token="${rest%% *}"
+    case "$token" in
+      goal=*) MVN_GOAL="${token#goal=}" ;;
+      prop=*) MVN_PROPS+=("${token#prop=}") ;;
+      pom=*)  MVN_POM="${token#pom=}" ;;
+      *) echo "ralph: malformed [mvn] item — unexpected field \"$token\" before 'then='. See $PLAN: \"$1\"" >&2; exit 1 ;;
+    esac
+    if [[ "$rest" == "$token" ]]; then
+      rest=""
+    else
+      rest="${rest#"$token" }"
+    fi
+  done
+  MVN_THEN="${rest#then=}"
+  if [[ -z "$MVN_GOAL" ]]; then
+    echo "ralph: malformed [mvn] item — missing required 'goal=' field. See $PLAN: \"$1\"" >&2
+    exit 1
+  fi
+  if [[ -z "$MVN_THEN" ]]; then
+    echo "ralph: malformed [mvn] item — 'then=' field is empty. See $PLAN: \"$1\"" >&2
+    exit 1
+  fi
 }
 
 MODEL_FLAG=()
 [[ -n "$MODEL" ]] && MODEL_FLAG=(--model "$MODEL")
 
-echo "ralph: starting. $(remaining_items) unchecked item(s) in $SPEC." | tee -a "$RUN_LOG"
+echo "ralph: starting. $(remaining_items) unchecked item(s) in $PLAN." | tee -a "$RUN_LOG"
 
 ITEMS_DONE=0
 while true; do
   REMAINING=$(remaining_items)
   if [[ "$REMAINING" -eq 0 ]]; then
-    echo "ralph: no unchecked items remain in $SPEC. Done." | tee -a "$RUN_LOG"
+    echo "ralph: no unchecked items remain in $PLAN. Done." | tee -a "$RUN_LOG"
     exit 0
   fi
   if [[ "$ITEMS_LIMIT" -gt 0 && "$ITEMS_DONE" -ge "$ITEMS_LIMIT" ]]; then
@@ -141,24 +236,58 @@ while true; do
   ITEM_TEXT=$(next_item_text)
   echo "ralph: next item — \"$ITEM_TEXT\"" | tee -a "$RUN_LOG"
 
-  case "$REVIEW_GATE" in
-    full)
-      REVIEW_STEP="4. Tests passing is necessary but not sufficient. Run \`/review-team roles=correctness,security,performance,style audit=false\` on your changes (its adversarial verification is what makes a finding count — don't skip that part). If any finding survives, fix it, re-run tests, and re-review, all within this same attempt if you can. Only once review comes back with no surviving findings do you move to step 5."
-      ;;
-    light)
-      REVIEW_STEP="4. Tests passing is necessary but not sufficient. Run \`/review-team roles=correctness,security audit=false\` on your changes (its adversarial verification is what makes a finding count — don't skip that part). If any finding survives, fix it, re-run tests, and re-review, all within this same attempt if you can. Only once review comes back with no surviving findings do you move to step 5."
-      ;;
-    none)
-      REVIEW_STEP="4. (No review gate configured — tests passing alone is sufficient. Move to step 5.)"
-      ;;
-  esac
+  IS_MVN=false
+  if is_mvn_item "$ITEM_TEXT"; then
+    IS_MVN=true
+    mvn_item_fields "$ITEM_TEXT"
+    echo "ralph: [mvn] item — running directly via mvn, no claude -p call, no --review-gate: $MVN_DESC" | tee -a "$RUN_LOG"
+  else
+    case "$REVIEW_GATE" in
+      full)
+        REVIEW_STEP="4. Tests passing is necessary but not sufficient. Run \`/review-team roles=correctness,security,performance,style audit=false\` on your changes (its adversarial verification is what makes a finding count — don't skip that part). If any finding survives, fix it, re-run tests, and re-review, all within this same attempt if you can. Only once review comes back with no surviving findings do you move to step 5."
+        ;;
+      light)
+        REVIEW_STEP="4. Tests passing is necessary but not sufficient. Run \`/review-team roles=correctness,security audit=false\` on your changes (its adversarial verification is what makes a finding count — don't skip that part). If any finding survives, fix it, re-run tests, and re-review, all within this same attempt if you can. Only once review comes back with no surviving findings do you move to step 5."
+        ;;
+      none)
+        REVIEW_STEP="4. (No review gate configured — tests passing alone is sufficient. Move to step 5.)"
+        ;;
+    esac
+  fi
 
   ITEM_SUCCEEDED=false
   for ((attempt=1; attempt<=MAX_ATTEMPTS; attempt++)); do
-    BEFORE_SHA=$(git rev-parse HEAD)
     LOG_FILE=".ralph/logs/item-$(printf '%03d' $((ITEMS_DONE+1)))-attempt-$attempt.log"
 
-    PROMPT="You are one fresh-context attempt at a single task from $SPEC. You have NO memory of previous attempts — everything you need is in this repository's current state.
+    if [[ "$IS_MVN" == "true" ]]; then
+      MVN_CMD=(mvn)
+      [[ -n "$MVN_POM" ]] && MVN_CMD+=(-f "$MVN_POM")
+      MVN_CMD+=("$MVN_GOAL")
+      for p in "${MVN_PROPS[@]:-}"; do
+        [[ -n "$p" ]] && MVN_CMD+=("-D$p")
+      done
+
+      {
+        echo "+ ${MVN_CMD[*]}"
+        echo "+ $MVN_THEN"
+      } > "$LOG_FILE"
+
+      if "${MVN_CMD[@]}" >> "$LOG_FILE" 2>&1 && bash -c "$MVN_THEN" >> "$LOG_FILE" 2>&1; then
+        LINE_NUM=$(next_item_line_number)
+        sed -i "${LINE_NUM}s/^\([[:space:]]*-[[:space:]]\)\[ \]/\1[x]/" "$PLAN"
+        git add -A
+        git commit -q -m "ralph: [mvn] $MVN_DESC (no LLM turn)"
+        echo "ralph: item done on attempt $attempt/$MAX_ATTEMPTS (mvn, no LLM) — $(git log -1 --format='%h %s')" | tee -a "$RUN_LOG"
+        ITEM_SUCCEEDED=true
+        ITEMS_DONE=$((ITEMS_DONE + 1))
+        break
+      else
+        echo "ralph: attempt $attempt/$MAX_ATTEMPTS: [mvn] item failed (mvn or the verify command exited non-zero). Working tree left as-is for inspection. See $LOG_FILE." | tee -a "$RUN_LOG"
+      fi
+    else
+      BEFORE_SHA=$(git rev-parse HEAD)
+
+      PROMPT="You are one fresh-context attempt at a single task from $PLAN. You have NO memory of previous attempts — everything you need is in this repository's current state.
 
 TASK: $ITEM_TEXT
 
@@ -166,30 +295,31 @@ TASK: $ITEM_TEXT
 2. Implement (or continue/fix) this task completely, including tests.
 3. Run the test suite. If it doesn't pass, that's your only job this attempt — get it passing, or if you can't, skip to step 5.
 $REVIEW_STEP
-5. If everything in steps 3-4 that applies is clean: check off this item in $SPEC (change its '- [ ] $ITEM_TEXT' to '- [x] $ITEM_TEXT'), and commit everything with a specific message.
+5. If everything in steps 3-4 that applies is clean: check off this item in $PLAN (change its '- [ ] $ITEM_TEXT' to '- [x] $ITEM_TEXT'), and commit everything with a specific message. This repo may also have a SPEC.md — the Design Reference this task's item may point to. Treat SPEC.md as strictly read-only: never edit it, and never check anything off in it. All checklist state belongs only in $PLAN.
 6. If it does NOT pass after your best effort this attempt: commit whatever partial progress is safe to commit, with a clear message describing exactly what you tried, what's still failing (test failures or unresolved review findings), so the next attempt isn't starting from zero. Do NOT check off the item.
 
 Work on ONLY this task. Do not start any other item, do not refactor unrelated code."
 
-    claude -p "$PROMPT" --permission-mode auto "${MODEL_FLAG[@]}" > "$LOG_FILE" 2>&1 || true
+      claude -p "$PROMPT" --permission-mode auto "${MODEL_FLAG[@]}" > "$LOG_FILE" 2>&1 || true
 
-    AFTER_SHA=$(git rev-parse HEAD)
-    NEW_REMAINING=$(remaining_items)
+      AFTER_SHA=$(git rev-parse HEAD)
+      NEW_REMAINING=$(remaining_items)
 
-    if [[ "$NEW_REMAINING" -lt "$REMAINING" ]]; then
-      echo "ralph: item done on attempt $attempt/$MAX_ATTEMPTS — $(git log -1 --format='%h %s')" | tee -a "$RUN_LOG"
-      ITEM_SUCCEEDED=true
-      ITEMS_DONE=$((ITEMS_DONE + 1))
-      break
-    elif [[ "$BEFORE_SHA" == "$AFTER_SHA" ]]; then
-      echo "ralph: attempt $attempt/$MAX_ATTEMPTS made no commit at all. See $LOG_FILE." | tee -a "$RUN_LOG"
-    else
-      echo "ralph: attempt $attempt/$MAX_ATTEMPTS committed partial progress, item not yet passing. See $LOG_FILE." | tee -a "$RUN_LOG"
+      if [[ "$NEW_REMAINING" -lt "$REMAINING" ]]; then
+        echo "ralph: item done on attempt $attempt/$MAX_ATTEMPTS — $(git log -1 --format='%h %s')" | tee -a "$RUN_LOG"
+        ITEM_SUCCEEDED=true
+        ITEMS_DONE=$((ITEMS_DONE + 1))
+        break
+      elif [[ "$BEFORE_SHA" == "$AFTER_SHA" ]]; then
+        echo "ralph: attempt $attempt/$MAX_ATTEMPTS made no commit at all. See $LOG_FILE." | tee -a "$RUN_LOG"
+      else
+        echo "ralph: attempt $attempt/$MAX_ATTEMPTS committed partial progress, item not yet passing. See $LOG_FILE." | tee -a "$RUN_LOG"
+      fi
     fi
   done
 
   if [[ "$ITEM_SUCCEEDED" != "true" ]]; then
-    echo "ralph: exhausted $MAX_ATTEMPTS attempts on \"$ITEM_TEXT\" without success — stopping for human review. Check $SPEC's notes and the .ralph/logs/item-$(printf '%03d' $((ITEMS_DONE+1)))-attempt-*.log files." | tee -a "$RUN_LOG"
+    echo "ralph: exhausted $MAX_ATTEMPTS attempts on \"$ITEM_TEXT\" without success — stopping for human review. Check $PLAN's notes (and SPEC.md's Design Reference for the item's design constraints) and the .ralph/logs/item-$(printf '%03d' $((ITEMS_DONE+1)))-attempt-*.log files." | tee -a "$RUN_LOG"
     exit 2
   fi
 done
