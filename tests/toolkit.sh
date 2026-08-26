@@ -521,6 +521,156 @@ test_with_fixture_repo() {
   assert_eq 1 "$rc" "with_fixture_repo reports a missing fixture instead of running the callback"
 }
 
+# SPEC.md §7 is the CLI surface, so the subcommand names are read back out of it
+# rather than restated here: a name in the spec with no handler in bin/okf then
+# fails as a missing subcommand instead of quietly never being exercised.
+_okf_spec_subcommands() {
+  awk '
+    /^## 7\./ { in_section = 1; next }
+    in_section && /^## / { exit }
+    in_section && /^okf[ \t]/ { print $2 }
+  ' "$TOOLKIT_ROOT/SPEC.md" | sort -u
+}
+
+# Runs each subcommand inside a throwaway fixture repo, because the ones already
+# implemented do real work: `init` writes okf.json, `index` writes index.md. In
+# the toolkit checkout that would edit the repo under test.
+#
+# The only thing asserted is that dispatch did not reject the name — whatever a
+# subcommand goes on to say about its arguments or a missing okf.json is that
+# subcommand's own contract, checked by its own PLAN.md item.
+_okf_probe_dispatch() { # $1.. = subcommand names
+  local okf="$TOOLKIT_ROOT/bin/okf" sub out
+
+  # `embed` and `search` are Tier B and reach for HTTP once implemented, and
+  # this fixture has no okf.json to point them somewhere harmless. SPEC.md §10
+  # forbids the suite touching the network at all, so shadow curl with a stub
+  # that records the attempt and fails — the guard stays even if some later
+  # config-resolution change stops those two exiting early.
+  local fakebin marker
+  fakebin="$(mktemp -d "${TMPDIR:-/tmp}/toolkit-fakebin.XXXXXX")" || {
+    _fail "okf dispatch probe" "mktemp -d failed"
+    return 1
+  }
+  # Registered the way with_fixture_repo registers its copies, so an interrupted
+  # run takes it with everything else rather than leaving it in TMPDIR.
+  printf '%s\n' "$fakebin" >> "$HARNESS_STATE/fixture_dirs"
+  marker="$fakebin/curl-was-called"
+  cat > "$fakebin/curl" <<FAKE_CURL
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$marker"
+exit 1
+FAKE_CURL
+  chmod +x "$fakebin/curl"
+  local saved_path="$PATH"
+  PATH="$fakebin:$PATH"
+
+  # Absence of a rejection only means anything if a rejection was reachable at
+  # all. Something added ahead of dispatch that exits early — the preflight, a
+  # global flag parser — would otherwise silently turn every check below into a
+  # check that cannot fail, so prove the name a rejection here first.
+  out="$("$okf" definitely-not-a-subcommand 2>&1)" || true
+  case "$out" in
+    *"unknown subcommand"*) _pass "an okf invocation in the fixture reaches dispatch" ;;
+    *)
+      _fail "an okf invocation in the fixture reaches dispatch" \
+        "an unknown subcommand was not rejected by name, so the checks that" \
+        "follow cannot tell a recognised subcommand from an early exit:" "$out"
+      # Bail rather than report ten passes that were just shown to mean nothing.
+      PATH="$saved_path"
+      rm -rf "$fakebin"
+      return 1
+      ;;
+  esac
+
+  for sub in "$@"; do
+    out="$("$okf" "$sub" 2>&1)" || true
+    case "$out" in
+      *"unknown subcommand"*)
+        _fail "okf $sub is a recognised subcommand" "dispatch rejected it:" "$out"
+        ;;
+      *) _pass "okf $sub is a recognised subcommand" ;;
+    esac
+  done
+
+  if [ -s "$marker" ]; then
+    _fail "no okf invocation in the probe tries to reach the network" \
+      "curl was called, with:" "$(cat "$marker")"
+  else
+    _pass "no okf invocation in the probe tries to reach the network"
+  fi
+
+  PATH="$saved_path"
+  rm -rf "$fakebin"
+  return 0
+}
+
+test_okf_dispatches_every_spec_subcommand() {
+  local okf="$TOOLKIT_ROOT/bin/okf"
+  if [ ! -x "$okf" ]; then
+    _fail "bin/okf is an executable script" "missing or not executable: $okf"
+    return 1
+  fi
+
+  local -a subs=()
+  local name
+  while IFS= read -r name; do
+    [ -n "$name" ] && subs+=("$name")
+  done < <(_okf_spec_subcommands)
+
+  # Guards the extraction above: were it to stop matching, every per-subcommand
+  # check below would vanish and this test would pass by asserting nothing.
+  # Empty is handled separately and bails, because expanding "${subs[@]}" on an
+  # empty array under `set -u` aborts the whole run on bash 3.2 — one reported
+  # failure is worth more than a suite that dies before its summary.
+  if [ "${#subs[@]}" -eq 0 ]; then
+    _fail "SPEC.md §7 lists its subcommands" \
+      "extracted no subcommand names from SPEC.md's CLI surface section"
+    return 1
+  fi
+  assert_eq 10 "${#subs[@]}" "SPEC.md §7 lists 10 subcommands"
+
+  local sub
+  for sub in "${subs[@]}"; do
+    if grep -qE "^cmd_$sub\(\)" "$okf"; then
+      _pass "bin/okf routes $sub to cmd_$sub"
+    else
+      _fail "bin/okf routes $sub to cmd_$sub" "no cmd_$sub function in bin/okf"
+    fi
+  done
+
+  with_fixture_repo tiny _okf_probe_dispatch "${subs[@]}"
+}
+
+test_okf_rejects_an_unknown_subcommand() {
+  local okf="$TOOLKIT_ROOT/bin/okf"
+  # bin/okf is committed, so its absence is a broken checkout rather than a
+  # point in the checklist it has not been reached yet — a failure, not a skip.
+  # Named here so it reads as one missing file instead of four "exits 127".
+  if [ ! -x "$okf" ]; then
+    _fail "bin/okf is an executable script" "missing or not executable: $okf"
+    return 1
+  fi
+
+  assert_exit 1 "$okf" frobnicate
+  assert_contains "$(last_output)" "unknown subcommand: frobnicate" \
+    "the error names the offending subcommand"
+
+  # A prefix of a real subcommand is still not that subcommand.
+  assert_exit 1 "$okf" ini
+  assert_contains "$(last_output)" "unknown subcommand: ini" \
+    "dispatch matches subcommand names whole, not by prefix"
+
+  # A bare invocation has no offender to name, so all this item pins is that it
+  # points at what it will accept. What it prints and with what status is the
+  # --help item's to decide, so the status is deliberately not asserted —
+  # pinning it here would fail that item for printing help and exiting 0.
+  local bare
+  bare="$("$okf" 2>&1)" || true
+  assert_contains "$bare" "init" "a bare invocation names the subcommands"
+  assert_contains "$bare" "search" "a bare invocation names the subcommands"
+}
+
 # --- add new test_* functions above this line ------------------------------
 
 # ---------------------------------------------------------------------------

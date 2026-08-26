@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# okf — OKF code knowledge for a repository.
+#
+# Deterministic, offline bookkeeping over co-located OKF concept files: which
+# sources are in scope, what has drifted, how often a type is referenced, and
+# (Tier B, opt-in) chunking/embedding for semantic search. The design reference
+# is SPEC.md; §7 defines this CLI surface and its exit codes.
+#
+# This script never parses source code and never invokes an LLM. Reading source,
+# deciding a tier and authoring prose belong to the commands/okf-*.md slash
+# commands — see SPEC.md's division of labour.
+#
+# Exit codes (SPEC.md §7):
+#   0  success
+#   1  error, or a missing prerequisite
+#   2  a Tier B subcommand was invoked without an `index` block in okf.json
+#   3  `check --strict` found drift
+#
+# Installed exactly like bin/ralph: copied onto $PATH by install.sh. There is no
+# compiled artifact and no build step.
+
+set -euo pipefail
+
+# The SPEC.md §7 subcommand surface, and the single source of truth for what
+# dispatch accepts. Each name routes to the cmd_<name> function below; adding a
+# name here without its function is caught at dispatch rather than silently
+# doing nothing.
+OKF_SUBCOMMANDS=(init list hash fanin check index verify chunk embed search)
+
+die() { # $1.. = message lines
+  local line
+  for line in "$@"; do
+    printf 'okf: %s\n' "$line" >&2
+  done
+  exit 1
+}
+
+# Placeholder for a subcommand that dispatch recognises but that has not been
+# built yet. Exits 1 — "recognised" is not "succeeded", and a stub that exited 0
+# would let a caller mistake doing nothing for having done the work.
+not_implemented() { # $1 = subcommand name
+  die "$1 is not implemented yet"
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands
+#
+# One function per SPEC.md §7 subcommand, each replaced by its real
+# implementation as the PLAN.md checklist reaches it. The usage line above each
+# stub is the contract that implementation owes.
+# ---------------------------------------------------------------------------
+
+# okf init [--force] — write okf.json + the bundle-root index.md
+cmd_init() { not_implemented init; }
+
+# okf list [--missing] [--orphans] — in-scope source files
+cmd_list() { not_implemented list; }
+
+# okf hash <file> — sha256:… of one file
+cmd_hash() { not_implemented hash; }
+
+# okf fanin <Name> — whole-word reference count across in-scope files
+cmd_fanin() { not_implemented fanin; }
+
+# okf check [--strict] [--stamp] [--json] — drift, missing and orphan concepts
+cmd_check() { not_implemented check; }
+
+# okf index — regenerate the per-directory index.md files
+cmd_index() { not_implemented index; }
+
+# okf verify <concept> [--by ACTOR] — append a verified entry
+cmd_verify() { not_implemented verify; }
+
+# okf chunk <concept> — Tier B: emit JSON chunks for one concept
+cmd_chunk() { not_implemented chunk; }
+
+# okf embed [--all] — Tier B: embed and upsert to Qdrant
+cmd_embed() { not_implemented embed; }
+
+# okf search <query> [--hyde-prompt] [--k N] [--repo R] [--type T]
+cmd_search() { not_implemented search; }
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+main() {
+  if [ $# -eq 0 ]; then
+    die "no subcommand given" "expected one of: ${OKF_SUBCOMMANDS[*]}"
+  fi
+
+  local sub="$1"
+  shift
+
+  local known
+  for known in "${OKF_SUBCOMMANDS[@]}"; do
+    [ "$sub" = "$known" ] || continue
+    if ! declare -F "cmd_$sub" > /dev/null; then
+      # Listed in OKF_SUBCOMMANDS but never written: a bug in this script, not
+      # in the caller's command line, so say which of the two it is.
+      die "$sub is listed as a subcommand but has no cmd_$sub function"
+    fi
+    # ${1+"$@"} rather than "$@": under `set -u` an empty "$@" is an unbound
+    # variable on bash 3.2, which is still what macOS ships.
+    "cmd_$sub" ${1+"$@"}
+    return $?
+  done
+
+  die "unknown subcommand: $sub" "expected one of: ${OKF_SUBCOMMANDS[*]}"
+}
+
+main ${1+"$@"}
