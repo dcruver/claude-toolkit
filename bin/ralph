@@ -54,14 +54,14 @@
 #   --review-gate MODE what a normal (non-[mvn]) attempt must clear, beyond tests,
 #                       before an item can be checked off (default: full). No-op
 #                       for [mvn] items — nothing to gate, no LLM runs.
-#                         full  - all four /review-team roles (correctness,
-#                                 security, performance, style), adversarially
-#                                 verified. Any surviving finding blocks.
-#                         light - correctness + security only, still
-#                                 adversarially verified. Cheaper, less coverage.
-#                         none  - tests-only gate (no review-team involvement).
-#                       ponytail-audit-style opinions never gate, in any mode —
-#                       they're informational, same as in /review-team itself.
+#                         full  - /code-review at high effort: broader
+#                                 coverage, may surface uncertain findings.
+#                                 Any surviving finding blocks.
+#                         light - /code-review at medium effort: fewer,
+#                                 higher-confidence findings. Cheaper.
+#                         none  - tests-only gate (no /code-review).
+#                       Never uses /code-review's `ultra` level — that one is
+#                       user-triggered and billed, not launchable from here.
 #
 # Relies on --permission-mode auto being valid in your environment (verified
 # via `claude --help` at write time) — headless -p calls can't answer
@@ -95,15 +95,14 @@ Options:
   --review-gate MODE      What a normal (non-[mvn]) attempt must clear,
                           beyond tests, before an item can be checked off
                           (default: full). No-op for [mvn] items.
-                            full   all four /review-team roles
-                                   (correctness, security, performance,
-                                   style), adversarially verified. Any
-                                   surviving finding blocks.
-                            light  correctness + security only, still
-                                   adversarially verified.
-                            none   tests-only gate, no review-team.
-                          ponytail-audit-style opinions never gate, in any
-                          mode — informational only, same as /review-team.
+                            full   /code-review at high effort: broader
+                                   coverage, may surface uncertain
+                                   findings. Any surviving finding blocks.
+                            light  /code-review at medium effort: fewer,
+                                   higher-confidence findings.
+                            none   tests-only gate, no /code-review.
+                          Never uses /code-review's `ultra` level — that is
+                          user-triggered and billed, not launchable here.
   --model MODEL           Model to use for each attempt (default: unset,
                           inherits claude's own default)
   -h, --help              Show this help and exit
@@ -244,10 +243,10 @@ while true; do
   else
     case "$REVIEW_GATE" in
       full)
-        REVIEW_STEP="4. Tests passing is necessary but not sufficient. Run \`/review-team roles=correctness,security,performance,style audit=false\` on your changes (its adversarial verification is what makes a finding count — don't skip that part). If any finding survives, fix it, re-run tests, and re-review, all within this same attempt if you can. Only once review comes back with no surviving findings do you move to step 5."
+        REVIEW_STEP="4. Tests passing is necessary but not sufficient. Run \`/code-review high\` on your changes. If any finding survives its verification pass, fix it, re-run tests, and re-review, all within this same attempt if you can. Only once review comes back with no surviving findings do you move to step 5."
         ;;
       light)
-        REVIEW_STEP="4. Tests passing is necessary but not sufficient. Run \`/review-team roles=correctness,security audit=false\` on your changes (its adversarial verification is what makes a finding count — don't skip that part). If any finding survives, fix it, re-run tests, and re-review, all within this same attempt if you can. Only once review comes back with no surviving findings do you move to step 5."
+        REVIEW_STEP="4. Tests passing is necessary but not sufficient. Run \`/code-review medium\` on your changes. If any finding survives its verification pass, fix it, re-run tests, and re-review, all within this same attempt if you can. Only once review comes back with no surviving findings do you move to step 5."
         ;;
       none)
         REVIEW_STEP="4. (No review gate configured — tests passing alone is sufficient. Move to step 5.)"
