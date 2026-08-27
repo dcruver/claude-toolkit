@@ -1,15 +1,38 @@
 {
   "permissions": {
     "allow": [
-      "Bash(docker compose ps *)",
-      "Bash(docker compose logs *)",
       "Bash(docker compose config *)",
-      "Bash(ss *)",
+      "Bash(docker compose logs *)",
+      "Bash(docker compose ps *)",
       "Bash(du *)",
-      "Bash(git rev-list *)",
+      "Bash(git blame *)",
+      "Bash(git branch --list *)",
+      "Bash(git cat-file *)",
       "Bash(git check-ignore *)",
+      "Bash(git config --get *)",
+      "Bash(git describe *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git ls-files *)",
+      "Bash(git remote -v)",
+      "Bash(git rev-list *)",
+      "Bash(git rev-parse *)",
+      "Bash(git shortlog *)",
+      "Bash(git show *)",
+      "Bash(git stash list)",
+      "Bash(git status *)",
+      "Bash(git tag --list *)",
+      "Bash(git worktree list)",
       "Bash(kubectl get *)",
-      "Bash(kubectl kustomize *)"
+      "Bash(kubectl kustomize *)",
+      "Bash(okf check *)",
+      "Bash(okf check)",
+      "Bash(okf fanin *)",
+      "Bash(okf hash *)",
+      "Bash(okf list *)",
+      "Bash(okf list)",
+      "Bash(okf search *)",
+      "Bash(ss *)"
     ]
   }
 }

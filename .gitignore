@@ -1,0 +1,12 @@
+# okf's local scratch/cache directory (SPEC.md §2). Nothing under it is a
+# source of truth: concepts are co-located .md files next to the code, and
+# okf.json is the committed bundle config — neither is matched by this pattern.
+.okf/
+
+# ralph's run log and per-attempt transcripts (bin/ralph writes .ralph/logs/
+# and .ralph/run.log into the repo it is driving). Beyond SPEC.md §2's list,
+# and here because this is the repo's first .gitignore and ralph is dogfooded
+# in it: ralph's own commit steps run `git add -A` and tell each attempt to
+# "commit everything", so without this line an unattended run commits tens of
+# megabytes of its own stream-json transcripts.
+.ralph/

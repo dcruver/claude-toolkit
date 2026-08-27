@@ -8687,6 +8687,298 @@ test_install_sh_prerequisites_are_exactly_the_spec_tools() {
     "install.sh and bin/okf agree on what only Tier B requires"
 }
 
+# ---------------------------------------------------------------------------
+# permissions.json and .gitignore (PLAN.md Phase 6)
+# ---------------------------------------------------------------------------
+
+# The subcommands SPEC.md §11 calls read-only, read back out of that bullet
+# rather than restated here: a name added to §11 and not to permissions.json
+# then fails as a missing entry instead of quietly never being checked.
+_okf_spec_permission_subcommands() {
+  awk '
+    /^## 11\./ { in_section = 1; next }
+    # "### Note on ralph'"'"'s review gate" does not end the section: three
+    # hashes and then a letter never match "## " followed by a space.
+    in_section && /^## / { exit }
+    in_section { text = text " " $0 }
+    END {
+      # The permissions.json sentence, from that filename to the first full
+      # stop. Nothing between the two is a period, so [^.]* cannot overshoot
+      # the end of the sentence and swallow the bullets after it.
+      if (!match(text, /permissions\.json[^.]*\./)) exit
+      n = split(substr(text, RSTART, RLENGTH), part, "`")
+      # Every field, not the even ones: `match` starts the sentence at
+      # "permissions" and so cuts off that name'"'"'s own opening backtick, which
+      # puts the backquoted names at odd indices here where a sentence opening
+      # in prose would put them at even ones. Scanning all of them is right
+      # either way, and a prose field cannot be mistaken for a subcommand —
+      # the pattern below anchors both ends.
+      for (i = 1; i <= n; i++) {
+        if (part[i] ~ /^okf [a-z]+$/) {
+          sub(/^okf /, "", part[i])
+          print part[i]
+        }
+      }
+    }
+  ' "$TOOLKIT_ROOT/SPEC.md" | sort -u
+}
+
+# permissions.allow, one entry per line. Callers guard on jq themselves.
+_permissions_allow_entries() {
+  jq -r '.permissions.allow[]' "$TOOLKIT_ROOT/permissions.json"
+}
+
+# A whole-line match, not a substring one: "Bash(okf list *)" is a substring of
+# entries that would grant something else entirely, and a check that cannot
+# tell the two apart is not checking the allowlist.
+_permissions_has_entry() { # $1 = entries, one per line, $2 = the exact entry
+  printf '%s\n' "$1" | grep -qxF -- "$2"
+}
+
+# PLAN.md Phase 6: the read-only okf subcommands are pre-approved, and the ones
+# that write are not.
+#
+# `okf check --stamp` is the known edge of "read-only". SPEC.md §11 lists
+# `okf check` among the read-only subcommands and SPEC.md §8 has plain
+# `okf check` never mutate a file, but --stamp does write stale_after onto
+# drifted concepts. A prefix entry cannot exclude one flag, and following §11
+# is the right trade: what --stamp writes is a tracked file, and it shows up in
+# the diff of the commit that follows.
+test_permissions_json_allows_the_read_only_okf_subcommands() {
+  local entries spec sub read_only
+  if ! command -v jq > /dev/null 2>&1; then
+    _skip "permissions.json allows the read-only okf subcommands" \
+      "jq is not installed here"
+    return 0
+  fi
+
+  if ! entries="$(_permissions_allow_entries 2>&1)"; then
+    _fail "permissions.json parses as JSON with a permissions.allow array" "$entries"
+    return 1
+  fi
+  _pass "permissions.json parses as JSON with a permissions.allow array"
+
+  spec="$(_okf_spec_permission_subcommands)"
+  if [ -z "$spec" ]; then
+    _fail "SPEC.md §11 names the read-only okf subcommands" \
+      "extracted no subcommand names from the permissions.json bullet"
+    return 1
+  fi
+
+  read_only=""
+  while IFS= read -r sub; do
+    [ -n "$sub" ] || continue
+    # Joined with no leading space, so the ` $x ` membership tests below cannot
+    # be satisfied by an empty needle matching a doubled separator.
+    read_only="${read_only:+$read_only }$sub"
+    # The trailing " *" is what makes the entry cover the flags each of these
+    # takes — `okf list --missing`, `okf check --json`, `okf search --k 5`.
+    if _permissions_has_entry "$entries" "Bash(okf $sub *)"; then
+      _pass "permissions.json pre-approves \`okf $sub\`"
+    else
+      _fail "permissions.json pre-approves \`okf $sub\`" \
+        "no permissions.allow entry equal to: Bash(okf $sub *)"
+    fi
+
+    # `Bash(okf list *)` has a literal space before its `*`, so it does not
+    # cover the arg-less `okf list` — which is the commonest way to run the two
+    # subcommands SPEC.md §7 gives no `<arg>`. permissions.json already shows
+    # the answer for that case: `Bash(git remote -v)`, `Bash(git stash list)`
+    # and `Bash(git worktree list)` are exact entries for exactly this reason.
+    # Which subcommands need one is read out of §7 rather than listed here, so
+    # a `<query>` added to or dropped from a usage line moves the requirement
+    # with it.
+    if _okf_spec_usage_tokens "$sub" | grep -q '^<'; then
+      continue
+    fi
+    if _permissions_has_entry "$entries" "Bash(okf $sub)"; then
+      _pass "permissions.json pre-approves the arg-less \`okf $sub\` too"
+    else
+      _fail "permissions.json pre-approves the arg-less \`okf $sub\` too" \
+        "SPEC.md §7 gives \`okf $sub\` no required argument, so it is run bare" \
+        "no permissions.allow entry equal to: Bash(okf $sub)"
+    fi
+  done <<< "$spec"
+
+  # The other half of the contract, and the half worth having a test for: an
+  # entry reaching a subcommand that writes — init, verify, index, embed —
+  # would give away the approval prompt that is the only thing between an
+  # unattended run and a rewritten bundle.
+  #
+  # Driven off the entries rather than off the subcommand names, because a scan
+  # that walks the names cannot see the entries that broaden past them:
+  # `Bash(okf *)` and `Bash(okf verify*)` both pre-approve `okf verify` while
+  # naming nothing a name-driven grep would think to look for. Walking the
+  # entries instead makes the rule "every entry that invokes okf names a
+  # literal read-only subcommand".
+  #
+  # It is a rule about entries that name okf, and not a proof that nothing else
+  # can reach it: a blanket `Bash(*)`, or a rule for a wrapper script that
+  # happens to shell out to okf, is outside what this can see and is a
+  # whole-allowlist question rather than an okf one.
+  #
+  # Flags-first invocations — SPEC.md §7's `okf -C DIR list` — are deliberately
+  # not allowlisted, and this test rejects an entry that tried: a glob after
+  # `-C` cannot be pinned to a read-only subcommand, so `Bash(okf -C *)` would
+  # reach `verify` and `init` as readily as `list`. Running okf against another
+  # root stays a prompt.
+  local entry inner normalised sub_token okf_entries=0
+  local -a tokens=()
+  local i
+  while IFS= read -r entry; do
+    case "$entry" in
+      "Bash("*")") ;;
+      *) continue ;;
+    esac
+    inner="${entry#Bash(}"
+    inner="${inner%)}"
+    # `:` is Claude Code's own prefix-rule separator — `Bash(okf list:*)` — and
+    # `&&`, `;` and `|` chain commands inside a single entry. Turned into plain
+    # whitespace so that one scan below sees every command word however the
+    # entry is spelled, rather than reading only the first: without this,
+    # `Bash(okf:*)` — a blanket grant over every subcommand — parses as a
+    # command named "okf:*" that is not okf, and is skipped unchecked.
+    normalised="$(printf '%s\n' "$inner" | tr ':&|;' '    ')"
+    # Word-split on IFS, which collapses runs of whitespace: "okf  verify"
+    # yields "verify" and not an empty token that would read as "this entry
+    # names no subcommand" for an entry that plainly does.
+    tokens=()
+    read -r -a tokens <<< "$normalised"
+
+    # Every occurrence, not just the first token: `Bash(cd /tmp && okf verify)`
+    # names okf in third position, and the word before it is not a command.
+    for ((i = 0; i < ${#tokens[@]}; i++)); do
+      # `bin/okf` and `./bin/okf` invoke okf just as `okf` does, and an entry
+      # spelled that way must clear the same bar. Matched on the whole
+      # basename, so a future `okfoo` is not mistaken for one of okf's.
+      case "${tokens[$i]}" in
+        okf | */okf) ;;
+        *) continue ;;
+      esac
+      okf_entries=$((okf_entries + 1))
+      sub_token="${tokens[$((i + 1))]:-}"
+      if [ -z "$sub_token" ]; then
+        # `Bash(okf)` matches the bare command and nothing else — okf's help
+        # output — so it grants no subcommand at all. Given its own arm rather
+        # than left to the membership test below, which would have to report an
+        # empty subcommand name as either a match or a violation, and neither
+        # reads as what this entry actually is.
+        _pass "the allowlist entry \`$entry\` names no subcommand, so it reaches only okf's help"
+        continue
+      fi
+      case " $read_only " in
+        *" $sub_token "*)
+          _pass "the allowlist entry \`$entry\` goes through the read-only \`okf $sub_token\`"
+          ;;
+        *)
+          _fail "the allowlist entry \`$entry\` goes through a read-only okf subcommand" \
+            "its subcommand reads as \"$sub_token\", which SPEC.md §11 does not call read-only" \
+            "a glob or an empty subcommand there pre-approves every okf subcommand," \
+            "including init, index, verify and embed, which all write"
+          ;;
+      esac
+    done
+  done <<< "$entries"
+
+  # Guards the loop above the way the §7 guards elsewhere in this file work: no
+  # okf entry at all means the checks it makes all vanished, and the read-only
+  # half above has already established that there should be several.
+  if [ "$okf_entries" -eq 0 ]; then
+    _fail "permissions.json has okf entries to check the shape of" \
+      "no permissions.allow entry invokes okf"
+    return 1
+  fi
+  return 0
+}
+
+# Does this checkout's .gitignore — and only this checkout's .gitignore — cause
+# git to ignore the given path? Exit 0 if so, 1 if not, 2 if the query could
+# not be set up.
+#
+# Hermetic in the same way with_fixture_repo's git is, and for the same reason:
+# tests/toolkit.sh is the verify command for every PLAN.md item, so neither a
+# pass nor a failure here may depend on whose machine it runs on. Someone with
+# a personal `*.json` ignore rule would otherwise fail a correct .gitignore,
+# and someone with a personal `.okf/` rule would pass a missing one.
+#
+# Scrubbing the config is not enough on its own, which is why this queries
+# through a throwaway bare git dir rather than through .git: git always reads
+# $GIT_DIR/info/exclude, and no environment variable turns that off. A bare dir
+# created with `--template=` has no info/exclude at all, and --work-tree points
+# it at this checkout, so the toolkit's own .gitignore is the only source of
+# rules left. --no-index makes the index irrelevant too, which the empty
+# scratch dir would anyway.
+#
+# --no-index is load-bearing on the negative checks for a second reason:
+# without it check-ignore says nothing at all about a path in the index, so
+# `bin/okf` — a tracked file — would report "not ignored" under any .gitignore
+# whatsoever, including one that plainly swallowed it. That is a check that
+# cannot fail.
+_git_ignores() { # $1 = a path relative to the repo root
+  local gd rc
+  gd="$(mktemp -d "${TMPDIR:-/tmp}/toolkit-ignore.XXXXXX")" || return 2
+  if GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+    git init -q --bare --template= "$gd" > /dev/null 2>&1; then
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+      git -C "$TOOLKIT_ROOT" --git-dir="$gd" --work-tree="$TOOLKIT_ROOT" \
+      -c core.excludesFile=/dev/null check-ignore --no-index -q "$1"
+    rc=$?
+  else
+    rc=2
+  fi
+  rm -rf "$gd"
+  return $rc
+}
+
+# PLAN.md Phase 6, SPEC.md §2: ".gitignore gains .okf/" — plus .ralph/, which
+# bin/ralph writes into whatever repo it is driving.
+test_gitignore_ignores_the_toolkit_scratch_directories() {
+  local ignore="$TOOLKIT_ROOT/.gitignore"
+  if [ ! -f "$ignore" ]; then
+    _fail "the toolkit has a .gitignore" "missing: $ignore"
+    return 1
+  fi
+  if grep -qxF '.okf/' "$ignore"; then
+    _pass ".gitignore carries the .okf/ pattern"
+  else
+    _fail ".gitignore carries the .okf/ pattern" \
+      "no line equal to '.okf/' in $ignore"
+  fi
+
+  # Beyond SPEC.md §2, which names only .okf/: bin/ralph writes .ralph/run.log
+  # and .ralph/logs/ into the repo it drives, and its own commit steps run
+  # `git add -A`. This repo dogfoods ralph, so an unignored .ralph/ is tens of
+  # megabytes of transcripts one unattended run away from being committed.
+  if grep -qxF '.ralph/' "$ignore"; then
+    _pass ".gitignore carries the .ralph/ pattern"
+  else
+    _fail ".gitignore carries the .ralph/ pattern" \
+      "no line equal to '.ralph/' in $ignore" \
+      "bin/ralph writes .ralph/logs/ into the repo and commits with git add -A"
+  fi
+
+  # And git agrees — which is the check that matters, because the pattern is
+  # only worth having if git reads it the way it was meant. Run against this
+  # checkout rather than a fixture: it is the repo the pattern was written for,
+  # and check-ignore answers for paths that do not exist.
+  if ! git -C "$TOOLKIT_ROOT" rev-parse --is-inside-work-tree > /dev/null 2>&1; then
+    _skip "git ignores .okf/ in this checkout" "not a git work tree"
+    return 0
+  fi
+  assert_exit 0 _git_ignores .okf/qdrant-cache.json
+  # Unanchored, so a scratch directory beside a nested package is ignored too.
+  assert_exit 0 _git_ignores bin/.okf/anything
+  assert_exit 0 _git_ignores .ralph/logs/item-001-attempt-1.jsonl
+
+  # The trailing slash keeps it to directories and the pattern is not a prefix
+  # match, so none of okf's committed files is swept up with the scratch: a
+  # .gitignore that swallowed okf.json — the bundle config — or bin/okf itself
+  # would be far worse than having none at all.
+  assert_exit 1 _git_ignores okf.json
+  assert_exit 1 _git_ignores bin/okf
+  assert_exit 1 _git_ignores src/parser/okf.md
+}
+
 # --- add new test_* functions above this line ------------------------------
 
 # ---------------------------------------------------------------------------
