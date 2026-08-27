@@ -234,6 +234,14 @@ http_preflight() { # $1 = the subcommand being dispatched, $2.. = its arguments
 OKF_ROOT=""
 OKF_CONFIG=""
 
+# Whether --config named that path or it is SPEC.md §7's default. The two are
+# the same string to everything downstream but not the same request: SPEC.md §6
+# says every field defaults if absent, so a repo with no okf.json is a repo
+# using the defaults, while a --config pointing at a file that is not there is a
+# caller who meant a particular file and mistyped it. Only the second is an
+# error, and nothing but this flag can tell them apart.
+OKF_CONFIG_GIVEN=0
+
 # SPEC.md §7's default, `./okf.json`, and SPEC.md §6's "okf.json (repo root)":
 # the same file named twice. Relative to the root, so -C moves it too.
 OKF_CONFIG_DEFAULT="okf.json"
@@ -368,6 +376,8 @@ parse_globals() { # $1.. = the command line, minus the program name
     die "--config needs a path, not an empty argument"
   fi
 
+  OKF_CONFIG_GIVEN="$seen_config"
+
   case "$config" in
     "")
       # Not given. SPEC.md §7's default, which is the root's okf.json.
@@ -390,6 +400,27 @@ parse_globals() { # $1.. = the command line, minus the program name
   # `set -u` is an unbound variable on bash 3.2, which is still what macOS
   # ships, and empty is exactly the case of a bare `okf -C somewhere`.
   OKF_ARGV=(${rest[@]+"${rest[@]}"})
+}
+
+# Clears the git environment variables that would have git answer for a
+# different repository than the one okf was pointed at.
+#
+# `git ls-files` reads GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE ahead of the
+# directory it is run in, so those three outrank both -C and the caller's own
+# cwd. They are not exotic: git exports them to every hook it runs, and to
+# everything under `git rebase --exec` — which is exactly where SPEC.md §11 has
+# bin/ralph refreshing concepts as part of a commit. An okf that inherited them
+# would list another repository's files, and the failure would be silent, since
+# none of those paths exists under the real root and what comes out is an empty
+# listing exiting 0.
+#
+# Cleared for the same reason CDPATH is cleared at every cd here, and ripgrep is
+# run with --no-config: what okf answers has to depend on the repository it was
+# pointed at, and on nothing else that happens to be in the environment.
+isolate_git_environment() {
+  unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_CEILING_DIRECTORIES \
+    GIT_NAMESPACE
 }
 
 # Enters the root, so that every relative path a subcommand touches — and every
@@ -451,6 +482,753 @@ canonical_path() { # $1 = an absolute path
     */) printf '%s%s\n' "$resolved" "$base" ;;
     *) printf '%s/%s\n' "$resolved" "$base" ;;
   esac
+}
+
+# ---------------------------------------------------------------------------
+# Settings (SPEC.md §6)
+# ---------------------------------------------------------------------------
+
+# The effective settings for this run: SPEC.md §6's defaults with the repo's
+# okf.json laid over them. Read once and kept, because several subcommands ask
+# for several of its lists and each ask is a jq process.
+OKF_SETTINGS=""
+OKF_SETTINGS_LOADED=0
+
+# Resolves okf.json against the defaults, per SPEC.md §6's "every field defaults
+# if absent".
+#
+# The overlay is jq's `*`, which merges objects recursively and lets the
+# right-hand side win — so a repo that sets only `bundle.include` keeps §6's
+# `exclude` and `extensions`, and an `index` block, which the defaults
+# deliberately have not got, arrives intact. Arrays replace rather than
+# concatenate, which is what a caller narrowing `extensions` to `["java"]`
+# means; a `*` that appended would leave them with all eight and no way back.
+#
+# OKF_DEFAULT_CONFIG is reused as the left-hand side rather than a second
+# transcription of §6, so `okf init` and every later run agree on what a field
+# means when it is missing — including in a repo that never ran init.
+load_settings() {
+  [ "$OKF_SETTINGS_LOADED" -eq 0 ] || return 0
+
+  # `-L` as well as `-e`, so a symlink pointing at nothing is diagnosed as the
+  # broken settings file it is rather than silently taken for no settings at
+  # all.
+  if [ -e "$OKF_CONFIG" ] || [ -L "$OKF_CONFIG" ]; then
+    [ -f "$OKF_CONFIG" ] || die "$(display_path "$OKF_CONFIG") is not a regular file"
+    [ -r "$OKF_CONFIG" ] || die "$(display_path "$OKF_CONFIG") is not readable"
+
+    local merged
+    # jq reads the file itself, so its parse errors name it. --slurpfile rather
+    # than plain input because it makes "how many JSON values are in there?"
+    # answerable: an empty okf.json and a file with two objects in it are both
+    # mistakes, and both would otherwise pass as something.
+    merged="$(jq -n --argjson defaults "$OKF_DEFAULT_CONFIG" \
+      --slurpfile given "$OKF_CONFIG" '
+        if ($given | length) != 1 then
+          error("expected one JSON object, found "
+            + (($given | length) | tostring) + " JSON values")
+        elif ($given[0] | type) != "object" then
+          error("expected a JSON object, found " + ($given[0] | type))
+        else
+          ($defaults * $given[0]) as $merged
+          | if ($merged.bundle | type) != "object" then
+              error("bundle must be a JSON object, found " + ($merged.bundle | type))
+            else $merged end
+        end' 2>&1)" \
+      || die "cannot read settings from $(display_path "$OKF_CONFIG")" "$merged"
+    OKF_SETTINGS="$merged"
+  elif [ "$OKF_CONFIG_GIVEN" -eq 1 ]; then
+    # See OKF_CONFIG_GIVEN: a path the caller named and okf cannot find is a
+    # typo, not a request for the defaults.
+    die "--config: no such file: $(display_path "$OKF_CONFIG")"
+  else
+    OKF_SETTINGS="$OKF_DEFAULT_CONFIG"
+  fi
+
+  # SPEC.md §6 gives `bundle.root` a default of `.` and says nothing else about
+  # it, and nothing in okf acts on any other value: the bundle root is the repo
+  # root, which is what -C DIR moves. A setting nothing reads is worse than one
+  # that is not there — the caller has said where the bundle is and been ignored
+  # — so a root that is anything but the default is refused rather than quietly
+  # treated as the default. Whichever checklist item teaches okf to honour it
+  # replaces this.
+  # stderr to /dev/null: the merge above has already settled that `.bundle` is
+  # an object, so there is nothing left here for jq to complain about, and a
+  # diagnostic naming `<stdin>` would arrive ahead of okf's own line if there
+  # ever were.
+  local root
+  root="$(printf '%s\n' "$OKF_SETTINGS" \
+    | jq -r '.bundle.root // "." | tostring' 2> /dev/null)" \
+    || die "cannot read bundle.root from $(display_path "$OKF_CONFIG")"
+  case "$root" in
+    . | ./ | "") ;;
+    *)
+      die "bundle.root is set to \"$root\" in $(display_path "$OKF_CONFIG")" \
+        "okf does not act on it yet: the bundle root is the repo root" \
+        "use -C DIR to run against another root, and set bundle.root back to \".\""
+      ;;
+  esac
+
+  OKF_SETTINGS_LOADED=1
+}
+
+# One of SPEC.md §6's lists of strings, one per line.
+#
+# load_settings has already laid §6's defaults underneath, so every list §6
+# defines is there by the time this runs and a `null` cannot mean "not
+# configured" — it can only be one somebody wrote, and jq's `*` merge lets it
+# override the default it was written over. `{"exclude": null}` would otherwise
+# read as an empty exclude list and quietly put the whole build directory in
+# scope, which is the one wrong shape a type check would let through. Refused by
+# name instead, alongside every other wrong shape; an exclude list of nothing is
+# spelled `[]`.
+#
+# An empty string in one of these lists is refused here too, and refused here
+# rather than in the caller: by the time the caller reads this back, an empty
+# list and a list holding one empty string are both a single blank line and
+# cannot be told apart. Dropped as unusable, `"include": [""]` would leave no
+# include patterns at all, which reads as no narrowing — and so would put the
+# whole repository in scope for a setting nobody could act on.
+#
+# Newline-separated rather than NUL-separated, and a value containing a newline
+# is refused rather than supported: these are globs and file extensions, a
+# newline in one could only be a mistake, and every caller reads the result back
+# through a command substitution, which drops NUL bytes.
+#
+# The key path arrives as jq's own $ARGS.positional rather than interpolated
+# into the program text, so nothing here has to reason about quoting.
+settings_strings() { # $1.. = the path to a list, e.g. `bundle include`
+  load_settings
+
+  local label="" part
+  for part in "$@"; do
+    label="$label.$part"
+  done
+
+  local out
+  out="$(printf '%s\n' "$OKF_SETTINGS" | jq -r '
+      getpath($ARGS.positional) as $list
+      | if ($list | type) != "array" then
+          error("must be a list, found " + ($list | type))
+        else $list end
+      | map(
+          if type != "string" then
+            error("must hold strings, found " + type)
+          elif . == "" then
+            error("must not hold an empty value")
+          elif contains([10] | implode) then
+            error("must not hold a value with a newline in it")
+          else . end)
+      | .[]' --args "$@" 2>&1)" \
+    || die "$(display_path "$OKF_CONFIG"): $label ${out#jq: error*: }"
+
+  printf '%s\n' "$out"
+}
+
+# ---------------------------------------------------------------------------
+# Scope (SPEC.md §5)
+# ---------------------------------------------------------------------------
+
+# SPEC.md §5's last exclusion: "files carrying a `@Generated`-style annotation".
+#
+# What has to be told apart here is a file a generator wrote from a file that
+# merely says the word. Four branches, each shaped by how one family of language
+# actually writes the marker, and each narrow enough that prose does not fit:
+#
+#   `^@Generated(`     the annotation on the file's top-level type, which in
+#                      every language that has annotations sits in column 0 —
+#                      bare, or package-qualified as `@javax.annotation.Generated`.
+#   `^ * @generated`   the same fact inside a comment, at any indentation: the
+#                      docblock convention JavaScript and Flow use puts it on a
+#                      javadoc continuation line, and `#` languages put it in a
+#                      header comment.
+#   Go's header        which has no annotations and so states it in the only
+#                      form it has, in a shape its own tooling defines exactly.
+#
+# Every branch that anchors on the end of a line allows a `\r` before it, so a
+# repository checked out with CRLF line endings is scanned the same as one
+# without: without that, a generated file would read as hand-written on Windows
+# and on any checkout configured for it.
+#
+# Three narrowings do the work of telling a marker from a sentence, and each one
+# is a hand-written file that would otherwise be dropped from the bundle in
+# silence:
+#
+#   * Column 0, for the annotation form. A member annotation is indented and a
+#     type annotation is not, so a hand-written class carrying one generated
+#     `@Generated("lombok")` accessor stays — losing a whole file to one
+#     generated method would lose exactly the code most worth documenting.
+#   * Nothing after the marker but its own argument list or the end of the line.
+#     Column 0 alone cannot tell an annotation from prose in a language whose
+#     string literals reach it: a Python docstring opening a line with
+#     "@generated is what the codegen writes" is a sentence. This is also what
+#     keeps `@NotGenerated(...)` and `@regenerated` out — the name must be
+#     `Generated` itself, or a qualified path ending in it, and not merely end
+#     with the letters.
+#   * Lower case, for the comment form. `@generated` in a comment is the
+#     docblock convention, whereas `@Generated` is the name of a Java annotation
+#     — and Java writes that annotation in the code, never in a comment. So a
+#     comment naming it, as in `// @Generated marks the classes our codegen
+#     owns`, is a sentence about the annotation and not a marker.
+#   * Nothing after the comment form either, unless it closes the comment —
+#     `/* @generated */` is the whole of one — or it is the provenance a
+#     generator stamps beside it: `by`, `from`, `with`, or Facebook's
+#     `SignedSource`. That list is short because the real conventions are, and
+#     it is what separates `# @generated by codegen` from `# @generated is the
+#     marker our codegen writes` — the same shape, one a marker and one a
+#     sentence about markers. A generator that words its provenance some other
+#     way is missed, and a generated file left in the listing is at least a
+#     visible mistake; a hand-written file dropped from the bundle is not.
+#
+# JPA's `@GeneratedValue`, an ordinary field annotation on hand-written code, is
+# kept out by all of them at once.
+#
+# Deliberately no bare "DO NOT EDIT": that phrase turns up in hand-written
+# configuration and in comments about generated files, and dropping a source
+# from the bundle is a silent loss, so the marker has to be one nothing but a
+# generator writes.
+#
+# Written without a repeated group — `[A-Za-z_.]*` rather than
+# `([A-Za-z_][A-Za-z0-9_]*\.)*` — because ripgrep 14.1.0 silently stops matching
+# a repeated group once a second pattern is in play, and this pattern has four.
+OKF_GENERATED_MARKER='^@[Gg]enerated(\(|\r?$)|^@[A-Za-z_.]*\.[Gg]enerated(\(|\r?$)|^[[:space:]]*[/#*]+[[:space:]]*@generated([[:space:]]+(by|from|with|SignedSource)\b|[[:space:]]*\*/|\(|\r?$)|^//[[:space:]]*Code generated .* DO NOT EDIT\.\r?$'
+
+# How many paths go to ripgrep at once. One process for the whole repo would be
+# ideal and one per file would be slow; a batch keeps the argument list well
+# inside any ARG_MAX while leaving a normal repo at a single invocation.
+OKF_GENERATED_BATCH=400
+
+# The in-scope sources, bundle-relative and sorted, as `load_in_scope` left them.
+OKF_IN_SCOPE=()
+
+# The file extensions in scope, as `load_in_scope` read them from the settings.
+OKF_EXTENSIONS=()
+
+# `git ls-files` is how SPEC.md §5's first exclusion — "anything gitignored" —
+# is honoured, so a bundle root outside a work tree is not a scope okf can
+# answer for. Said here rather than left to git, whose own line is about a
+# missing .git directory and does not mention okf or the root it was pointed at.
+require_git_repo() {
+  local inside
+  inside="$(git rev-parse --is-inside-work-tree 2> /dev/null)" || inside=""
+  [ "$inside" = "true" ] || die "not inside a git work tree: $OKF_ROOT" \
+    "okf reads the repo's scope from git ls-files, which needs one"
+}
+
+# Refuses the gitignore constructs glob_regex does not implement, rather than
+# letting them through to be escaped into literals that can never match. Every
+# other setting of the wrong shape is refused by name; a `[Gg]` that quietly
+# excluded nothing at all would be the one that was not.
+check_supported_glob() { # $1 = a glob from okf.json, $2 = the key it came from
+  local where
+  where="$(display_path "$OKF_CONFIG"): $2"
+  case "$1" in
+    '!'*)
+      die "$where: a leading ! is gitignore's negation, which okf has not got: $1" \
+        "an exclude is undone by narrowing include, not by negating the exclude"
+      ;;
+    *'['* | *']'* | *'\'*)
+      die "$where: okf's globs have no character classes and no escapes: $1" \
+        "its wildcards are **, * and ?"
+      ;;
+    # The whole bundle, however it is spelled. Named here so the segment check
+    # below does not read the `.` in it as a segment going nowhere.
+    . | ./ | /) return 0 ;;
+  esac
+
+  # A `..` names something outside the bundle and a bare `.` names a step that
+  # goes nowhere, and okf matches the paths git lists — which have neither in
+  # them, so either one is a pattern that can only ever match nothing. Wrapped
+  # in separators so the test is on whole segments: a directory called `..stuff`
+  # is a perfectly ordinary name.
+  local segments="/${1#./}/"
+  case "$segments" in
+    */../* | */./*)
+      die "$where: a glob cannot contain a . or a .. segment: $1" \
+        "okf matches the paths under the bundle root that git lists, and they have neither"
+      ;;
+  esac
+}
+
+# One of SPEC.md §6's globs, spelled the one way the matcher below expects, or
+# nothing when it says nothing.
+#
+# Only what is genuinely redundant is folded away: a leading `./`, which says
+# nothing a bare name does not, and a run of trailing separators, which is one
+# separator. The leading `/` and the single trailing `/` are both left in place
+# and both mean something to glob_regex — anchored to the bundle root, and names
+# a directory. A leading `/` is SPEC.md §4's bundle-absolute spelling and
+# gitignore's anchor at once, and the two say the same thing: measured from the
+# bundle root and from nowhere else.
+#
+# A pattern that says only that — `.`, `/`, `./` — is the whole bundle, and
+# comes back as the `**` that says so. See the case at the end for why that is
+# not the same as dropping it.
+bundle_pattern() { # $1 = a glob from okf.json
+  local pattern="$1"
+
+  # `./x` becomes `/x` rather than `x`: both spellings say "x at the bundle
+  # root", and it is the leading `/` that carries that here. Stripped to a bare
+  # `x`, the pattern would be one with no `/` in it, which glob_regex reads as
+  # matching at any depth — `./src` would start matching `vendor/src/`.
+  #
+  # `./?*` and not `./*`: a bare `./` is the bundle root itself, and stripping
+  # it to nothing would lose that rather than shorten it.
+  local anchor=""
+  while :; do
+    case "$pattern" in
+      ./?*)
+        pattern="${pattern#./}"
+        anchor="/"
+        ;;
+      *) break ;;
+    esac
+  done
+  pattern="$anchor$pattern"
+
+  # A run of separators is one separator, wherever it falls: `src//**` is
+  # `src/**` written twice over, and left alone it compiles to a regular
+  # expression with a `//` in it that no path can match — an include that
+  # silently selects nothing.
+  while :; do
+    case "$pattern" in
+      *//*) pattern="${pattern%%//*}/${pattern#*//}" ;;
+      *) break ;;
+    esac
+  done
+
+  # The bundle root, however it is spelled, is the whole bundle — and is written
+  # out as such rather than dropped. Dropped, it would read as "narrows
+  # nothing", which is the right answer for `include` and the exact opposite of
+  # it for `exclude`: `"exclude": ["/"]` means every file, not no files.
+  case "$pattern" in
+    . | / | ./) pattern="**" ;;
+  esac
+
+  printf '%s\n' "$pattern"
+}
+
+# One of SPEC.md §6's globs as an anchored extended regular expression, which is
+# what bash's `=~` matches paths with.
+#
+# The dialect is gitignore's, because that is the one every `exclude` glob in
+# §6's defaults is written in and the one anybody editing okf.json will expect:
+#
+#   `**`      a whole path component of nothing but asterisks: any run of
+#             characters, `/` included
+#   `**/`     the same at the head of a component: any number of directories,
+#             none among them
+#   `*`       any run of characters within a single path component — and so is
+#             a `**` that is not a whole component of its own, which is what
+#             makes `src/**.ts` the same pattern as `src/*.ts`
+#   `?`       one character, but not `/`
+#   anything else, literally
+#
+# Gitignore's remaining constructs — `!` negation, `[...]` classes, backslash
+# escapes — are not implemented, and check_supported_glob refuses a pattern that
+# uses one rather than letting this function escape it into a literal nobody
+# meant and nothing matches.
+#
+# And gitignore's two rules about the separator, which are what decide where a
+# pattern is measured from and how far down it reaches:
+#
+#   * A `/` anywhere but at the end anchors the pattern to the bundle root, and
+#     a leading `/` anchors it while saying nothing else. A pattern with no `/`
+#     in it — `target`, `*.min.js` — matches at any depth, which is what makes
+#     the obvious `"exclude": ["target"]` reach `src/target/` and not only a
+#     `target/` sitting at the root.
+#   * Every pattern matches what is under it as well as itself, because okf only
+#     ever matches file paths and a pattern naming a directory would otherwise
+#     match nothing at all: `git ls-files` prints no directories for `vendor` or
+#     `**/vendor/` to match. A trailing `/` says the pattern names a directory,
+#     and then it is only the contents that match.
+#
+# Written here rather than handed to `git ls-files` as a `:(glob,exclude)`
+# pathspec, which is where this started: git derives a common directory prefix
+# from the positive pathspecs and matches the negative ones against paths with
+# that prefix already taken off, so `**/vendor/**` stops excluding as soon as
+# every include shares one directory — and a second exclude that matches nothing
+# at all can empty the listing outright (git 2.43). Matching both lists here
+# instead also means include and exclude cannot disagree about what a pattern
+# means, which two matchers eventually would.
+glob_regex() { # $1 = a normalised glob
+  local rest="$1" out tail='(/.*)?$' ch anchored=0
+
+  case "$rest" in
+    */)
+      rest="${rest%/}"
+      tail='/.*$'
+      ;;
+  esac
+
+  case "$rest" in
+    /*)
+      anchored=1
+      rest="${rest#/}"
+      ;;
+    */*) anchored=1 ;;
+  esac
+
+  if [ "$anchored" -eq 1 ]; then
+    out="^"
+  else
+    out="^(.*/)?"
+  fi
+
+  # Whether the next character starts a whole path component, which is what
+  # decides between gitignore's two readings of `**`: a component that is
+  # nothing but `**` crosses separators, and asterisks anywhere else are a
+  # plain `*` however many of them there are. `src/**.ts` is `src/*.ts`.
+  local at_component=1
+
+  while [ -n "$rest" ]; do
+    case "$rest" in
+      '**/'*)
+        if [ "$at_component" -eq 1 ]; then
+          out="$out(.*/)?"
+          rest="${rest#'**/'}"
+          at_component=1
+          continue
+        fi
+        ;;
+      '**')
+        if [ "$at_component" -eq 1 ]; then
+          out="$out.*"
+          rest=""
+          continue
+        fi
+        ;;
+    esac
+
+    case "$rest" in
+      '*'*)
+        # A run of asterisks that is not a whole component: one `*`, per
+        # gitignore's "other consecutive asterisks are considered regular
+        # asterisks".
+        while :; do
+          case "$rest" in
+            '*'*) rest="${rest#'*'}" ;;
+            *) break ;;
+          esac
+        done
+        out="$out[^/]*"
+        at_component=0
+        ;;
+      '?'*)
+        out="$out[^/]"
+        rest="${rest#?}"
+        at_component=0
+        ;;
+      /*)
+        out="$out/"
+        rest="${rest#/}"
+        at_component=1
+        ;;
+      *)
+        # The first character, taken by removing everything after it. Only the
+        # extended regular expression metacharacters are escaped: a backslash
+        # before an ordinary character is undefined in POSIX ERE, so escaping
+        # everything would be the less safe of the two. `*`, `?` and `/` are not
+        # on the list because the branches above have already taken every one of
+        # them.
+        ch="${rest%"${rest#?}"}"
+        case "$ch" in
+          '\' | '.' | '[' | ']' | '(' | ')' | '{' | '}' | '+' | '|' | '^' | '$')
+            out="$out\\$ch"
+            ;;
+          *) out="$out$ch" ;;
+        esac
+        rest="${rest#?}"
+        at_component=0
+        ;;
+    esac
+  done
+
+  printf '%s%s\n' "$out" "$tail"
+}
+
+# Whether a path matches any of the given anchored regular expressions. No
+# expressions is no match, which is what leaves an empty `exclude` excluding
+# nothing.
+matches_any() { # $1 = a bundle-relative path, $2.. = anchored regular expressions
+  local path="$1" expression
+  shift
+  # ${1+"$@"} rather than "$@": under `set -u` an empty "$@" is an unbound
+  # variable on bash 3.2, which is still what macOS ships, and empty is exactly
+  # the case of an `exclude` list with nothing in it.
+  for expression in ${1+"$@"}; do
+    # Unquoted on the right, which is what makes bash read it as a pattern
+    # rather than as the literal text of one.
+    if [[ $path =~ $expression ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Whether a path's extension is one of SPEC.md §6's `extensions`.
+#
+# Matched exactly as written, not case-folded: the settings say `java`, every
+# toolchain in §6's default list writes its extension in lower case, and folding
+# would need a tool SPEC.md §3 does not list. A project whose sources are `.CBL`
+# spells it `CBL` in okf.json.
+#
+# An empty list is no restriction rather than no files: `extensions` narrows the
+# listing, and there is nothing to narrow by. A file whose name has no dot in it
+# past a leading one has no extension at all, so `.gitignore` is not a file with
+# a `gitignore` extension.
+in_scope_extension() { # $1 = a bundle-relative path
+  [ "${#OKF_EXTENSIONS[@]}" -gt 0 ] || return 0
+
+  local name="${1##*/}" ext want
+  name="${name#.}"
+  case "$name" in
+    *.*) ext="${name##*.}" ;;
+    *) return 1 ;;
+  esac
+
+  for want in "${OKF_EXTENSIONS[@]}"; do
+    [ "$ext" = "$want" ] || continue
+    return 0
+  done
+  return 1
+}
+
+# Appends the given paths to OKF_IN_SCOPE, in the order given, minus the ones
+# carrying a generated marker.
+#
+# One batch, one ripgrep, and the membership test that follows is over that
+# batch alone. That bound is the point of batching, not the argument list: the
+# test is a substring search per path over a string holding the batch's
+# generated paths, so what it costs depends on OKF_GENERATED_BATCH and not on
+# how big the repository is. Over the whole repository at once it would be
+# quadratic in the file count, and worst exactly where it matters — a repo that
+# is mostly generated code has both the most paths to test and the longest
+# string to test them against.
+#
+# The paths are joined by newlines and each wrapped in them, so the test is on
+# whole paths and not on any path that ends in another. That is exact for every
+# path without a newline in it; one that has a newline is legal, vanishingly
+# rare and cheap to notice, and falls back to a scan of the batch's generated
+# paths rather than being matched against the wrong entry.
+keep_hand_written() { # $1.. = one batch of candidate paths
+  local -a generated=()
+  local record
+  while IFS= read -r -d '' record; do
+    generated+=("$record")
+  done < <(
+    # ripgrep's status carried out in the stream, since a process
+    # substitution's own is invisible to the shell reading it. Without it a
+    # ripgrep that failed outright would hand back no generated paths at all —
+    # which reads exactly like a batch with none, and would put every generated
+    # file in the bundle with nothing said. `set +e` so the errexit inherited
+    # here does not act on the 1 that means "nothing matched", which is the
+    # ordinary answer for a hand-written repo.
+    set +e
+    rg --no-config --no-ignore --files-with-matches --null \
+      -e "$OKF_GENERATED_MARKER" -- "$@"
+    printf 'status:%s\0' "$?"
+  )
+
+  local count="${#generated[@]}"
+  [ "$count" -gt 0 ] \
+    || die "the generated-source scan wrote nothing at all, not even its exit status"
+  local status="${generated[$((count - 1))]}"
+  unset "generated[$((count - 1))]"
+  case "$status" in
+    # Matched, or matched nothing. Anything else is a scan that did not happen,
+    # and a scan that did not happen looks exactly like a batch with no
+    # generated code — so it is said rather than acted on. ripgrep's own
+    # message, naming the file it could not read, has already gone to stderr.
+    status:0 | status:1) ;;
+    *)
+      die "ripgrep could not scan for generated sources — see its message above" \
+        "okf cannot tell which of these files a generator wrote, so it will not guess"
+      ;;
+  esac
+
+  local newline='
+'
+  local blob="" joined=1
+  for record in ${generated[@]+"${generated[@]}"}; do
+    case "$record" in
+      *"$newline"*)
+        joined=0
+        break
+        ;;
+    esac
+    blob="$blob$record$newline"
+  done
+  blob="$newline$blob"
+
+  local path marked
+  for path in "$@"; do
+    if [ "$joined" -eq 1 ]; then
+      case "$blob" in
+        *"$newline$path$newline"*) marked=1 ;;
+        *) marked=0 ;;
+      esac
+    else
+      marked=0
+      for record in ${generated[@]+"${generated[@]}"}; do
+        if [ "$record" = "$path" ]; then
+          marked=1
+          break
+        fi
+      done
+    fi
+    [ "$marked" -eq 0 ] || continue
+    OKF_IN_SCOPE+=("$path")
+  done
+}
+
+# Fills OKF_IN_SCOPE with the repo's in-scope sources: SPEC.md §5's exclusions
+# applied to `git ls-files`, narrowed by SPEC.md §6's include, exclude and
+# extensions.
+#
+# The exclusions divide up as follows. Gitignored files are absent from
+# `git ls-files` to begin with — which also settles the one case where "is it
+# ignored?" has two answers: a file somebody committed with `git add -f` matches
+# an ignore rule and is tracked anyway, and git does not ignore it. Neither does
+# okf. A file deliberately put under version control is part of what the repo
+# says it is, and a repo that wants it out of the bundle as well says so in
+# `exclude`, where it can be seen.
+#
+# Build and output directories and vendored trees
+# are `exclude` globs, and nothing here hard-codes either: a list okf applied on
+# top of the settings would be one no okf.json could take back out, and §6 makes
+# `exclude` the place that decision is written down.
+#
+# That leaves one gap worth naming: §5 calls out vendored trees and §6's default
+# `exclude` covers only the build and output directories — `target`, `build`,
+# `node_modules`, `dist` — so a repo with a `vendor/` tree and no okf.json lists
+# it. §6 is where that is settled and §6 is read-only, so the answer is a
+# `**/vendor/**` in the repo's own okf.json, which is what tests/fixtures/scoped
+# does.
+#
+# The `@Generated` scan is the one that has to read files, so it runs last, over
+# what is left.
+load_in_scope() {
+  require_git_repo
+  load_settings
+
+  # Assigned on their own lines, not as `local x="$(...)"`: `local` returns
+  # success whatever the command substitution did, which would swallow both
+  # `set -e` and the status of a settings_strings that died inside the subshell
+  # having already printed why.
+  local includes excludes extensions
+  includes="$(settings_strings bundle include)" || exit 1
+  excludes="$(settings_strings bundle exclude)" || exit 1
+  extensions="$(settings_strings bundle extensions)" || exit 1
+
+  local -a include_res=() exclude_res=()
+  local pattern
+  # The blank line is the empty list, not an empty pattern: settings_strings
+  # refuses an empty string outright, and a here-string of nothing is still one
+  # line. Past it, bundle_pattern always answers with a pattern — the bundle
+  # root comes back as `**` rather than as nothing — so there is nothing else
+  # here to skip.
+  while IFS= read -r pattern; do
+    [ -n "$pattern" ] || continue
+    check_supported_glob "$pattern" .bundle.include
+    include_res+=("$(glob_regex "$(bundle_pattern "$pattern")")")
+  done <<< "$includes"
+  while IFS= read -r pattern; do
+    [ -n "$pattern" ] || continue
+    check_supported_glob "$pattern" .bundle.exclude
+    exclude_res+=("$(glob_regex "$(bundle_pattern "$pattern")")")
+  done <<< "$excludes"
+
+  OKF_EXTENSIONS=()
+  local ext
+  while IFS= read -r ext; do
+    [ -n "$ext" ] || continue
+    # A settings file that spells them `.java` means the same thing as `java`.
+    OKF_EXTENSIONS+=("${ext#.}")
+  done <<< "$extensions"
+
+  # No pathspec: the whole index comes out here and the globs above narrow it
+  # below, because the two lists have to be matched by one matcher and git's
+  # cannot be the one — see glob_regex.
+  local -a records=()
+  local record
+  while IFS= read -r -d '' record; do
+    records+=("$record")
+  done < <(
+    # A process substitution's exit status is invisible to the shell reading it,
+    # so git's is carried out as one more NUL record. Without it, a git that
+    # failed — an unreadable index, a repository in a state it will not answer
+    # for — would be an empty listing reported as a repo with nothing in scope.
+    # `set +e` because the errexit inherited here would otherwise take the
+    # subshell down before the status could be written.
+    set +e
+    git ls-files -z
+    printf 'status:%s\0' "$?"
+  )
+
+  local count="${#records[@]}"
+  [ "$count" -gt 0 ] \
+    || die "git ls-files wrote nothing at all, not even its exit status"
+  local status="${records[$((count - 1))]}"
+  unset "records[$((count - 1))]"
+  [ "$status" = "status:0" ] \
+    || die "git ls-files failed in $OKF_ROOT — see its message above"
+
+  local -a candidates=()
+  local previous="" path
+  for path in ${records[@]+"${records[@]}"}; do
+    # `git ls-files` prints an unmerged path once per stage, so a repo stopped
+    # in the middle of a conflicted merge names the same file three times. The
+    # listing is sorted, so the repeats are adjacent.
+    [ "$path" != "$previous" ] || continue
+    previous="$path"
+    # Extension first: it is the cheapest of the three and, on the repos §6's
+    # defaults describe, the one that rules out the most.
+    in_scope_extension "$path" || continue
+    # A tracked symbolic link is a path whose content, as far as git is
+    # concerned, is the target it names and not the source at the end of it.
+    # Following one would put a second concept beside a file that already has
+    # its own — SPEC.md §5 co-locates one concept per declared type, and a link
+    # is not a second declaration — and the two would then drift apart
+    # independently. A link out of the work tree is worse: what `okf check`
+    # would take a sha256 of is content git does not version at all. Tested
+    # before `-f`, which follows the link and would answer for its target.
+    [ ! -L "$path" ] || continue
+    # `git ls-files` answers from the index, which still holds a file that has
+    # been deleted from the working tree and not yet staged as removed. Nothing
+    # downstream of this listing can do anything with a path that is not there —
+    # not the @Generated scan below, not the sha256 `okf check` will want, and
+    # not the read a slash command has to do to document it.
+    [ -f "$path" ] || continue
+    if matches_any "$path" ${exclude_res[@]+"${exclude_res[@]}"}; then
+      continue
+    fi
+    # An include list that narrows nothing is no narrowing rather than no
+    # files: `include` is the filter, and with nothing to filter by there is
+    # nothing filtered out.
+    if [ "${#include_res[@]}" -gt 0 ]; then
+      matches_any "$path" "${include_res[@]}" || continue
+    fi
+    candidates+=("$path")
+  done
+
+  OKF_IN_SCOPE=()
+  [ "${#candidates[@]}" -gt 0 ] || return 0
+
+  # The @Generated scan, in batches: one ripgrep per batch, and each batch
+  # filtered against its own results before the next one starts. Batching keeps
+  # the argument list well inside any ARG_MAX, and — see keep_hand_written —
+  # keeps the cost of deciding which paths came back bounded by the batch rather
+  # than by the size of the repository.
+  local -a batch=()
+  for path in "${candidates[@]}"; do
+    batch+=("$path")
+    if [ "${#batch[@]}" -ge "$OKF_GENERATED_BATCH" ]; then
+      keep_hand_written "${batch[@]}"
+      batch=()
+    fi
+  done
+  [ "${#batch[@]}" -eq 0 ] || keep_hand_written "${batch[@]}"
 }
 
 # ---------------------------------------------------------------------------
@@ -819,7 +1597,43 @@ cmd_init() {
 }
 
 # okf list [--missing] [--orphans] — in-scope source files
-cmd_list() { not_implemented list; }
+cmd_list() {
+  local missing=0 orphans=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --missing) missing=1 ;;
+      --orphans) orphans=1 ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        die "list: unknown flag: $1" "usage: okf list [--missing] [--orphans]"
+        ;;
+      *) break ;;
+    esac
+    shift
+  done
+
+  [ $# -eq 0 ] || die "list takes no arguments, but was given: $1" \
+    "usage: okf list [--missing] [--orphans]"
+
+  # Recognised by the parser above so that a caller who types one is told it is
+  # not built yet rather than told it is not a flag — the difference between
+  # something to wait for and something to stop typing. Each is its own PLAN.md
+  # item; until then, exiting 1 keeps a caller from mistaking the whole listing
+  # for the filtered one they asked for.
+  [ "$missing" -eq 0 ] || die "list: --missing is not implemented yet"
+  [ "$orphans" -eq 0 ] || die "list: --orphans is not implemented yet"
+
+  load_in_scope
+
+  local path
+  for path in ${OKF_IN_SCOPE[@]+"${OKF_IN_SCOPE[@]}"}; do
+    printf '%s\n' "$path"
+  done
+}
 
 # okf hash <file> — sha256:… of one file
 cmd_hash() { not_implemented hash; }
@@ -856,6 +1670,10 @@ main() {
   # of these are checked at dispatch, where the subcommand asked for is known —
   # a caller who typed `okf list` is not told to install curl.
   preflight
+
+  # Before anything reaches git, and before -C is even read: what these name
+  # outranks both the flag and the directory okf is standing in.
+  isolate_git_environment
 
   # SPEC.md §7's -C DIR and --config PATH, taken out of the line here so that
   # everything below — the bare-invocation check, dispatch, the subcommand's

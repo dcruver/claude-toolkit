@@ -1,0 +1,15 @@
+{
+  "okf_version": "0.2",
+  "bundle": {
+    "root": ".",
+    "include": ["src/**", "lib/**"],
+    "exclude": ["**/target/**", "**/build/**", "**/node_modules/**", "**/dist/**", "**/vendor/**"],
+    "extensions": ["java", "ts", "tsx", "py", "rs", "go", "js", "mjs"]
+  },
+  "tiers": {
+    "tier0_max_members": 2,
+    "tier0_max_loc": 15,
+    "tier2_min_fan_in": 8,
+    "tier2_min_loc": 200
+  }
+}

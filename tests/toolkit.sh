@@ -1438,10 +1438,12 @@ PROBE
 # left of the line to the subcommand. Calling parse_globals directly proves the
 # resolution and nothing about who acts on it.
 #
-# The stub that every unimplemented subcommand shares is replaced, after
-# sourcing, with one that reports instead of dying — so main runs all the way
-# through dispatch and the report is made from inside the subcommand, where the
-# process has finished moving.
+# Every subcommand's own function is replaced, after sourcing, with one that
+# reports instead of doing its work — so main runs all the way through dispatch
+# and the report is made from inside the subcommand, where the process has
+# finished moving. All of them rather than the stub they used to share: as the
+# checklist replaces those stubs one by one, a probe that hooked the stub would
+# quietly stop being reached by the subcommand it was pointed at.
 _okf_dispatch_context() { # $1 = directory to run from, $2.. = okf arguments
   local from="$1"
   shift
@@ -1453,7 +1455,7 @@ okf_script="$1"
 shift
 # shellcheck source=/dev/null
 . "$okf_script"
-not_implemented() { # $1 = subcommand name
+_report_context() { # $1 = subcommand name
   local args="" arg
   for arg in ${OKF_ARGV[@]+"${OKF_ARGV[@]}"}; do
     args="$args[$arg]"
@@ -1464,6 +1466,9 @@ not_implemented() { # $1 = subcommand name
   printf 'sub=%s\n' "$1"
   printf 'args=%s\n' "$args"
 }
+for _sub in "${OKF_SUBCOMMANDS[@]}"; do
+  eval "cmd_$_sub() { _report_context $_sub; }"
+done
 main ${1+"$@"}
 PROBE
     chmod +x "$probe" || return 1
@@ -1605,19 +1610,15 @@ _okf_global_flags_dispatch_probe() {
 
   # -C names a directory, and one that is not there is worth saying so about in
   # the same single line the preflight uses — before dispatch, so no subcommand
-  # has begun work against the wrong tree. "not implemented" is what every
-  # stub says, and its absence is what shows nothing was dispatched.
+  # has begun work against the wrong tree. The one line being -C's own refusal
+  # is what shows nothing was dispatched: anything the subcommand said instead,
+  # having been handed a root that is not there, would be a different line.
   assert_exit 1 "$okf" -C "$FIXTURE_DIR/definitely-not-a-directory" list
   out="$(last_output)"
   assert_eq 1 "$(_okf_line_count "$out")" "a -C at a missing directory is one line"
   assert_contains "$out" "definitely-not-a-directory" "that line names the directory"
-  case "$out" in
-    *"not implemented"*)
-      _fail "a -C at a missing directory stops before dispatch" \
-        "the subcommand ran anyway:" "$out"
-      ;;
-    *) _pass "a -C at a missing directory stops before dispatch" ;;
-  esac
+  assert_contains "$out" "-C:" \
+    "a -C at a missing directory stops before dispatch, with -C's own refusal"
 
   # A directory that is there but cannot be entered is -C's failure to report,
   # in the same single line: bash's own cd diagnostic names a line number
@@ -1924,11 +1925,11 @@ _okf_spec_config_json() {
   ' "$TOOLKIT_ROOT/SPEC.md"
 }
 
-# The two things the init checks need before they can mean anything: a bin/okf
+# The two things any okf check needs before it can mean anything: a bin/okf
 # to run, and the jq SPEC.md §3 makes a hard requirement of it. jq is not an
 # extra dependency taken on here — a machine without it cannot run okf at all,
 # so there would be nothing for these checks to read back.
-_okf_init_preconditions() {
+_okf_preconditions() {
   local okf="$TOOLKIT_ROOT/bin/okf"
   if [ ! -x "$okf" ]; then
     _fail "bin/okf is an executable script" "missing or not executable: $okf"
@@ -2116,7 +2117,7 @@ _okf_init_force_probe() {
 
 # SPEC.md §6 defines okf.json's contents and §7 makes writing it `okf init`.
 test_okf_init_writes_the_spec_defaults() {
-  _okf_init_preconditions || return 1
+  _okf_preconditions || return 1
   # In a throwaway repo, not the checkout: `okf init` here would drop an
   # okf.json into the toolkit itself.
   with_fixture_repo tiny _okf_init_defaults_probe
@@ -2125,7 +2126,7 @@ test_okf_init_writes_the_spec_defaults() {
 # The other half of the same PLAN.md item: an existing okf.json is not
 # overwritten without --force.
 test_okf_init_refuses_to_overwrite_without_force() {
-  _okf_init_preconditions || return 1
+  _okf_preconditions || return 1
   with_fixture_repo tiny _okf_init_force_probe
 }
 
@@ -2462,15 +2463,592 @@ _okf_init_index_force_probe() {
 # and the only file in a bundle where okf_version is legal. §7 makes writing it
 # `okf init`'s job, alongside okf.json.
 test_okf_init_writes_the_bundle_root_index() {
-  _okf_init_preconditions || return 1
+  _okf_preconditions || return 1
   with_fixture_repo tiny _okf_init_index_probe
 }
 
 # The other half of the same PLAN.md item: an existing bundle-root index.md is
 # not overwritten without --force.
 test_okf_init_refuses_to_overwrite_the_index_without_force() {
-  _okf_init_preconditions || return 1
+  _okf_preconditions || return 1
   with_fixture_repo tiny _okf_init_index_force_probe
+}
+
+# What `okf list` prints in tests/fixtures/scoped, whose own okf.json is
+# SPEC.md §6's defaults plus a `**/vendor/**` glob. Every other file in that
+# tree is left out by one of SPEC.md §5's exclusion rules, and the fixture's
+# README.md says which rule leaves out which file.
+_OKF_SCOPED_LISTING='lib/conventions.py
+lib/core.py
+src/app.ts
+src/generated/Handwritten.java
+src/util/Accessors.java
+src/util/helper.ts'
+
+# Compares okf's stdout — not the stdout+stderr assert_exit records — against a
+# whole expected listing. A listing is an ordered set, and a check that could
+# only say "src/app.ts is in there somewhere" would pass a command that also
+# printed the vendored tree.
+_okf_assert_listing() { # $1 = expected listing, $2 = description, $3.. = okf arguments
+  local expected="$1" what="$2"
+  shift 2
+
+  local stderr="$HARNESS_STATE/okf-list-stderr" actual rc
+  actual="$("$TOOLKIT_ROOT/bin/okf" "$@" 2> "$stderr")"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    local -a detail=("okf $* exited $rc" "stderr:")
+    local line
+    while IFS= read -r line; do detail+=("$line"); done \
+      < <(_detail_lines "$(cat "$stderr" 2> /dev/null)")
+    _fail "$what" "${detail[@]}"
+    return 1
+  fi
+  assert_eq "$expected" "$actual" "$what"
+}
+
+# Whole-line membership, not `assert_contains`: `src/util/helper.md` contains
+# `src/util/helper.ts`'s stem, and a substring check would call the concept file
+# listed whenever its source was.
+_okf_assert_listed() { # $1 = listing, $2 = path, $3 = description
+  local line
+  while IFS= read -r line; do
+    if [ "$line" = "$2" ]; then
+      _pass "$3"
+      return 0
+    fi
+  done <<< "$1"
+  _fail "$3" "$2 is not in the listing"
+  return 1
+}
+
+_okf_assert_not_listed() { # $1 = listing, $2 = path, $3 = description
+  local line
+  while IFS= read -r line; do
+    if [ "$line" = "$2" ]; then
+      _fail "$3" "$2 is in the listing"
+      return 1
+    fi
+  done <<< "$1"
+  _pass "$3"
+  return 0
+}
+
+# SPEC.md §5's exclusion rules, each named on its own, so a listing that goes
+# wrong says which rule stopped working rather than only that one did.
+_okf_list_scope_probe() {
+  local okf="$TOOLKIT_ROOT/bin/okf" listing
+
+  # tests/fixtures/scoped carries its own .gitignore, which the *toolkit's*
+  # repository obeys too: without a `git add -f`, the ignored fixture file is
+  # never committed here, never copied into the fixture repo, and every check
+  # below that it is not listed passes because there is nothing to list. A
+  # check that cannot fail is worse than no check, so look for the file first.
+  if [ -f src/ignored/secret.ts ]; then
+    _pass "the fixture's gitignored source is present to be excluded"
+  else
+    _fail "the fixture's gitignored source is present to be excluded" \
+      "no src/ignored/secret.ts under $PWD — it needs a git add -f in the toolkit repo"
+    return 1
+  fi
+  assert_eq "" "$(git ls-files src/ignored 2> /dev/null)" \
+    "and git does not track it, so git ls-files cannot see it"
+
+  _okf_assert_listing "$_OKF_SCOPED_LISTING" \
+    "okf list prints the fixture's in-scope sources" list || return 1
+
+  listing="$("$okf" list 2> /dev/null)"
+
+  _okf_assert_listed "$listing" src/app.ts "a source under an include glob is listed"
+  _okf_assert_listed "$listing" lib/core.py "so is one under the second include glob"
+
+  _okf_assert_not_listed "$listing" src/ignored/secret.ts \
+    "a gitignored source is out of scope"
+  _okf_assert_not_listed "$listing" src/target/Stale.java \
+    "a build-output directory is out of scope"
+  _okf_assert_not_listed "$listing" lib/vendor/pinned.py \
+    "a vendored tree is out of scope"
+  _okf_assert_not_listed "$listing" lib/node_modules/left-pad/index.js \
+    "and so is node_modules"
+  _okf_assert_not_listed "$listing" tools/build.js \
+    "a source outside every include glob is out of scope"
+  _okf_assert_not_listed "$listing" src/notes.md \
+    "a file whose extension is not listed is out of scope"
+  _okf_assert_not_listed "$listing" src/util/helper.md \
+    "a concept file is not itself a source"
+  _okf_assert_not_listed "$listing" src/data.json "and neither is a data file"
+
+  # The one exclusion that has to read the file: a @Generated annotation on the
+  # top-level type puts a source out of scope, while a sentence about one, and
+  # one on a single member of a hand-written class, do not.
+  _okf_assert_not_listed "$listing" src/generated/Api.java \
+    "a source carrying a @Generated annotation is out of scope"
+  _okf_assert_not_listed "$listing" src/generated/Ports.py \
+    "and so is one carrying the # @generated header convention"
+  _okf_assert_not_listed "$listing" src/generated/ping.go \
+    "and Go's generated header, which that fixture writes with CRLF line endings"
+  _okf_assert_not_listed "$listing" src/generated/config.js \
+    "and the one-line /* @generated */ block comment"
+  _okf_assert_listed "$listing" src/generated/Handwritten.java \
+    "a source that only names @Generated in prose and in @NotGenerated stays in scope"
+  _okf_assert_listed "$listing" src/util/Accessors.java \
+    "so does one whose @Generated is on a member rather than on the type"
+  _okf_assert_listed "$listing" lib/conventions.py \
+    "and one whose docstring and comments open lines with @generated, as prose"
+
+  # A tracked symlink is a second name for a file that already has a concept of
+  # its own, so listing it would put two independently drifting concepts beside
+  # one declared type.
+  if ln -s app.ts src/alias.ts > /dev/null 2>&1 \
+    && git add src/alias.ts > /dev/null 2>&1; then
+    listing="$("$okf" list 2> /dev/null)"
+    _okf_assert_not_listed "$listing" src/alias.ts \
+      "a tracked symlink is not itself a source"
+    _okf_assert_listed "$listing" src/app.ts "while the file it points at still is"
+    git rm -q --cached src/alias.ts > /dev/null 2>&1
+    rm -f src/alias.ts
+  else
+    _fail "a tracked symlink can be made in the fixture copy" "ln -s src/alias.ts failed"
+  fi
+  listing="$("$okf" list 2> /dev/null)"
+
+  # git ls-files answers from the index, which still names a file deleted from
+  # the working tree. Nothing downstream can read a path that is not there.
+  rm -f lib/core.py
+  _okf_assert_not_listed "$("$okf" list 2> /dev/null)" lib/core.py \
+    "a source deleted from the working tree is not listed"
+  if git checkout -- lib/core.py > /dev/null 2>&1; then
+    _okf_assert_listed "$("$okf" list 2> /dev/null)" lib/core.py \
+      "and is listed again once it is back"
+  else
+    _fail "the fixture copy restores a deleted file" "git checkout -- lib/core.py failed"
+  fi
+
+  # git's order is sorted, and nothing downstream should have to sort it again.
+  assert_eq "$listing" "$("$okf" list 2> /dev/null)" \
+    "okf list prints the same listing twice running"
+
+  # Scope comes out of the index, so a file git has never been told about is
+  # not yet part of what the repo says it is.
+  printf 'export const fresh = 1;\n' > src/fresh.ts
+  _okf_assert_not_listed "$("$okf" list 2> /dev/null)" src/fresh.ts \
+    "a source git does not track is not listed"
+  if git add src/fresh.ts > /dev/null 2>&1; then
+    _okf_assert_listed "$("$okf" list 2> /dev/null)" src/fresh.ts \
+      "and is listed once git has been told about it"
+    git rm -q --cached src/fresh.ts > /dev/null 2>&1
+  else
+    _fail "the fixture copy accepts a git add" "git add src/fresh.ts failed"
+  fi
+  rm -f src/fresh.ts
+
+  # -C moves the root every path resolves against, so the same listing comes
+  # out of a run started somewhere else entirely.
+  local elsewhere
+  elsewhere="$(CDPATH= cd "$TOOLKIT_ROOT" && "$okf" -C "$FIXTURE_DIR" list 2> /dev/null)"
+  assert_eq "$_OKF_SCOPED_LISTING" "$elsewhere" \
+    "okf -C DIR list lists DIR's sources, whatever the caller's own directory"
+
+  # git reads GIT_DIR and GIT_INDEX_FILE ahead of both -C and the directory it
+  # is standing in, and git exports them to every hook it runs — which is where
+  # SPEC.md §11 has bin/ralph refreshing concepts. Inherited, they would have
+  # `git ls-files` answer for the toolkit's own repository, whose paths do not
+  # exist under this root: an empty listing, exiting 0, saying nothing.
+  local hooked
+  hooked="$(env "GIT_DIR=$TOOLKIT_ROOT/.git" "GIT_INDEX_FILE=$TOOLKIT_ROOT/.git/index" \
+    "$okf" -C "$FIXTURE_DIR" list 2> /dev/null)"
+  assert_eq "$_OKF_SCOPED_LISTING" "$hooked" \
+    "okf list answers for the root it was given, not for a GIT_DIR in the environment"
+  return 0
+}
+
+# SPEC.md §6's include, exclude and extensions, each moved in turn. The fixture
+# copy is a throwaway, so its okf.json can be rewritten between checks.
+_okf_list_settings_probe() {
+  # include narrows the listing. The exclude globs are restated because a
+  # settings file that leaves a key out gets SPEC.md §6's default for it, and
+  # §6's default exclude has no `**/vendor/**` in it.
+  printf '%s\n' '{"bundle": {"include": ["lib/**"],
+    "exclude": ["**/vendor/**", "**/node_modules/**"]}}' > okf.json
+  _okf_assert_listing 'lib/conventions.py
+lib/core.py' \
+    "okf list honours a narrowed include" list
+
+  # The same two files, reached by SPEC.md §4's bundle-absolute spelling and
+  # with a trailing separator: `/lib/` and `lib/**` name one directory.
+  printf '%s\n' '{"bundle": {"include": ["/lib/"],
+    "exclude": ["**/vendor/**", "**/node_modules/**"]}}' > okf.json
+  _okf_assert_listing 'lib/conventions.py
+lib/core.py' \
+    "okf list reads /lib/ as the same include as lib/**" list
+
+  # Emptying exclude is what shows the exclusions were doing the work: the
+  # build output, the vendored tree and node_modules all come back.
+  printf '%s\n' '{"bundle": {"include": ["src/**", "lib/**"], "exclude": []}}' > okf.json
+  _okf_assert_listing 'lib/conventions.py
+lib/core.py
+lib/node_modules/left-pad/index.js
+lib/vendor/pinned.py
+src/app.ts
+src/generated/Handwritten.java
+src/target/Stale.java
+src/util/Accessors.java
+src/util/helper.ts' \
+    "okf list honours an emptied exclude" list
+
+  # ...but not the gitignored one or the generated one, which no okf.json can
+  # bring back.
+  local listing
+  listing="$("$TOOLKIT_ROOT/bin/okf" list 2> /dev/null)"
+  _okf_assert_not_listed "$listing" src/ignored/secret.ts \
+    "an emptied exclude does not un-ignore a gitignored source"
+  _okf_assert_not_listed "$listing" src/generated/Api.java \
+    "nor does it un-generate a @Generated source"
+
+  # extensions decides what counts as a source at all.
+  printf '%s\n' '{"bundle": {"include": ["src/**"], "exclude": [],
+    "extensions": ["md"]}}' > okf.json
+  _okf_assert_listing 'src/notes.md
+src/util/helper.md' \
+    "okf list honours a changed extensions list" list
+
+  # An include list that narrows nothing leaves the rest of the repo in reach,
+  # which is what puts tools/ — outside every default include — in the listing.
+  printf '%s\n' '{"bundle": {"include": [],
+    "exclude": ["**/target/**", "**/node_modules/**", "**/vendor/**"],
+    "extensions": ["js"]}}' > okf.json
+  _okf_assert_listing 'tools/build.js' \
+    "okf list treats an empty include as no narrowing rather than no files" list
+
+  # An exclude naming the bundle root excludes the bundle. Dropping such a
+  # pattern as "narrows nothing" would be the right reading for include and the
+  # exact opposite of it here.
+  printf '%s\n' '{"bundle": {"include": [], "exclude": ["/"]}}' > okf.json
+  _okf_assert_listing '' "an exclude of / excludes everything" list
+  printf '%s\n' '{"bundle": {"include": ["."], "exclude": ["**/target/**",
+    "**/node_modules/**", "**/vendor/**"], "extensions": ["js"]}}' > okf.json
+  _okf_assert_listing 'tools/build.js' \
+    "while an include of . is the whole bundle" list
+
+  # SPEC.md §7 gives every subcommand --config PATH, and it is the settings it
+  # moves, not the root: both runs below are of the same repo.
+  printf '%s\n' '{"bundle": {"include": ["lib/**"],
+    "exclude": ["**/vendor/**", "**/node_modules/**"]}}' > okf.ci.json
+  printf '%s\n' '{"bundle": {"include": ["src/**"], "exclude": [],
+    "extensions": ["ts"]}}' > okf.json
+  _okf_assert_listing 'lib/conventions.py
+lib/core.py' \
+    "okf --config PATH list reads its settings from PATH" --config okf.ci.json list
+  _okf_assert_listing 'src/app.ts
+src/util/helper.ts' \
+    "and the default okf.json still answers for a run without it" list
+  rm -f okf.ci.json
+
+  # SPEC.md §6: every field defaults if absent, so a repo that has never run
+  # okf init is a repo using the defaults — whose exclude has no
+  # `**/vendor/**`, which is exactly how the listing shows they are in use.
+  rm -f okf.json
+  _okf_assert_listing 'lib/conventions.py
+lib/core.py
+lib/vendor/pinned.py
+src/app.ts
+src/generated/Handwritten.java
+src/util/Accessors.java
+src/util/helper.ts' \
+    "okf list falls back to SPEC.md §6's defaults when there is no okf.json" list
+  return 0
+}
+
+# The refusals: a line okf cannot act on is answered, not guessed at.
+_okf_list_refusal_probe() {
+  local okf="$TOOLKIT_ROOT/bin/okf"
+
+  assert_exit 1 "$okf" list --bogus
+  assert_contains "$(last_output)" "unknown flag: --bogus" \
+    "okf list names a flag it does not know"
+  assert_exit 1 "$okf" list extra
+  assert_contains "$(last_output)" "extra" "okf list names an argument it does not take"
+
+  # SPEC.md §7 gives list these two, and each is its own PLAN.md item. Until
+  # they are built, exiting 1 is what keeps a caller from mistaking the whole
+  # listing for the filtered one they asked for.
+  assert_exit 1 "$okf" list --missing
+  assert_contains "$(last_output)" "--missing" "okf list --missing says it is not built yet"
+  assert_exit 1 "$okf" list --orphans
+  assert_contains "$(last_output)" "--orphans" "okf list --orphans says so too"
+
+  printf 'not json at all\n' > okf.json
+  assert_exit 1 "$okf" list
+  assert_contains "$(last_output)" "okf.json" "an unparseable okf.json is named"
+
+  : > okf.json
+  assert_exit 1 "$okf" list
+  assert_contains "$(last_output)" "okf.json" "so is an empty one"
+
+  printf '%s\n' '{"bundle": {"include": "src/**"}}' > okf.json
+  assert_exit 1 "$okf" list
+  assert_contains "$(last_output)" ".bundle.include" \
+    "a setting of the wrong shape is named by its key"
+
+  # The gitignore constructs okf's globs have not got are refused by name, like
+  # every other setting okf cannot act on. Escaped into literals instead, a
+  # `[Gg]` would be an exclude that excluded nothing and said nothing about it.
+  printf '%s\n' '{"bundle": {"exclude": ["src/[Gg]enerated/**"]}}' > okf.json
+  assert_exit 1 "$okf" list
+  assert_contains "$(last_output)" ".bundle.exclude" \
+    "a character class in a glob is refused rather than read as a literal"
+  printf '%s\n' '{"bundle": {"exclude": ["!src/app.ts"]}}' > okf.json
+  assert_exit 1 "$okf" list
+  assert_contains "$(last_output)" "negation" \
+    "so is gitignore's ! negation, which okf does not implement"
+
+  # A glob that reaches outside the bundle can only ever match nothing, and an
+  # include matching nothing is an empty listing exiting 0 — a repo with no
+  # sources and a repo whose include is unusable, told apart by neither.
+  printf '%s\n' '{"bundle": {"include": ["../shared/**"]}}' > okf.json
+  assert_exit 1 "$okf" list
+  assert_contains "$(last_output)" ".bundle.include" \
+    "a glob with a .. segment is refused rather than left to match nothing"
+
+  # An empty string is not a glob. Dropped as unusable it would leave no include
+  # patterns at all, which reads as no narrowing — the whole repository in
+  # scope, for a setting nobody could act on.
+  printf '%s\n' '{"bundle": {"include": [""]}}' > okf.json
+  assert_exit 1 "$okf" list
+  assert_contains "$(last_output)" ".bundle.include" \
+    "an empty glob is refused rather than dropped into a repo-wide scope"
+
+  # A null is the one wrong shape that could pass for something: SPEC.md §6's
+  # defaults are merged underneath, and a null written over one of them would
+  # otherwise read as an empty list — putting the whole build directory in scope
+  # without a word about it. An exclude list of nothing is spelled [].
+  printf '%s\n' '{"bundle": {"exclude": null}}' > okf.json
+  assert_exit 1 "$okf" list
+  assert_contains "$(last_output)" ".bundle.exclude" \
+    "a null written over a default is refused, not read as an empty list"
+
+  # A scan that did not happen looks exactly like a repo with no generated code:
+  # ripgrep prints nothing either way. Said rather than acted on, because acting
+  # on it would put every generated file in the bundle without a word. Driven by
+  # a stand-in ripgrep that fails the way the real one does, since there is no
+  # way to make a working ripgrep fail on demand.
+  # A settings file that is fine, so the run below gets as far as the scan
+  # rather than stopping on the last check's deliberately broken one.
+  rm -f okf.json
+  local fakebin
+  if ! fakebin="$(mktemp -d "${TMPDIR:-/tmp}/toolkit-fakerg.XXXXXX")"; then
+    _fail "a stand-in ripgrep can be made" "mktemp -d failed"
+  else
+    printf '%s\n' "$fakebin" >> "$HARNESS_STATE/fixture_dirs"
+    printf '#!/bin/sh\nprintf "rg: broken\\n" >&2\nexit 2\n' > "$fakebin/rg"
+    if ! chmod +x "$fakebin/rg"; then
+      _fail "a stand-in ripgrep can be made" "chmod +x failed: $fakebin/rg"
+    else
+      assert_exit 1 env "PATH=$fakebin:$PATH" "$okf" list
+      assert_contains "$(last_output)" "ripgrep" \
+        "a failed generated-source scan is reported, not read as no generated code"
+    fi
+    rm -rf "$fakebin"
+  fi
+
+  # SPEC.md §6 gives bundle.root a default of `.` and nothing in okf acts on any
+  # other value. A setting written down and then ignored is a caller who has
+  # said where their bundle is and been overruled in silence, so it is refused
+  # while the default still passes.
+  printf '%s\n' '{"bundle": {"root": "src"}}' > okf.json
+  assert_exit 1 "$okf" list
+  assert_contains "$(last_output)" "bundle.root" \
+    "a bundle.root okf does not act on is refused rather than ignored"
+  printf '%s\n' '{"bundle": {"root": "."}}' > okf.json
+  assert_exit 0 "$okf" list
+
+  # A --config naming a file that is not there is a typo, while no okf.json at
+  # all is SPEC.md §6's defaults. The two must not be answered the same way.
+  rm -f okf.json
+  assert_exit 1 "$okf" --config nowhere.json list
+  assert_contains "$(last_output)" "nowhere.json" \
+    "a --config that names nothing is refused"
+  assert_exit 0 "$okf" list
+  return 0
+}
+
+# Runs bin/okf's own glob matcher over a table of cases, one process for the
+# whole table. bin/okf is sourced rather than run, because what is being checked
+# here is a dialect and not a subcommand — `okf list` can only show that a whole
+# listing came out right, which says nothing about which rule of the dialect was
+# the one that decided it.
+_okf_glob_verdicts() { # $1.. = alternating glob and path
+  local probe="$HARNESS_STATE/okf-glob-probe.sh"
+  if [ ! -f "$probe" ]; then
+    cat > "$probe" <<'PROBE'
+#!/usr/bin/env bash
+okf_script="$1"
+shift
+# shellcheck source=/dev/null
+. "$okf_script"
+while [ $# -gt 1 ]; do
+  pattern="$(bundle_pattern "$1")"
+  expression="$(glob_regex "$pattern")"
+  if matches_any "$2" "$expression"; then
+    printf '%s vs %s: match\n' "$1" "$2"
+  else
+    printf '%s vs %s: miss\n' "$1" "$2"
+  fi
+  shift 2
+done
+PROBE
+    chmod +x "$probe" || return 1
+  fi
+  "$probe" "$TOOLKIT_ROOT/bin/okf" "$@"
+}
+
+# The include and exclude globs are matched by bin/okf itself rather than by
+# git, so the dialect they are written in is okf's to get right: gitignore's,
+# which is the one SPEC.md §6's own defaults are written in.
+test_okf_scope_globs_are_gitignore_shaped() {
+  _okf_preconditions || return 1
+
+  # Each case's verdict is spelled out beside it, so a dialect that drifts says
+  # which rule drifted rather than only that the listing changed. The last of
+  # them are the two rules about the separator: a `/` in the pattern anchors it
+  # to the bundle root and a bare name floats, and a pattern reaches what is
+  # under it — without which `"exclude": ["target"]` and `["**/vendor/"]` both
+  # quietly exclude nothing at all, since git ls-files prints no directories for
+  # them to match.
+  local expected='**/target/** vs target/Old.java: match
+**/target/** vs src/target/Stale.java: match
+**/target/** vs src/targeted/Keep.java: miss
+src/** vs src/a/b/c.ts: match
+src/** vs srcx/a.ts: miss
+src/*.ts vs src/a.ts: match
+src/*.ts vs src/util/a.ts: miss
+src/?.ts vs src/a.ts: match
+src/?.ts vs src/ab.ts: miss
+lib vs lib/core.py: match
+lib vs library/core.py: miss
+/lib/ vs lib/core.py: match
+a.b vs axb: miss
+** vs any/depth/at/all.py: match
+target vs src/target/Stale.java: match
+target vs target/Old.java: match
+*.min.js vs src/vendor/jquery.min.js: match
+/target vs src/target/Stale.java: miss
+src/target vs src/target/Stale.java: match
+**/vendor/ vs lib/vendor/pinned.py: match
+vendor/ vs lib/vendor/pinned.py: match
+vendor/ vs lib/vendor: miss
+/ vs src/app.ts: match
+. vs src/app.ts: match
+./ vs src/app.ts: match
+./src vs src/app.ts: match
+./src vs lib/vendor/src/a.ts: miss
+src vs lib/vendor/src/a.ts: match
+src/**.ts vs src/helper.ts: match
+src/**.ts vs src/util/helper.ts: miss
+a**b vs axb: match
+a**b vs a/x/b: miss
+src//** vs src/app.ts: match
+src/**//util/* vs src/util/helper.ts: match'
+
+  local actual
+  actual="$(_okf_glob_verdicts \
+    '**/target/**' target/Old.java \
+    '**/target/**' src/target/Stale.java \
+    '**/target/**' src/targeted/Keep.java \
+    'src/**' src/a/b/c.ts \
+    'src/**' srcx/a.ts \
+    'src/*.ts' src/a.ts \
+    'src/*.ts' src/util/a.ts \
+    'src/?.ts' src/a.ts \
+    'src/?.ts' src/ab.ts \
+    lib lib/core.py \
+    lib library/core.py \
+    /lib/ lib/core.py \
+    a.b axb \
+    '**' any/depth/at/all.py \
+    target src/target/Stale.java \
+    target target/Old.java \
+    '*.min.js' src/vendor/jquery.min.js \
+    /target src/target/Stale.java \
+    src/target src/target/Stale.java \
+    '**/vendor/' lib/vendor/pinned.py \
+    vendor/ lib/vendor/pinned.py \
+    vendor/ lib/vendor \
+    / src/app.ts \
+    . src/app.ts \
+    ./ src/app.ts \
+    ./src src/app.ts \
+    ./src lib/vendor/src/a.ts \
+    src lib/vendor/src/a.ts \
+    'src/**.ts' src/helper.ts \
+    'src/**.ts' src/util/helper.ts \
+    'a**b' axb \
+    'a**b' a/x/b \
+    'src//**' src/app.ts \
+    'src/**//util/*' src/util/helper.ts)"
+  assert_eq "$expected" "$actual" \
+    "okf's include and exclude globs read as gitignore's do"
+  return 0
+}
+
+# SPEC.md §5's scope rules over tests/fixtures/scoped, which carries one file
+# for each of them.
+test_okf_list_prints_the_in_scope_sources() {
+  _okf_preconditions || return 1
+  with_fixture_repo scoped _okf_list_scope_probe
+}
+
+# The other half of the same PLAN.md item: the include, exclude and extensions
+# settings SPEC.md §6 defines actually move the listing.
+test_okf_list_honours_the_bundle_settings() {
+  _okf_preconditions || return 1
+  with_fixture_repo scoped _okf_list_settings_probe
+}
+
+test_okf_list_refuses_what_it_cannot_answer() {
+  _okf_preconditions || return 1
+  with_fixture_repo scoped _okf_list_refusal_probe
+}
+
+# Scope is read out of git, so a bundle root outside a work tree is a question
+# okf cannot answer — and says so rather than printing an empty listing and
+# exiting 0.
+test_okf_list_needs_a_git_work_tree() {
+  _okf_preconditions || return 1
+
+  local tmp
+  # Named without "git" in it, because the directory's own path is echoed back
+  # in every message okf prints about it — including the ones that never got as
+  # far as looking for a work tree.
+  if ! tmp="$(mktemp -d "${TMPDIR:-/tmp}/toolkit-bare.XXXXXX")"; then
+    _fail "a directory outside any git repo can be made" "mktemp -d failed"
+    return 1
+  fi
+  # Registered the way with_fixture_repo registers its copies, so an interrupted
+  # run takes it with everything else rather than leaving it in TMPDIR.
+  printf '%s\n' "$tmp" >> "$HARNESS_STATE/fixture_dirs"
+
+  # TMPDIR is usually nobody's repository, but it does not have to be: someone
+  # whose TMPDIR is $HOME/tmp under a dotfiles repo has a temp directory inside
+  # a work tree, and this check would fail there for a reason that has nothing
+  # to do with okf. Said as a skip rather than left to be a spurious failure of
+  # the suite every PLAN.md item verifies with.
+  if (CDPATH= cd "$tmp" && git rev-parse --is-inside-work-tree > /dev/null 2>&1); then
+    _skip "okf list says why it cannot list a directory outside a work tree" \
+      "TMPDIR is itself inside a git work tree"
+    rm -rf "$tmp"
+    return 0
+  fi
+
+  assert_exit 1 "$TOOLKIT_ROOT/bin/okf" -C "$tmp" list
+  # "work tree" and not "git": the latter would be satisfied by the temp path
+  # itself, so a -C that failed before ever reaching the work-tree check — a
+  # directory that is not there, one that cannot be entered — would pass this
+  # for the wrong reason.
+  assert_contains "$(last_output)" "work tree" \
+    "okf list says why it cannot list a directory that is not in a work tree"
+  rm -rf "$tmp"
+  return 0
 }
 
 # --- add new test_* functions above this line ------------------------------

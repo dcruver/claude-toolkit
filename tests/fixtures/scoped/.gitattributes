@@ -1,0 +1,4 @@
+# The CRLF line endings in src/generated/ping.go are the point of that fixture:
+# a generated-file header must still be recognised on a CRLF checkout. Without
+# this, a core.autocrlf setting could rewrite them on the way out of git.
+* -text

@@ -23,7 +23,7 @@ there). Items are ordered so none depends on a later one. Every item verifies wi
 
 ## Phase 3 — Tier A: scope and metrics
 
-- [ ] Implement okf list in bin/okf to print in-scope source files via git ls-files, honouring the include, exclude and extensions settings from okf.json and the SPEC.md §5 exclusion rules, with a tests/fixtures/ tree to exercise it (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
+- [x] Implement okf list in bin/okf to print in-scope source files via git ls-files, honouring the include, exclude and extensions settings from okf.json and the SPEC.md §5 exclusion rules, with a tests/fixtures/ tree to exercise it (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Add --missing to okf list in bin/okf, restricting output to in-scope sources that have no co-located concept file (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Add --orphans to okf list in bin/okf, instead listing concept files whose resource no longer exists (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Implement okf hash in bin/okf to print the sha256: prefixed digest of one file, asserting a known digest over a tests/fixtures/ file (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
