@@ -701,8 +701,22 @@ OKF_GENERATED_BATCH=400
 # The in-scope sources, bundle-relative and sorted, as `load_in_scope` left them.
 OKF_IN_SCOPE=()
 
-# The file extensions in scope, as `load_in_scope` read them from the settings.
+# The repo's concept files, bundle-relative and sorted, as `load_concepts` left
+# them.
+OKF_CONCEPTS=()
+
+# The repo's tracked paths, bundle-relative and sorted, as `load_tracked_paths`
+# left them.
+OKF_TRACKED=()
+
+# The file extensions in scope, as `load_bundle_globs` read them from the
+# settings.
 OKF_EXTENSIONS=()
+
+# SPEC.md §6's `include` and `exclude`, compiled to the anchored regular
+# expressions matches_any wants, as `load_bundle_globs` left them.
+OKF_INCLUDE_RES=()
+OKF_EXCLUDE_RES=()
 
 # `git ls-files` is how SPEC.md §5's first exclusion — "anything gitignored" —
 # is honoured, so a bundle root outside a work tree is not a scope okf can
@@ -713,6 +727,114 @@ require_git_repo() {
   inside="$(git rev-parse --is-inside-work-tree 2> /dev/null)" || inside=""
   [ "$inside" = "true" ] || die "not inside a git work tree: $OKF_ROOT" \
     "okf reads the repo's scope from git ls-files, which needs one"
+}
+
+# Compiles SPEC.md §6's `include` and `exclude` into the anchored regular
+# expressions matches_any wants, and reads `extensions` alongside them.
+#
+# Its own function rather than the head of load_in_scope because the orphan
+# listing needs the same bundle boundary: it asks these globs about a concept's
+# `resource`, which is a source path like any other. Transcribed a second time,
+# the two listings could disagree about the edges of one bundle — `okf list` and
+# `okf list --orphans` answering for different repositories — and the
+# disagreement would surface only as a concept nobody could account for.
+load_bundle_globs() {
+  load_settings
+
+  # Assigned on their own lines, not as `local x="$(...)"`: `local` returns
+  # success whatever the command substitution did, which would swallow both
+  # `set -e` and the status of a settings_strings that died inside the subshell
+  # having already printed why.
+  local includes excludes extensions
+  includes="$(settings_strings bundle include)" || exit 1
+  excludes="$(settings_strings bundle exclude)" || exit 1
+  extensions="$(settings_strings bundle extensions)" || exit 1
+
+  OKF_INCLUDE_RES=()
+  OKF_EXCLUDE_RES=()
+  local pattern
+  # The blank line is the empty list, not an empty pattern: settings_strings
+  # refuses an empty string outright, and a here-string of nothing is still one
+  # line. Past it, bundle_pattern always answers with a pattern — the bundle
+  # root comes back as `**` rather than as nothing — so there is nothing else
+  # here to skip.
+  while IFS= read -r pattern; do
+    [ -n "$pattern" ] || continue
+    check_supported_glob "$pattern" .bundle.include
+    OKF_INCLUDE_RES+=("$(glob_regex "$(bundle_pattern "$pattern")")")
+  done <<< "$includes"
+  while IFS= read -r pattern; do
+    [ -n "$pattern" ] || continue
+    check_supported_glob "$pattern" .bundle.exclude
+    OKF_EXCLUDE_RES+=("$(glob_regex "$(bundle_pattern "$pattern")")")
+  done <<< "$excludes"
+
+  OKF_EXTENSIONS=()
+  local ext
+  while IFS= read -r ext; do
+    [ -n "$ext" ] || continue
+    # A settings file that spells them `.java` means the same thing as `java`.
+    OKF_EXTENSIONS+=("${ext#.}")
+  done <<< "$extensions"
+}
+
+# Whether a bundle-relative path is inside the bundle SPEC.md §6's `include` and
+# `exclude` describe. `exclude` is asked first, because it is the one that can
+# take a path back out of an `include` that reached it.
+in_bundle_globs() { # $1 = a bundle-relative path
+  if matches_any "$1" ${OKF_EXCLUDE_RES[@]+"${OKF_EXCLUDE_RES[@]}"}; then
+    return 1
+  fi
+  # An include list that narrows nothing is no narrowing rather than no files:
+  # `include` is the filter, and with nothing to filter by there is nothing
+  # filtered out.
+  if [ "${#OKF_INCLUDE_RES[@]}" -gt 0 ]; then
+    matches_any "$1" "${OKF_INCLUDE_RES[@]}" || return 1
+  fi
+  return 0
+}
+
+# Fills OKF_TRACKED with every path `git ls-files` names, in git's order and
+# without git's repeats.
+#
+# No pathspec: the whole index comes out here and each caller narrows it
+# afterwards, because `include` and `exclude` have to be matched by one matcher
+# and git's cannot be the one — see glob_regex.
+load_tracked_paths() {
+  local -a records=()
+  local record
+  while IFS= read -r -d '' record; do
+    records+=("$record")
+  done < <(
+    # A process substitution's exit status is invisible to the shell reading it,
+    # so git's is carried out as one more NUL record. Without it, a git that
+    # failed — an unreadable index, a repository in a state it will not answer
+    # for — would be an empty listing reported as a repo with nothing in scope.
+    # `set +e` because the errexit inherited here would otherwise take the
+    # subshell down before the status could be written.
+    set +e
+    git ls-files -z
+    printf 'status:%s\0' "$?"
+  )
+
+  local count="${#records[@]}"
+  [ "$count" -gt 0 ] \
+    || die "git ls-files wrote nothing at all, not even its exit status"
+  local status="${records[$((count - 1))]}"
+  unset "records[$((count - 1))]"
+  [ "$status" = "status:0" ] \
+    || die "git ls-files failed in $OKF_ROOT — see its message above"
+
+  OKF_TRACKED=()
+  local previous="" path
+  for path in ${records[@]+"${records[@]}"}; do
+    # `git ls-files` prints an unmerged path once per stage, so a repo stopped
+    # in the middle of a conflicted merge names the same file three times. The
+    # listing is sorted, so the repeats are adjacent.
+    [ "$path" != "$previous" ] || continue
+    previous="$path"
+    OKF_TRACKED+=("$path")
+  done
 }
 
 # Refuses the gitignore constructs glob_regex does not implement, rather than
@@ -1110,78 +1232,12 @@ keep_hand_written() { # $1.. = one batch of candidate paths
 # what is left.
 load_in_scope() {
   require_git_repo
-  load_settings
-
-  # Assigned on their own lines, not as `local x="$(...)"`: `local` returns
-  # success whatever the command substitution did, which would swallow both
-  # `set -e` and the status of a settings_strings that died inside the subshell
-  # having already printed why.
-  local includes excludes extensions
-  includes="$(settings_strings bundle include)" || exit 1
-  excludes="$(settings_strings bundle exclude)" || exit 1
-  extensions="$(settings_strings bundle extensions)" || exit 1
-
-  local -a include_res=() exclude_res=()
-  local pattern
-  # The blank line is the empty list, not an empty pattern: settings_strings
-  # refuses an empty string outright, and a here-string of nothing is still one
-  # line. Past it, bundle_pattern always answers with a pattern — the bundle
-  # root comes back as `**` rather than as nothing — so there is nothing else
-  # here to skip.
-  while IFS= read -r pattern; do
-    [ -n "$pattern" ] || continue
-    check_supported_glob "$pattern" .bundle.include
-    include_res+=("$(glob_regex "$(bundle_pattern "$pattern")")")
-  done <<< "$includes"
-  while IFS= read -r pattern; do
-    [ -n "$pattern" ] || continue
-    check_supported_glob "$pattern" .bundle.exclude
-    exclude_res+=("$(glob_regex "$(bundle_pattern "$pattern")")")
-  done <<< "$excludes"
-
-  OKF_EXTENSIONS=()
-  local ext
-  while IFS= read -r ext; do
-    [ -n "$ext" ] || continue
-    # A settings file that spells them `.java` means the same thing as `java`.
-    OKF_EXTENSIONS+=("${ext#.}")
-  done <<< "$extensions"
-
-  # No pathspec: the whole index comes out here and the globs above narrow it
-  # below, because the two lists have to be matched by one matcher and git's
-  # cannot be the one — see glob_regex.
-  local -a records=()
-  local record
-  while IFS= read -r -d '' record; do
-    records+=("$record")
-  done < <(
-    # A process substitution's exit status is invisible to the shell reading it,
-    # so git's is carried out as one more NUL record. Without it, a git that
-    # failed — an unreadable index, a repository in a state it will not answer
-    # for — would be an empty listing reported as a repo with nothing in scope.
-    # `set +e` because the errexit inherited here would otherwise take the
-    # subshell down before the status could be written.
-    set +e
-    git ls-files -z
-    printf 'status:%s\0' "$?"
-  )
-
-  local count="${#records[@]}"
-  [ "$count" -gt 0 ] \
-    || die "git ls-files wrote nothing at all, not even its exit status"
-  local status="${records[$((count - 1))]}"
-  unset "records[$((count - 1))]"
-  [ "$status" = "status:0" ] \
-    || die "git ls-files failed in $OKF_ROOT — see its message above"
+  load_bundle_globs
+  load_tracked_paths
 
   local -a candidates=()
-  local previous="" path
-  for path in ${records[@]+"${records[@]}"}; do
-    # `git ls-files` prints an unmerged path once per stage, so a repo stopped
-    # in the middle of a conflicted merge names the same file three times. The
-    # listing is sorted, so the repeats are adjacent.
-    [ "$path" != "$previous" ] || continue
-    previous="$path"
+  local path
+  for path in ${OKF_TRACKED[@]+"${OKF_TRACKED[@]}"}; do
     # Extension first: it is the cheapest of the three and, on the repos §6's
     # defaults describe, the one that rules out the most.
     in_scope_extension "$path" || continue
@@ -1200,15 +1256,7 @@ load_in_scope() {
     # not the @Generated scan below, not the sha256 `okf check` will want, and
     # not the read a slash command has to do to document it.
     [ -f "$path" ] || continue
-    if matches_any "$path" ${exclude_res[@]+"${exclude_res[@]}"}; then
-      continue
-    fi
-    # An include list that narrows nothing is no narrowing rather than no
-    # files: `include` is the filter, and with nothing to filter by there is
-    # nothing filtered out.
-    if [ "${#include_res[@]}" -gt 0 ]; then
-      matches_any "$path" "${include_res[@]}" || continue
-    fi
+    in_bundle_globs "$path" || continue
     candidates+=("$path")
   done
 
@@ -1371,6 +1419,141 @@ has_concept() { # $1 = a bundle-relative source path
     [ ! "$dir$stem.md" -ef "$dir$reserved" ] || return 1
   done
   return 0
+}
+
+# Prints a concept's `resource` — the source file SPEC.md §4 says the concept
+# documents — or nothing at all when it declares none. Always exits 0: "this
+# file names no resource" is an answer, not a failure.
+#
+# Read to SPEC.md §4's formatting contract and no further: the block is `---` on
+# line 1 to the next line that is exactly `---`, and a top-level key is
+# unindented `key: value`. Anchoring on the unindented spelling is what keeps
+# the `  - resource: https://example.invalid/DON-86` inside a `sources:` list
+# out of the answer — §4 is explicit that `sources` is for external references
+# and never a restatement of `resource`, so reading one as the other would point
+# this at a URL that is not a path at all.
+#
+# The first such line wins. A block with two `resource:` lines is malformed
+# YAML with no defined meaning, and taking the first is both what §4's
+# extraction rule for `code.X` does and the only choice that does not depend on
+# how far past the mistake the reader kept going.
+#
+# CRLF and a UTF-8 BOM are stripped for the reason has_frontmatter strips them:
+# a checkout on Windows changes how the lines are spelled and not what they say,
+# and a concept okf stopped recognising there would be one it silently reported
+# as documenting nothing.
+#
+# Surrounding quotes come off. §4's own example writes `resource:` bare and
+# `content_hash:` quoted, so both spellings are in circulation, and a quoted
+# path read with its quotes is a path that never exists — which on the orphan
+# listing means a live concept reported as dead.
+#
+# This is deliberately not the frontmatter reader of Phase 4, which owes the
+# whole §4 shell-read field set. It is the one field `okf list --orphans` needs,
+# written narrowly so that reader can replace it rather than work around it.
+concept_resource() { # $1 = a path to a concept file
+  local line opened=0 value
+  # `|| [ -n "$line" ]` so a last line with no newline after it is still read.
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#$'\xef\xbb\xbf'}"
+    line="${line%$'\r'}"
+    if [ "$opened" -eq 0 ]; then
+      [ "$line" = "---" ] || return 0
+      opened=1
+      continue
+    fi
+    # The closing `---`. Nothing past it is frontmatter.
+    [ "$line" != "---" ] || return 0
+    case "$line" in
+      resource:*)
+        value="${line#resource:}"
+        # Leading then trailing whitespace. A value that is nothing but
+        # whitespace comes out empty, which is the same as absent: `resource:`
+        # with nothing after it names no file, and okf cannot say whether a
+        # file it was never told about is still there.
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        case "$value" in
+          '"'*'"') value="${value#\"}" && value="${value%\"}" ;;
+          "'"*"'") value="${value#\'}" && value="${value%\'}" ;;
+        esac
+        [ -n "$value" ] || return 0
+        printf '%s\n' "$value"
+        return 0
+        ;;
+    esac
+  # stderr redirected before the input, for the reason has_frontmatter gives:
+  # a `2> /dev/null` written after it is set up too late to catch the shell's
+  # own complaint about opening the file.
+  done 2> /dev/null < "$1"
+  return 0
+}
+
+# Fills OKF_CONCEPTS with the repo's concept files, in the order `load_in_scope`
+# lists its sources: every tracked `.md` that carries SPEC.md §4 frontmatter and
+# is not one of §4's reserved names.
+#
+# Neither `include` nor `exclude` is applied here, deliberately. Both are
+# written about sources — `src/**`, `**/node_modules/**`, and nothing stops one
+# being written `src/**/*.py` or `**/*.md` — and a glob that names a source
+# extension matches no concept anywhere in the repository. Asked of a concept's
+# own path it would empty the orphan listing and exit 0, which is a bundle full
+# of leftovers reported as having none. cmd_list asks both of the `resource`
+# instead, where they are being asked about the thing they describe; SPEC.md
+# §5's co-location makes that the same directory either way.
+#
+# The cost of leaving them out is that a vendored tree's markdown is opened to
+# be looked at rather than skipped on its path. That is one read of one line
+# each, against the risk above.
+#
+# Tracked files only, where has_concept asks the filesystem. The asymmetry is
+# the point of each: has_concept answers "has this source been documented yet?",
+# and a concept /okf-generate wrote a second ago counts. This answers "what is
+# in the bundle?", and the bundle is what the repo has put under version
+# control — the same `git ls-files` reading that makes gitignored files invisible
+# to `okf list`. An orphan is made by *deleting a source*, and by then its
+# concept has been committed for as long as the source was.
+#
+# SPEC.md §4's reserved names are skipped: `index.md` is the directory's own
+# document and `log.md` belongs to OKF, so neither is any source's concept and
+# neither can be orphaned by one going away.
+load_concepts() {
+  require_git_repo
+  load_tracked_paths
+
+  OKF_CONCEPTS=()
+  local path dir reserved skip
+  for path in ${OKF_TRACKED[@]+"${OKF_TRACKED[@]}"}; do
+    case "$path" in
+      *.md) ;;
+      *) continue ;;
+    esac
+    # `git ls-files` answers from the index, which still holds a concept deleted
+    # from the working tree and not yet staged as removed. A file that is not
+    # there documents nothing and cannot be read to find out what it once did.
+    # has_frontmatter below reaches the same verdict by failing to open it; this
+    # is the cheap answer, and the one that says so in words.
+    [ -f "$path" ] || continue
+
+    case "$path" in
+      */*) dir="${path%/*}/" ;;
+      *) dir="" ;;
+    esac
+    # `-ef` rather than a name comparison, for the reason has_concept gives:
+    # on a case-insensitive filesystem `Index.md` and `index.md` are one file
+    # that a string compare reads as two.
+    skip=0
+    for reserved in "${OKF_RESERVED_CONCEPT_NAMES[@]}"; do
+      [ ! "$path" -ef "$dir$reserved" ] || skip=1
+    done
+    [ "$skip" -eq 0 ] || continue
+
+    # Frontmatter last, because it is the only one of these that opens a file.
+    # A markdown file without it is prose — a README, a design note — and
+    # counting it would put every one of them on a listing of things to delete.
+    has_frontmatter "$path" || continue
+    OKF_CONCEPTS+=("$path")
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -1761,15 +1944,94 @@ cmd_list() {
   [ $# -eq 0 ] || die "list takes no arguments, but was given: $1" \
     "usage: okf list [--missing] [--orphans]"
 
-  # Recognised by the parser above so that a caller who types it is told it is
-  # not built yet rather than told it is not a flag — the difference between
-  # something to wait for and something to stop typing. It is its own PLAN.md
-  # item; until then, exiting 1 keeps a caller from mistaking the whole listing
-  # for the filtered one they asked for. Checked before --missing does any work,
-  # so `list --missing --orphans` is answered by the flag okf cannot honour
-  # rather than by the one it can — the two name different listings, and which
-  # of them wins when both are given is the --orphans item's to settle.
-  [ "$orphans" -eq 0 ] || die "list: --orphans is not implemented yet"
+  # --missing narrows the source listing; --orphans replaces it with a listing
+  # of concept files. Neither is a filter on the other, so there is no listing
+  # that answers both — and picking one silently would hand back paths of the
+  # wrong kind to a caller who cannot see which flag got dropped. Refused, with
+  # both flags named, rather than ranked.
+  if [ "$missing" -eq 1 ] && [ "$orphans" -eq 1 ]; then
+    die "list: --missing and --orphans name different listings — sources, and concepts" \
+      "give one or the other" \
+      "usage: okf list [--missing] [--orphans]"
+  fi
+
+  local path
+  if [ "$orphans" -eq 1 ]; then
+    # SPEC.md §5's co-location read the other way round from --missing: not a
+    # source with no concept beside it, but a concept whose source has gone.
+    #
+    # The concept's own `resource` decides it, not the sibling `<stem>.<ext>`
+    # that has_concept looks for. §5 gives a file's *additional* top-level types
+    # the spelling `<stem>.<TypeName>.md`, and no source is ever named
+    # `RouteRegistry.Inner.<ext>` — so a listing built from the co-located name
+    # would call every one of those an orphan while its source sat right beside
+    # it. `resource` is where the concept says what it documents, and it is the
+    # only thing here that survives §5's naming rules.
+    #
+    # A concept that declares no `resource` is left off. okf has not been told
+    # what it documents, so it cannot have found out that thing is gone, and
+    # this listing is one a caller acts on by deleting files: a wrong name on it
+    # costs a concept somebody wrote, where a missing one costs a stale file
+    # that stays until `resource` is filled in.
+    local resource resource_dir concept_dir
+    load_concepts
+    load_bundle_globs
+    for path in ${OKF_CONCEPTS[@]+"${OKF_CONCEPTS[@]}"}; do
+      resource="$(concept_resource "$path")"
+      [ -n "$resource" ] || continue
+      # §4 puts path-valued fields in bundle-absolute form — a leading `/` that
+      # means the bundle root and not the filesystem's. okf is standing in the
+      # root, so dropping it makes the path one this can test directly. A
+      # `resource` written without the leading `/` is read the same way rather
+      # than refused: the two spellings name one file, and §4's form is a
+      # recommendation about surviving file moves, not a gate on being read.
+      resource="${resource#/}"
+
+      # SPEC.md §5's co-location, asked as a directory and not as a filename:
+      # the concept lives beside its source, so a `resource` naming a file in
+      # some other directory is not one this concept documents by §5's rules.
+      # The filename is deliberately not derived — §5 gives a file's additional
+      # top-level types the spelling `<stem>.<TypeName>.md`, which no source is
+      # ever named — so the directory is as much as can be checked, and it is
+      # the part that matters.
+      #
+      # What it is really guarding is the bundle boundary. A vendored or
+      # nested repository with its own okf.json is its own bundle, and its
+      # concepts write `resource` bundle-absolute against *its* root: read from
+      # out here, `/src/util/helper.ts` is a file that was never in this
+      # repository, and every concept it has would be reported as this bundle's
+      # orphan. This listing is acted on by deleting files, so that is the
+      # expensive direction — and §5 is what tells a nested bundle's concept
+      # from one of this bundle's own.
+      case "$resource" in
+        */*) resource_dir="${resource%/*}/" ;;
+        *) resource_dir="" ;;
+      esac
+      case "$path" in
+        */*) concept_dir="${path%/*}/" ;;
+        *) concept_dir="" ;;
+      esac
+      [ "$resource_dir" = "$concept_dir" ] || continue
+
+      # SPEC.md §6's `include` and `exclude`, asked of the source and not of the
+      # concept. Both settings are written about sources, and one written
+      # `src/**/*.py` matches no `.md` in the repository at all — asked of a
+      # concept's own path it would report a bundle full of leftovers as having
+      # none. Co-location above has already made this the concept's directory,
+      # so what the two spellings differ over is only the filename, which is
+      # exactly the part these globs are entitled to have an opinion about.
+      #
+      # `extensions` is deliberately not asked. It says what kind of file gets
+      # documented, and a concept that exists is evidence one already was:
+      # narrowing `extensions` to `["java"]` today does not make yesterday's
+      # TypeScript concept stop being a leftover when its source goes.
+      in_bundle_globs "$resource" || continue
+
+      [ ! -e "$resource" ] || continue
+      printf '%s\n' "$path"
+    done
+    return 0
+  fi
 
   load_in_scope
 
@@ -1777,7 +2039,6 @@ cmd_list() {
   # order and the paths are the ones plain `okf list` prints. That is what makes
   # it the input /okf-generate walks: the sources with no concept beside them,
   # in the order the bundle holds them.
-  local path
   for path in ${OKF_IN_SCOPE[@]+"${OKF_IN_SCOPE[@]}"}; do
     if [ "$missing" -eq 1 ] && has_concept "$path"; then
       continue

@@ -3011,6 +3011,338 @@ lib/core.py' \
   return 0
 }
 
+# Stages a concept file so `git ls-files` sees it, since the orphan listing is
+# over what the repo has put under version control. `git add` and not a commit:
+# the index is what git ls-files reads, and a commit would only make each of
+# these slower.
+_okf_stage() { # $1.. = paths
+  if ! git add -- "$@" > /dev/null 2>&1; then
+    _fail "the fixture copy accepts a git add" "git add $* failed"
+    return 1
+  fi
+  return 0
+}
+
+# SPEC.md §5's co-location read the other way round from --missing: not a source
+# with no concept beside it, but a concept whose `resource` names a file that is
+# not there any more.
+_okf_list_orphans_probe() {
+  local listing
+
+  # The fixture's one concept, src/util/helper.md, has `resource:
+  # /src/util/helper.ts` and that source is there — so nothing is orphaned. An
+  # empty listing exiting 0, not an error: a bundle with no orphans in it is the
+  # ordinary state, and the same run has to be able to say so.
+  #
+  # It is also the check that a markdown file which is not a concept stays off
+  # this listing: the fixture carries README.md and src/notes.md, neither with
+  # frontmatter and neither naming any file that exists. Counted as concepts,
+  # both would be on a listing whose whole use is naming files to delete.
+  _okf_assert_listing '' \
+    "a bundle whose concepts all still have their sources prints nothing, exiting 0" \
+    list --orphans
+
+  # The orphan itself. Deleted from the working tree and not staged as removed,
+  # which is what a source being deleted looks like at the moment it happens:
+  # git ls-files still names it, so the answer has to come from the filesystem.
+  rm -f src/util/helper.ts
+  _okf_assert_listing 'src/util/helper.md' \
+    "a concept whose resource has been deleted is an orphan" list --orphans
+  git checkout -q -- src/util/helper.ts > /dev/null 2>&1
+  _okf_assert_listing '' "and stops being one when its resource comes back" \
+    list --orphans
+
+  # --orphans lists concepts, and the sources --missing lists are exactly what
+  # must not turn up here. src/util/Accessors.java has no concept at all, so it
+  # is on the --missing listing and belongs on neither half of this one.
+  _okf_capture listing list --missing || return 1
+  _okf_assert_listed "$listing" src/util/Accessors.java \
+    "an undocumented source is on the --missing listing"
+  _okf_capture listing list --orphans || return 1
+  _okf_assert_not_listed "$listing" src/util/Accessors.java \
+    "and never on the --orphans one, which lists concepts and not sources"
+
+  # A concept that declares no resource is not an orphan. okf has not been told
+  # what it documents, so it cannot have found out that thing is gone — and this
+  # is a listing acted on by deleting files, where a wrong name costs a concept
+  # somebody wrote and a missing one costs a stale file that stays.
+  printf -- '---\ntype: Class\ntitle: Nameless\n---\n' > src/util/Nameless.md
+  _okf_stage src/util/Nameless.md || return 1
+  _okf_assert_listing '' "a concept that names no resource is not an orphan" \
+    list --orphans
+  printf -- '---\ntype: Class\nresource:\n---\n' > src/util/Nameless.md
+  _okf_assert_listing '' "nor is one whose resource is empty" list --orphans
+
+  # A resource that never existed is as gone as one that was deleted: what is
+  # asked is whether the file is there, not what became of it.
+  printf -- '---\ntype: Class\nresource: /src/util/Nameless.java\n---\n' \
+    > src/util/Nameless.md
+  _okf_assert_listing 'src/util/Nameless.md' \
+    "a concept whose resource was never there is an orphan too" list --orphans
+
+  # SPEC.md §4 puts path-valued fields in bundle-absolute form — a leading `/`
+  # that means the bundle root and not the filesystem's. Read as a filesystem
+  # path, /src/util/helper.ts is a file on nobody's machine and every concept in
+  # every bundle would be an orphan.
+  printf -- '---\ntype: Class\nresource: /src/util/Accessors.java\n---\n' \
+    > src/util/Nameless.md
+  _okf_assert_listing '' \
+    "a bundle-absolute resource is resolved against the bundle root" list --orphans
+  # The same path without the leading slash names the same file, so it is read
+  # the same way rather than refused: §4's form is a recommendation about
+  # surviving file moves, not a gate on being understood.
+  printf -- '---\ntype: Class\nresource: src/util/Accessors.java\n---\n' \
+    > src/util/Nameless.md
+  _okf_assert_listing '' "so is one written without the leading slash" list --orphans
+  printf -- '---\ntype: Class\nresource: src/util/Gone.java\n---\n' \
+    > src/util/Nameless.md
+  _okf_assert_listing 'src/util/Nameless.md' \
+    "and a missing one is still found without it" list --orphans
+
+  # SPEC.md §4's example writes some values quoted. Both directions again: a
+  # quote left on the front of the path takes the value out of the concept's own
+  # directory, so a reader that does not strip them reports nothing at all — and
+  # nothing is what a bundle with no orphans in it also prints.
+  printf -- '---\ntype: Class\nresource: "/src/util/Accessors.java"\n---\n' \
+    > src/util/Nameless.md
+  _okf_assert_listing '' "a quoted resource has its quotes taken off" list --orphans
+  printf -- '---\ntype: Class\nresource: "/src/util/Gone.java"\n---\n' \
+    > src/util/Nameless.md
+  _okf_assert_listing 'src/util/Nameless.md' \
+    "and a quoted one that is gone is still found" list --orphans
+  printf -- "---\ntype: Class\nresource: '/src/util/Accessors.java'\n---\n" \
+    > src/util/Nameless.md
+  _okf_assert_listing '' "single quotes as well as double" list --orphans
+  printf -- "---\ntype: Class\nresource: '/src/util/Gone.java'\n---\n" \
+    > src/util/Nameless.md
+  _okf_assert_listing 'src/util/Nameless.md' "in that direction too" list --orphans
+
+  # SPEC.md §4 is explicit that `sources` holds external references — tickets,
+  # RFCs — and is never a restatement of `resource`. Its entries are indented
+  # list items, and a reader that took one for the concept's own resource would
+  # be testing a URL for being a file.
+  printf -- '---\ntype: Class\nsources:\n  - resource: https://example.invalid/DON-86\n    id: don-86\n---\n' \
+    > src/util/Nameless.md
+  _okf_assert_listing '' \
+    "a resource inside the sources list is not the concept's own" list --orphans
+  printf -- '---\ntype: Class\nsources:\n  - resource: https://example.invalid/DON-86\nresource: /src/util/Gone.java\n---\n' \
+    > src/util/Nameless.md
+  _okf_assert_listing 'src/util/Nameless.md' \
+    "and the unindented one is still read past it" list --orphans
+
+  # Two top-level `resource:` lines is malformed YAML with no defined meaning.
+  # The first wins — the same rule SPEC.md §4's extraction rule for `code.X`
+  # states — because it is the only answer that does not depend on how far past
+  # the mistake the reader kept going.
+  printf -- '---\ntype: Class\nresource: /src/util/Gone.java\nresource: /src/util/Accessors.java\n---\n' \
+    > src/util/Nameless.md
+  _okf_assert_listing 'src/util/Nameless.md' \
+    "the first of two resource lines is the one read" list --orphans
+
+  # Whitespace around the value comes off. A path with a space still on the end
+  # of it exists nowhere, so a live concept would be reported dead.
+  printf -- '---\ntype: Class\nresource:   /src/util/Accessors.java   \n---\n' \
+    > src/util/Nameless.md
+  _okf_assert_listing '' "the value is read without the whitespace around it" \
+    list --orphans
+
+  # A checkout with CRLF line endings and an editor on Windows change how the
+  # lines are spelled, not what they say. Both directions are checked here, and
+  # deliberately: a reader that does not know the spelling recognises no
+  # frontmatter, reads no resource, and reports no orphan — which passes any
+  # check that only ever expects an empty listing.
+  printf -- '---\r\ntype: Class\r\nresource: /src/util/Accessors.java\r\n---\r\n' \
+    > src/util/Nameless.md
+  _okf_assert_listing '' "a concept checked out with CRLF endings is read" list --orphans
+  printf -- '---\r\ntype: Class\r\nresource: /src/util/Gone.java\r\n---\r\n' \
+    > src/util/Nameless.md
+  _okf_assert_listing 'src/util/Nameless.md' \
+    "and its orphan is found, not passed over as unreadable" list --orphans
+  printf -- '\357\273\277---\ntype: Class\nresource: /src/util/Accessors.java\n---\n' \
+    > src/util/Nameless.md
+  _okf_assert_listing '' "and so is one opened with a UTF-8 BOM" list --orphans
+  printf -- '\357\273\277---\ntype: Class\nresource: /src/util/Gone.java\n---\n' \
+    > src/util/Nameless.md
+  _okf_assert_listing 'src/util/Nameless.md' "whose orphan is found too" list --orphans
+
+  # Only the frontmatter block is read, and the block ends at the closing `---`.
+  # A `resource:` line in the body is prose about the concept — a worked example,
+  # a quoted fragment — and not the concept's own field.
+  printf -- '---\ntype: Class\n---\n\nresource: /src/util/Gone.java\n' \
+    > src/util/Nameless.md
+  _okf_assert_listing '' "a resource line in the body is not frontmatter" list --orphans
+  # And the frontmatter's own is what answers when there is one of each.
+  printf -- '---\ntype: Class\nresource: /src/util/Accessors.java\n---\n\nresource: /src/util/Gone.java\n' \
+    > src/util/Nameless.md
+  _okf_assert_listing '' "the frontmatter's resource is the one that answers" \
+    list --orphans
+
+  # A file that opens a frontmatter block and never closes it is the half-written
+  # concept has_frontmatter exists to tell from a whole one. Counted here it
+  # would be an orphan, and the fix — finishing the write — is the one thing a
+  # caller who deleted it can no longer do.
+  printf -- '---\ntype: Class\nresource: /src/util/Gone.java\n' > src/util/Nameless.md
+  _okf_assert_listing '' \
+    "a half-written concept is not a concept, so not an orphan" list --orphans
+  rm -f src/util/Nameless.md
+  git rm -q --cached src/util/Nameless.md > /dev/null 2>&1
+
+  # SPEC.md §4 reserves index.md for the directory's own Package document and
+  # leaves log.md to OKF. Neither is any source's concept, so neither can be
+  # orphaned by a source going away — whatever is written in it.
+  local reserved
+  for reserved in index.md log.md; do
+    printf -- '---\ntype: Package\nresource: /src/util/Gone.java\n---\n' \
+      > "src/util/$reserved"
+    _okf_stage "src/util/$reserved" || return 1
+    _okf_assert_listing '' "src/util/$reserved is a reserved name, never an orphan" \
+      list --orphans
+    rm -f "src/util/$reserved"
+    git rm -q --cached "src/util/$reserved" > /dev/null 2>&1
+  done
+
+  # SPEC.md §5 co-locates a concept as `<stem>.md`, so a concept is a markdown
+  # file and nothing else. A source that happens to open with a `---` block —
+  # a language where that is a legal first line, a file with an editor's own
+  # header on it — is still a source, and reading it as a concept would put a
+  # file the bundle is meant to document on the list of files to delete.
+  printf -- '---\ntype: Class\nresource: /src/gone.ts\n---\nexport const x = 1;\n' \
+    > src/frontmatter.ts
+  _okf_stage src/frontmatter.ts || return 1
+  _okf_assert_listing '' "a source is not a concept, whatever it opens with" \
+    list --orphans
+  rm -f src/frontmatter.ts
+  git rm -q --cached src/frontmatter.ts > /dev/null 2>&1
+
+  # A concept written and never committed is not in the bundle yet. Scope is
+  # read out of git — the same reading that keeps gitignored files off `okf
+  # list` — so a stray .md in the working tree is not something okf answers for.
+  printf -- '---\ntype: Class\nresource: /src/util/Gone.java\n---\n' \
+    > src/util/Untracked.md
+  _okf_assert_listing '' "an untracked concept is not in the bundle" list --orphans
+  _okf_stage src/util/Untracked.md || return 1
+  _okf_assert_listing 'src/util/Untracked.md' "and is once it is staged" list --orphans
+
+  # The concept's own deletion, the other way the pair can be broken. git
+  # ls-files still names it; there is no file to read a resource out of, and
+  # nothing left to report.
+  rm -f src/util/Untracked.md
+  _okf_assert_listing '' "a concept deleted from the working tree is not listed" \
+    list --orphans
+  git rm -q --cached src/util/Untracked.md > /dev/null 2>&1
+
+  # A concept is the bundle's when the source it names is, so `include` and
+  # `exclude` are asked of the resource. A vendored tree and a directory outside
+  # every include glob are out of scope for `okf list`, and a concept naming a
+  # file in one of them is out of scope here for the same reason.
+  printf -- '---\ntype: Module\nresource: /lib/vendor/gone.py\n---\n' \
+    > lib/vendor/pinned.md
+  printf -- '---\ntype: Module\nresource: /tools/gone.js\n---\n' > tools/build.md
+  _okf_stage lib/vendor/pinned.md tools/build.md || return 1
+  _okf_assert_listing '' \
+    "an excluded resource and one outside include contribute no orphans" \
+    list --orphans
+  rm -f lib/vendor/pinned.md tools/build.md
+  git rm -q --cached lib/vendor/pinned.md tools/build.md > /dev/null 2>&1
+
+  # SPEC.md §5 co-locates a concept beside its source, so a resource naming a
+  # file in some other directory is not one this concept documents. The
+  # directory is as much as can be checked — §5's `<stem>.<TypeName>.md` gives
+  # additional types a filename no source ever has — and it is the part that
+  # matters.
+  printf -- '---\ntype: Module\nresource: /src/gone.ts\n---\n' > src/util/away.md
+  _okf_stage src/util/away.md || return 1
+  _okf_assert_listing '' \
+    "a resource in another directory is not the concept's own source" list --orphans
+  printf -- '---\ntype: Module\nresource: /src/util/gone.ts\n---\n' > src/util/away.md
+  _okf_assert_listing 'src/util/away.md' \
+    "while the same name beside it is, and is an orphan" list --orphans
+  rm -f src/util/away.md
+  git rm -q --cached src/util/away.md > /dev/null 2>&1
+
+  # What co-location is really guarding is the bundle boundary. A nested
+  # repository with its own okf.json is its own bundle, and its concepts write
+  # `resource` bundle-absolute against *its* root: read from out here,
+  # /src/pkg/Thing.java is a file that was never in this repository. Without §5
+  # to tell the two apart, every concept a vendored bundle has would be on this
+  # listing — and this listing is acted on by deleting files.
+  #
+  # The include glob is widened to `**` for this one, so that what keeps the
+  # nested concept off the listing is demonstrably co-location and not a glob
+  # that never reached it.
+  mkdir -p nested/src/pkg
+  printf '{}\n' > nested/okf.json
+  printf 'class Thing {}\n' > nested/src/pkg/Thing.java
+  printf -- '---\ntype: Class\nresource: /src/pkg/Thing.java\n---\n' \
+    > nested/src/pkg/Thing.md
+  printf '%s\n' '{"bundle": {"include": ["**"], "exclude": []}}' > okf.json
+  _okf_stage nested/okf.json nested/src/pkg/Thing.java nested/src/pkg/Thing.md \
+    || return 1
+  _okf_assert_listing '' \
+    "a nested bundle's concepts are not this bundle's orphans" list --orphans
+  rm -rf nested
+  rm -f okf.json
+  git rm -q -r --cached nested > /dev/null 2>&1
+
+  # A concept at the bundle root that declares an empty resource is the one
+  # place where "names no source" and "names a source beside it" are the same
+  # string: the root's directory part is empty, and so is the value. Everywhere
+  # else co-location throws such a concept out on its own; here it would fall
+  # through to the existence test and be reported, putting a document at the top
+  # of the bundle on a listing of files to delete.
+  printf -- '---\ntype: Class\nresource:\n---\n' > Rootless.md
+  printf '%s\n' '{"bundle": {"include": ["**"], "exclude": []}}' > okf.json
+  _okf_stage Rootless.md || return 1
+  _okf_assert_listing '' \
+    "a root concept with an empty resource is not an orphan" list --orphans
+  rm -f Rootless.md okf.json
+  git rm -q --cached Rootless.md > /dev/null 2>&1
+
+  # An include glob shaped by extension rather than by directory matches no .md
+  # anywhere in the repository. Asked of the concept's own path it would empty
+  # this listing and exit 0 — a repo full of orphans reported as having none,
+  # which is the one answer a listing of leftovers must never give.
+  printf '%s\n' '{"bundle": {"include": ["src/**/*.ts"], "exclude": []}}' > okf.json
+  rm -f src/util/helper.ts
+  _okf_assert_listing 'src/util/helper.md' \
+    "an include glob written by extension still finds its orphans" list --orphans
+  rm -f okf.json
+
+  # `extensions` is the one bundle setting that does not reach this listing: it
+  # says what kind of file gets documented, and a concept that exists is
+  # evidence one already was. Narrowing it to java today cannot make yesterday's
+  # TypeScript concept stop being a leftover when its source goes.
+  printf '%s\n' '{"bundle": {"include": ["src/**", "lib/**"],
+    "exclude": ["**/vendor/**", "**/node_modules/**"], "extensions": ["java"]}}' \
+    > okf.json
+  _okf_assert_listing 'src/util/helper.md' \
+    "extensions names what is a source, and does not gate concepts" list --orphans
+  rm -f okf.json
+  git checkout -q -- src/util/helper.ts > /dev/null 2>&1
+
+  # Two orphans come out in the order the bundle holds them — git's — which is
+  # the order plain `okf list` prints and the order --missing keeps.
+  printf -- '---\ntype: Module\nresource: /src/app.ts\n---\n' > src/app.md
+  printf -- '---\ntype: Module\nresource: /lib/core.py\n---\n' > lib/core.md
+  _okf_stage src/app.md lib/core.md || return 1
+  rm -f src/app.ts lib/core.py
+  _okf_assert_listing 'lib/core.md
+src/app.md' \
+    "several orphans come out in the order the bundle holds them" list --orphans
+
+  # A resource that is there but is not a file — a directory left where one was
+  # — is a resource that has not gone away. What okf can say is that something
+  # is at that path; what it is belongs to the drift check, not to this listing.
+  mkdir -p src/app.ts
+  _okf_assert_listing 'lib/core.md' \
+    "a resource that exists as a directory is not gone" list --orphans
+  rmdir src/app.ts
+  rm -f src/app.md lib/core.md
+  git rm -q --cached src/app.md lib/core.md > /dev/null 2>&1
+  git checkout -q -- src/app.ts lib/core.py > /dev/null 2>&1
+  return 0
+}
+
 # The refusals: a line okf cannot act on is answered, not guessed at.
 _okf_list_refusal_probe() {
   local okf="$TOOLKIT_ROOT/bin/okf"
@@ -3021,21 +3353,20 @@ _okf_list_refusal_probe() {
   assert_exit 1 "$okf" list extra
   assert_contains "$(last_output)" "extra" "okf list names an argument it does not take"
 
-  # SPEC.md §7 gives list two flags and each is its own PLAN.md item. --orphans
-  # is not built yet, and until it is, exiting 1 keeps a caller from mistaking
-  # the whole listing for the filtered one they asked for.
-  assert_exit 1 "$okf" list --orphans
-  assert_contains "$(last_output)" "--orphans" "okf list --orphans says it is not built yet"
-
-  # --missing and --orphans name different listings, and which of them wins when
-  # both are given is the --orphans item's to settle. Until then the refusal has
-  # to come out whichever order they are typed in, or `list --missing --orphans`
-  # is a listing of one thing answering a request for another.
+  # --missing narrows the source listing and --orphans replaces it with a
+  # listing of concepts, so no listing answers both. Ranking one over the other
+  # would hand back paths of the wrong kind to a caller with no way to see which
+  # flag was dropped — `okf list --missing --orphans | xargs rm` on the sources.
+  # The refusal has to come out whichever order they are typed in, and it has to
+  # name both flags, or it reads as a complaint about only one of them.
   assert_exit 1 "$okf" list --missing --orphans
   assert_contains "$(last_output)" "--orphans" \
-    "--missing does not talk okf past an --orphans it cannot honour"
+    "okf list refuses --missing and --orphans together"
+  assert_contains "$(last_output)" "--missing" \
+    "and names the other flag as well as the one it stopped on"
   assert_exit 1 "$okf" list --orphans --missing
-  assert_contains "$(last_output)" "--orphans" "nor does it in the other order"
+  assert_contains "$(last_output)" "--orphans" "the refusal holds in the other order"
+  assert_contains "$(last_output)" "--missing" "and still names both flags there"
 
   printf 'not json at all\n' > okf.json
   assert_exit 1 "$okf" list
@@ -3049,6 +3380,14 @@ _okf_list_refusal_probe() {
   assert_exit 1 "$okf" list
   assert_contains "$(last_output)" ".bundle.include" \
     "a setting of the wrong shape is named by its key"
+
+  # --orphans reads the same settings and has to refuse the same file. It gets
+  # there by a different route — the concepts are gathered before the globs are
+  # compiled — and a route that skipped the compile would answer an unusable
+  # okf.json with a listing built from no include at all.
+  assert_exit 1 "$okf" list --orphans
+  assert_contains "$(last_output)" ".bundle.include" \
+    "okf list --orphans refuses the same settings okf list does"
 
   # The gitignore constructs okf's globs have not got are refused by name, like
   # every other setting okf cannot act on. Escaped into literals instead, a
@@ -3277,6 +3616,13 @@ test_okf_list_missing_lists_undocumented_sources() {
   with_fixture_repo scoped _okf_list_missing_probe
 }
 
+# The same rule read the other way round: --orphans lists the concept files
+# whose `resource` names a source that is no longer there.
+test_okf_list_orphans_lists_concepts_whose_source_is_gone() {
+  _okf_preconditions || return 1
+  with_fixture_repo scoped _okf_list_orphans_probe
+}
+
 # Scope is read out of git, so a bundle root outside a work tree is a question
 # okf cannot answer — and says so rather than printing an empty listing and
 # exiting 0.
@@ -3314,6 +3660,16 @@ test_okf_list_needs_a_git_work_tree() {
   # for the wrong reason.
   assert_contains "$(last_output)" "work tree" \
     "okf list says why it cannot list a directory that is not in a work tree"
+
+  # The same for the filtered listings. --orphans reads a different set out of
+  # git than plain `list` does, and left to git alone it would fail with git's
+  # own line about the index instead of okf's about the root it was pointed at.
+  local flag
+  for flag in --missing --orphans; do
+    assert_exit 1 "$TOOLKIT_ROOT/bin/okf" -C "$tmp" list "$flag"
+    assert_contains "$(last_output)" "work tree" \
+      "okf list $flag says so too, rather than leaving it to git"
+  done
   rm -rf "$tmp"
   return 0
 }
