@@ -5647,6 +5647,169 @@ test_okf_check_answers_for_its_own_flags() {
   with_fixture_repo concepts _okf_check_flag_probe
 }
 
+# `okf check`'s exit status alongside its listing, which is the pair `--strict`
+# has to be judged on. The flag changes only the first of the two, so both are
+# asserted on every call below: a `--strict` run that exited 3 while printing
+# something other than what the plain run prints would be a second, sterner
+# check rather than the same one with a status on the end — and a caller who
+# read the report and then acted on it would be acting on the wrong listing.
+_okf_assert_check_status() { # $1 = expected status, $2 = expected stdout, $3 = description, $4.. = okf arguments
+  local expected_rc="$1" expected_out="$2" what="$3"
+  shift 3
+  _okf_check "$@"
+  if [ "$OKF_CHECK_RC" -eq "$expected_rc" ]; then
+    _pass "$what"
+  else
+    local -a detail=("okf $* exited $OKF_CHECK_RC, expected $expected_rc" "stderr:")
+    local line
+    while IFS= read -r line; do detail+=("$line"); done < <(_detail_lines "$OKF_CHECK_ERR")
+    _fail "$what" "${detail[@]}"
+  fi
+  assert_eq "$expected_out" "$OKF_CHECK_OUT" \
+    "$what: and its listing is the plain report, line for line"
+}
+
+# SPEC.md §8's "`--strict` exits 3" and SPEC.md §7's exit-code table, which name
+# the same finding: drift, and only drift. Everything the flag must *not* gate
+# on is asserted here too, because a status is the one part of this report a CI
+# job branches on without ever reading it, and a gate that fires on the wrong
+# thing gets switched off rather than fixed.
+_okf_check_strict_probe() {
+  local okf="$TOOLKIT_ROOT/bin/okf" root="$PWD"
+
+  # tests/fixtures/concepts starts with a concept for every source and every
+  # concept carrying the true digest of the source beside it. Finding nothing is
+  # success however the caller asked, so this is the flag's quiet case.
+  _okf_assert_check_status 0 '' \
+    "--strict over a bundle with nothing wrong with it exits 0, printing nothing" \
+    check --strict
+
+  # One source edited under its concept. The plain run is asserted first, on the
+  # same state, because "--strict exits 3" only means something next to "plain
+  # check always exits 0": asserting the 3 on its own would pass just as
+  # happily against a check that had quietly started failing for everybody.
+  printf '// touched\n' >> src/route/RouteRegistry.java
+  _okf_assert_check_status 0 'drifted: src/route/RouteRegistry.md' \
+    "drift leaves a plain run at 0 — SPEC.md §8's CI warns, never gates" check
+  _okf_assert_check_status 3 'drifted: src/route/RouteRegistry.md' \
+    "and the same drift makes a --strict run exit 3" check --strict
+
+  # A second drifted concept is the same answer, not a worse one. There is one
+  # non-zero status for drift in SPEC.md §7's table, and a count leaking into it
+  # would give a caller an exit status to do arithmetic on.
+  printf '// touched\n' >> src/route/Legacy.java
+  _okf_assert_check_status 3 'drifted: src/route/Legacy.md
+drifted: src/route/RouteRegistry.md' \
+    "two drifted concepts are still exit 3, not a count" check --strict
+
+  git checkout -q -- src/route/
+  _okf_assert_check_status 0 '' "and putting both sources back returns --strict to 0" \
+    check --strict
+
+  # An in-scope source nobody has written a concept for. Not drift: SPEC.md §8
+  # defines drift as a stored hash differing from its resource's, and there is
+  # no concept here to have stored one. Gating on it would also be hopeless —
+  # a repository part way through being written up is nearly all `missing:`, so
+  # the job would fail from the first commit until the last concept was authored.
+  printf 'package route;\n\nclass Dispatcher {}\n' > src/route/Dispatcher.java
+  _okf_stage src/route/Dispatcher.java || return 1
+  _okf_assert_check_status 0 'missing: src/route/Dispatcher.java' \
+    "an undocumented source is reported but does not make --strict exit 3" \
+    check --strict
+
+  # A concept whose resource is gone. Also not drift, and its repair is not a
+  # re-read of anything: the concept goes, or the `resource` it names is
+  # corrected.
+  rm -f src/route/Dispatcher.java
+  git rm -q --cached src/route/Dispatcher.java > /dev/null 2>&1
+  rm -f src/route/Legacy.java
+  _okf_assert_check_status 0 'orphan: src/route/Legacy.md' \
+    "an orphan concept is reported but does not make --strict exit 3 either" \
+    check --strict
+
+  # Both of the non-drift kinds at once, in case either only stayed off the
+  # status because the other was absent.
+  printf 'package route;\n\nclass Dispatcher {}\n' > src/route/Dispatcher.java
+  _okf_stage src/route/Dispatcher.java || return 1
+  _okf_assert_check_status 0 'missing: src/route/Dispatcher.java
+orphan: src/route/Legacy.md' \
+    "a report of nothing but missing and orphan findings still exits 0" check --strict
+
+  # And drift on top of them, which is the state a real repository mid-refactor
+  # is in. The 3 has to survive the company of findings that do not cause it.
+  printf '// touched\n' >> src/route/RouteRegistry.java
+  _okf_assert_check_status 3 'drifted: src/route/RouteRegistry.md
+missing: src/route/Dispatcher.java
+orphan: src/route/Legacy.md' \
+    "drift alongside a missing source and an orphan is exit 3" check --strict
+  _okf_assert_check_status 0 'drifted: src/route/RouteRegistry.md
+missing: src/route/Dispatcher.java
+orphan: src/route/Legacy.md' \
+    "and the same three findings leave a plain run at 0" check
+
+  git checkout -q -- src/route/
+  rm -f src/route/Dispatcher.java
+  git rm -q --cached src/route/Dispatcher.java > /dev/null 2>&1
+  _okf_assert_check_status 0 '' "the bundle is clean and --strict is back to 0" check --strict
+
+  # The stderr half. A concept okf can only warn about — a `content_hash` that
+  # was never a digest — is a fact about one file, not a finding about the
+  # bundle: it is not on the listing, so it must not be on the status either. A
+  # --strict run that failed a build over it would be gating on something no
+  # amount of refreshing concepts could clear.
+  printf -- '---\ntype: Class\nresource: /src/route/RouteSource.java\ncode:\n  content_hash: "not-a-digest"\n---\n' \
+    > src/route/Bad.md
+  _okf_stage src/route/Bad.md || return 1
+  _okf_assert_check_status 0 '' \
+    "a concept okf can only warn about leaves --strict at 0, printing no finding" \
+    check --strict
+  assert_contains "$OKF_CHECK_ERR" "code.content_hash is not" \
+    "and the warning it did not gate on was still said out loud"
+  rm -f src/route/Bad.md
+  git rm -q --cached src/route/Bad.md > /dev/null 2>&1
+
+  # SPEC.md §8's other promise, which `--strict` does not get to break: plain
+  # `okf check` never mutates a file, and the flag that changes the status must
+  # not have quietly become the flag that writes — that is `--stamp`, a separate
+  # one, for exactly this reason. Asserted over a run that exits 3, since that
+  # is the run with something it might think worth writing down.
+  local marker=".okf-strict-marker" before_status touched
+  printf '// touched\n' >> src/route/RouteRegistry.java
+  local before_registry
+  before_registry="$(_okf_concept_bytes src/route/RouteRegistry.md)"
+  : > "$marker"
+  before_status="$(git status --porcelain)"
+  _okf_assert_check_status 3 'drifted: src/route/RouteRegistry.md' \
+    "a --strict run that finds drift exits 3" check --strict
+  assert_eq "$before_status" "$(git status --porcelain)" \
+    "and leaves the work tree exactly as it found it"
+  touched="$(find . -path ./.git -prune -o -type f -newer "$marker" -print | sort)"
+  assert_eq "" "$touched" "and not one file in the copy was written to"
+  assert_eq "$before_registry" "$(_okf_concept_bytes src/route/RouteRegistry.md)" \
+    "and the drifted concept is byte for byte as it was — no stale_after was stamped"
+  rm -f "$marker"
+
+  # The status has to survive dispatch, and it is the one status in okf that is
+  # neither 0 nor an error. These two spellings are where it would be lost: a
+  # global flag taken out of the line after the subcommand, and a run re-rooted
+  # into another checkout from outside it.
+  assert_exit 3 "$okf" check -C "$root" --strict
+  assert_exit 3 "$okf" -C "$root" check --strict
+  git checkout -q -- src/route/
+  assert_exit 0 "$okf" -C "$root" check --strict
+
+  # `--strict` is a flag, not an argument, so it stops being one past a `--` and
+  # the line is refused as a stray argument rather than silently gating.
+  assert_exit 1 "$okf" check -- --strict
+  assert_contains "$(last_output)" "check takes no arguments" \
+    "past a -- it is an argument check does not take, not a flag"
+  return 0
+}
+
+test_okf_check_strict_exits_three_only_on_drift() {
+  with_fixture_repo concepts _okf_check_strict_probe
+}
+
 # --- add new test_* functions above this line ------------------------------
 
 # ---------------------------------------------------------------------------

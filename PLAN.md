@@ -38,7 +38,7 @@ there). Items are ordered so none depends on a later one. Every item verifies wi
 
 - [x] Implement okf check in bin/okf to report concepts whose stored code.content_hash differs from the current sha256 of their resource, always exiting 0 and never mutating a file, per SPEC.md §8 (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [x] Extend okf check in bin/okf to also report in-scope sources having no concept and orphan concepts whose resource is gone (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
-- [ ] Add --strict to okf check in bin/okf, exiting 3 when drift exists and leaving every other outcome exiting 0 (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
+- [x] Add --strict to okf check in bin/okf, exiting 3 when drift exists and leaving every other outcome exiting 0 (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Add --json to okf check in bin/okf, emitting the drifted, missing and orphan sets as one JSON document (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Add --stamp to okf check in bin/okf, writing stale_after at the detection instant onto drifted concepts without ever removing an existing verified entry (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Implement okf index in bin/okf to regenerate a per-directory index.md of type Package listing that directory's concepts and subdirectories as bundle-absolute markdown links, never writing an okf_version key into a non-root index.md and leaving the bundle-root index.md's okf_version intact, over a nested tests/fixtures/ tree (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh

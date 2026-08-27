@@ -3542,12 +3542,17 @@ cmd_check() {
 
   # Recognised here so that the flag is answered by the subcommand that owns it
   # rather than by "unknown flag", which would send a caller looking for a
-  # typo — and refused, because each of the three changes what a run *means*.
-  # `--strict` changes the exit status a CI job branches on, `--json` the shape
-  # of what is parsed, `--stamp` whether files are written; accepting any of
-  # them and quietly doing the plain thing would be answering a different
-  # question than the one asked, in a way the caller cannot see.
-  [ "$strict" -eq 0 ] || not_implemented "check --strict"
+  # typo — and, for the two not written yet, refused, because each changes what
+  # a run *means*. `--json` changes the shape of what is parsed and `--stamp`
+  # whether files are written; accepting either and quietly doing the plain
+  # thing would be answering a different question than the one asked, in a way
+  # the caller cannot see.
+  #
+  # `--strict` is off that list because it is carried out, at the bottom of this
+  # function and nowhere else. It changes only the status the run comes back
+  # with: what is walked, what is warned about and what is printed are the plain
+  # run's, line for line, so everything between here and there is written as
+  # though the flag were not there.
   [ "$stamp" -eq 0 ] || not_implemented "check --stamp"
   [ "$json" -eq 0 ] || not_implemented "check --json"
 
@@ -3695,10 +3700,35 @@ cmd_check() {
     printf 'orphan: %s\n' "$finding"
   done
 
-  # Explicit, and not left to the loop's own status. SPEC.md §8's "always exits
-  # 0" is this line: the last thing the loop did was a comparison, and under
-  # `set -e` a final concept that turned out not to have drifted would otherwise
-  # be the status the whole run came back with.
+  # SPEC.md §8's exit statuses, decided here and nowhere else. Explicit, and not
+  # left to the loop's own status: the last thing the walk did was a comparison,
+  # and under `set -e` a final concept that turned out not to have drifted would
+  # otherwise be the status the whole run came back with.
+  #
+  # Plain `okf check` is 0 whatever it found — "CI warns, never gates" — and
+  # every line above this one is printed identically either way, so `--strict`
+  # is a status and not a second, sterner report.
+  #
+  # SPEC.md §7's 3 is `--strict` *and* drift. Nothing else is drift: a `missing:`
+  # or an `orphan:` line leaves a `--strict` run at 0, because §8 defines drift
+  # as one thing — a stored `code.content_hash` that differs from its resource's
+  # current sha256 — and §7's table names that same finding. The two other kinds
+  # would also make a hopeless gate: a repository part way through being written
+  # up is nearly all `missing:`, so a job failing on those would fail from the
+  # first commit until the last concept was authored and be switched off long
+  # before it ever caught real drift. Drift is different in kind — it is a
+  # concept that is actively wrong about the code beside it, and it appears
+  # between one commit and the next rather than being the starting state.
+  #
+  # The warnings above do not reach here either, for the same reason they go to
+  # stderr: a resource that cannot be hashed is a fact about one file, not a
+  # finding about the bundle, and a `--strict` run that failed a build over a
+  # fifo somebody left in a work tree would be gating on the wrong thing. Nor
+  # does a scope that could not be worked out — that costs this report its
+  # `missing:` lines, which are not what `--strict` answers for.
+  if [ "$strict" -eq 1 ] && [ "${#drifted[@]}" -gt 0 ]; then
+    return 3
+  fi
   return 0
 }
 
@@ -3772,6 +3802,15 @@ main() {
     http_preflight "$sub" ${1+"$@"}
     # ${1+"$@"} rather than "$@": under `set -u` an empty "$@" is an unbound
     # variable on bash 3.2, which is still what macOS ships.
+    #
+    # Not caught in a `|| status=$?`, deliberately, even though SPEC.md §7's 3
+    # is a status this line has to carry out rather than a failure: putting the
+    # call in an OR-list turns `set -e` off for the whole of the subcommand it
+    # runs, and every one of them is written expecting errexit to be on. So the
+    # status leaves here the way any non-zero status does — errexit ends the
+    # shell at this line with the status the subcommand returned, which is the
+    # 3 `okf check --strict` came back with. `return $?` below is what runs when
+    # the subcommand succeeded.
     "cmd_$sub" ${1+"$@"}
     return $?
   done
