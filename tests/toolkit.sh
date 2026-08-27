@@ -6070,6 +6070,602 @@ test_okf_check_json_says_what_it_could_not_work_out() {
   with_fixture_repo concepts _okf_check_json_degraded_probe
 }
 
+# ---------------------------------------------------------------------------
+# okf check --stamp (SPEC.md §8)
+# ---------------------------------------------------------------------------
+
+# Now, spelled the way SPEC.md §4 spells an instant, so a value okf wrote and a
+# value this file wrote are comparable as strings.
+_okf_now() {
+  date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+# One concept's `stale_after`, read back through bin/okf's own reader rather
+# than off the line. src/route/Legacy.md quotes every one of its values and ends
+# every line with a CR, so a probe that compared the raw text would be asserting
+# a quoting convention where what is being checked is a timestamp.
+#
+# Preloaded with a concept that carries a `stale_after`, which is what
+# _okf_frontmatter_probe's own comment says that argument is for: an empty
+# answer here then means this concept has no such field, rather than meaning
+# nothing was ever read — every OKF_FM_ variable held a value the read under
+# test had to clear.
+#
+# And the probe's status is answered rather than dropped. Without that, a
+# concept read_frontmatter refused outright — one whose block was damaged by the
+# very write being tested — comes back as the empty string, which is exactly
+# what "this concept has no stale_after" looks like, and the assertion that
+# expects nothing becomes one that cannot fail.
+_okf_stale_after() { # $1 = a concept
+  local out
+  out="$(_okf_frontmatter_probe \
+    "$FIXTURES_DIR/concepts/src/route/RouteRegistry.md" "$1" stale_after)"
+  if [ "$(_okf_frontmatter_status "$out")" != "0" ]; then
+    printf '%s\n' "!read_frontmatter refused $1!"
+    return 0
+  fi
+  _okf_frontmatter_field "$out" stale_after
+}
+
+# Puts a concept into a known state before a stamping run, and says so out loud.
+# Setup that failed in silence would leave every assertion after it comparing
+# two things that were never arranged, which passes for the wrong reason.
+_okf_assert_write() { # $1 = concept, $2 = field, $3 = value
+  local out
+  out="$(_okf_frontmatter_write "$1" "$2" "$3")"
+  assert_eq "0" "$(_okf_write_status "$out")" \
+    "the fixture's $1 can be given $2: $3"
+}
+
+# The value is SPEC.md §4's spelling of an instant, and it is one inside the
+# window the run under test ran in.
+#
+# A window and not an equality, because a run takes time and may cross a second
+# boundary between the clock this file reads and the clock bin/okf reads. Two
+# instants either side of it is the tightest claim that is actually true, and it
+# is tight enough: "the detection instant" is wrong by a whole month, or by a
+# timezone, or by nothing.
+_okf_assert_stamped_now() { # $1 = before, $2 = after, $3 = value, $4 = description
+  local before="$1" after="$2" value="$3" what="$4"
+  case "$value" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) ;;
+    *)
+      _fail "$what" \
+        "SPEC.md §4 writes an instant as 2026-11-24T00:00:00Z; this one reads:" \
+        "$value"
+      return 1
+      ;;
+  esac
+  if [ "$value" \< "$before" ] || [ "$value" \> "$after" ]; then
+    _fail "$what" \
+      "stamped $value, which is not between $before and $after —" \
+      "the instants the run under test was started and finished at"
+    return 1
+  fi
+  _pass "$what"
+  return 0
+}
+
+# SPEC.md §8's `--stamp`: "writes the standard `stale_after` at the detection
+# instant, so plain OKF consumers see the signal without understanding `code:`".
+#
+# Nothing in this probe turns on today's date. The fixture's own `stale_after`
+# values are in November 2026, which is the future on the machine this was
+# written on and the past on any machine whose clock is past it — a test reading
+# them as one or the other would quietly start passing for the wrong reason and
+# then stop passing at all. Every concept is put into the state being tested
+# first, with an instant chosen so that no clock can be on the other side of it.
+_okf_check_stamp_probe() {
+  local concept="src/route/Boundaries.md"
+  local marker=".okf-stamp-marker" before_status touched before after bytes
+
+  # A bundle with nothing wrong with it. `--stamp` is the flag that writes and
+  # there is nothing here to write: a run over a clean bundle has to be the
+  # plain run down to the bytes on disk, or a hook running it on every commit
+  # would dirty a work tree nobody had touched.
+  : > "$marker"
+  before_status="$(git status --porcelain)"
+  _okf_assert_check '' "--stamp over a clean bundle prints nothing, exiting 0" \
+    check --stamp
+  assert_eq "$before_status" "$(git status --porcelain)" \
+    "and leaves the work tree exactly as it found it"
+  touched="$(find . -path ./.git -prune -o -type f -newer "$marker" -print | sort)"
+  assert_eq "" "$touched" "and not one file in the copy was written to"
+  rm -f "$marker"
+
+  # src/route/Boundaries.md carries no `stale_after` at all, which is the
+  # inserting half: the signal has to appear on a concept that has never had
+  # one, and it has to appear where SPEC.md §4's reader looks for it.
+  assert_eq "" "$(_okf_stale_after "$concept")" \
+    "the fixture's Boundaries.md starts out with no stale_after"
+
+  printf '// touched\n' >> src/route/Boundaries.java
+  before="$(_okf_now)"
+  _okf_assert_check "drifted: $concept" \
+    "a drifted concept is reported exactly as a plain run reports it" check --stamp
+  after="$(_okf_now)"
+  _okf_assert_stamped_now "$before" "$after" "$(_okf_stale_after "$concept")" \
+    "and gains a stale_after at the instant the drift was detected"
+
+  # Stamping is not repairing. The concept still describes a version of its
+  # source that is not the one on disk, and the only thing that fixes that is
+  # somebody re-reading the source — so the finding stays on the report, and a
+  # plain run over the stamped bundle says exactly what it said before.
+  _okf_assert_check "drifted: $concept" \
+    "a stamped concept is still drifted, because a stamp is not a repair" check
+
+  # The signal is already there, and it is older, which makes it the truer of
+  # the two: the concept went stale when the drift was first detected, not on
+  # whichever later run happened to look. Left alone — so `--stamp` on every
+  # commit stops producing a diff once it has produced one.
+  _okf_assert_write "$concept" stale_after 1970-01-01T00:00:00Z
+  bytes="$(_okf_concept_bytes "$concept")"
+  _okf_assert_check "drifted: $concept" \
+    "a concept already marked stale is still reported drifted" check --stamp
+  assert_eq "1970-01-01T00:00:00Z" "$(_okf_stale_after "$concept")" \
+    "but keeps the earlier instant it was already marked stale at"
+  assert_eq "$bytes" "$(_okf_concept_bytes "$concept")" \
+    "and is not rewritten at all, so a --stamp on every commit stops making diffs"
+
+  # The opposite case gets the opposite answer. A `stale_after` still in the
+  # future is a concept claiming a freshness the drift has just ended, and a
+  # plain OKF reader — one that knows nothing of `code.content_hash` — would
+  # call it good until the year it names.
+  _okf_assert_write "$concept" stale_after 9999-12-31T23:59:59Z
+  before="$(_okf_now)"
+  _okf_assert_check "drifted: $concept" \
+    "a concept whose stale_after is still in the future is reported drifted" \
+    check --stamp
+  after="$(_okf_now)"
+  _okf_assert_stamped_now "$before" "$after" "$(_okf_stale_after "$concept")" \
+    "and its stale_after is brought back to the detection instant"
+
+  # And a value that is not an instant at all, which nothing here can place in
+  # time. Overwritten for the same reason as the future one: leaving it would be
+  # a drifted concept still reading as fresh to exactly the plain OKF consumers
+  # this flag exists for.
+  _okf_assert_write "$concept" stale_after soon
+  before="$(_okf_now)"
+  _okf_assert_check "drifted: $concept" \
+    "a concept whose stale_after is not an instant is reported drifted" \
+    check --stamp
+  after="$(_okf_now)"
+  _okf_assert_stamped_now "$before" "$after" "$(_okf_stale_after "$concept")" \
+    "and a stale_after nothing can compare against is replaced by one that can"
+
+  # SPEC.md §8's statuses are the walk's, and `--stamp` is not one of them:
+  # writing a file is not a finding. So a stamping run gates exactly as a
+  # reading one does, and prints exactly the same document when asked for JSON.
+  _okf_assert_check_status 3 "drifted: $concept" \
+    "--stamp alongside --strict still exits 3 on drift" check --stamp --strict
+  _okf_assert_check_json 0 \
+    '{"drifted":["src/route/Boundaries.md"],"missing":[],"orphan":[]}' \
+    "and --stamp alongside --json prints the same three sets" check --stamp --json
+
+  git checkout -q -- src/route/
+  _okf_assert_check '' "putting the source back leaves the bundle clean again" \
+    check --stamp
+  return 0
+}
+
+test_okf_check_stamp_marks_drifted_concepts_stale() {
+  if ! command -v date > /dev/null 2>&1; then
+    _skip "okf check --stamp writes stale_after at the detection instant" \
+      "date is not installed here, so there is no clock to stamp with"
+    return 0
+  fi
+  with_fixture_repo concepts _okf_check_stamp_probe
+}
+
+# What `--stamp` must not touch, which is everything except the `stale_after` of
+# a concept on the `drifted:` list.
+#
+# The `verified` half is SPEC.md §8's own sentence — "verified entries are never
+# stripped, they are historical facts" — and it is asserted twice on purpose:
+# once as bytes, which says no line of the concept moved, and once through
+# bin/okf's own reader, which says the entries are still entries to the thing
+# that has to read them.
+_okf_check_stamp_scope_probe() {
+  local drifted="src/route/RouteRegistry.md"
+  local -a others=(src/route/Boundaries.md src/route/Legacy.md src/route/RouteSource.md)
+  local -a snapshot=()
+  local path before after i read_out untouched line
+
+  _okf_assert_write "$drifted" stale_after 9999-12-31T23:59:59Z
+
+  # An orphan and an undocumented source alongside the drift, so the two kinds
+  # of finding `--stamp` has nothing to write for are both present on the run
+  # that writes. A `missing:` has no concept to stamp at all; an `orphan:`'s
+  # source is gone, so there is no version of it the concept could be stale
+  # against, and marking it would only add a second thing wrong with a file that
+  # is on its way out.
+  printf '// touched\n' >> src/route/RouteRegistry.java
+  printf 'package route;\n\nclass Dispatcher {}\n' > src/route/Dispatcher.java
+  _okf_stage src/route/Dispatcher.java || return 1
+  rm -f src/route/Legacy.java
+
+  for path in "${others[@]}"; do
+    snapshot+=("$(_okf_concept_bytes "$path")")
+  done
+  untouched="$(_okf_concept_bytes "$drifted" "stale_after:")"
+
+  before="$(_okf_now)"
+  _okf_assert_check "drifted: $drifted
+missing: src/route/Dispatcher.java
+orphan: src/route/Legacy.md" \
+    "all three kinds of finding, reported as a plain run reports them" check --stamp
+  after="$(_okf_now)"
+
+  _okf_assert_stamped_now "$before" "$after" "$(_okf_stale_after "$drifted")" \
+    "the drifted concept is stamped"
+  assert_eq "$untouched" "$(_okf_concept_bytes "$drifted" "stale_after:")" \
+    "and every other byte of it is exactly as it was — the stale_after line and nothing else"
+  for ((i = 0; i < ${#others[@]}; i++)); do
+    # src/route/Legacy.md is the orphan here and src/route/RouteSource.md has no
+    # stored hash to have drifted from; neither is on the drifted list, so
+    # neither is stamped.
+    assert_eq "${snapshot[i]}" "$(_okf_concept_bytes "${others[i]}")" \
+      "${others[i]} is not on the drifted list, so it is byte for byte as it was"
+  done
+
+  read_out="$(_okf_frontmatter_probe "" "$drifted" "verified[].at" stale_after)"
+  assert_eq "$(printf '2026-08-26T15:00:00Z\n2026-08-26T16:40:00Z')" \
+    "$(_okf_frontmatter_field "$read_out" "verified[].at")" \
+    "both verified entries survive the stamp — SPEC.md §8: never stripped"
+
+  git checkout -q -- src/route/
+  rm -f src/route/Dispatcher.java
+  git rm -q --cached src/route/Dispatcher.java > /dev/null 2>&1
+
+  # src/route/Legacy.md is written with CRLF line endings and a UTF-8 BOM, and
+  # quotes every one of its values. A stamped line that came out with a bare LF
+  # would leave one line of the file ending differently from every other, which
+  # is the kind of damage a whole-file diff shows and a field-by-field read does
+  # not.
+  _okf_assert_write src/route/Legacy.md stale_after 9999-12-31T23:59:59Z
+  printf '// touched\n' >> src/route/Legacy.java
+  before="$(_okf_now)"
+  _okf_assert_check 'drifted: src/route/Legacy.md' \
+    "a concept written on Windows is reported drifted like any other" check --stamp
+  after="$(_okf_now)"
+  _okf_assert_stamped_now "$before" "$after" "$(_okf_stale_after src/route/Legacy.md)" \
+    "and is stamped like any other"
+  line="$(_okf_concept_line src/route/Legacy.md "stale_after:")"
+  case "$line" in
+    *$'\r')
+      _pass "and its stamped line keeps the CRLF ending every other line of that file has"
+      ;;
+    *)
+      _fail "and its stamped line keeps the CRLF ending every other line of that file has" \
+        "the line written was:" "$line"
+      ;;
+  esac
+
+  git checkout -q -- src/route/
+  return 0
+}
+
+test_okf_check_stamp_touches_nothing_else() {
+  if ! command -v date > /dev/null 2>&1; then
+    _skip "okf check --stamp touches nothing but a drifted concept's stale_after" \
+      "date is not installed here, so there is no clock to stamp with"
+    return 0
+  fi
+  with_fixture_repo concepts _okf_check_stamp_scope_probe
+}
+
+# A `--stamp` that could not stamp. Every other thing `okf check` cannot do is a
+# fact about one file that leaves the status alone — SPEC.md §8's "CI warns,
+# never gates" — and this one is not: the caller asked for files to be written,
+# and a run that could not write them and came back 0 would leave a hook, or the
+# person who typed it, believing a signal is in concepts that do not carry it.
+_okf_check_stamp_refusal_probe() {
+  local okf="$TOOLKIT_ROOT/bin/okf" before after
+
+  _okf_assert_write src/route/Boundaries.md stale_after 9999-12-31T23:59:59Z
+  _okf_assert_write src/route/RouteRegistry.md stale_after 9999-12-31T23:59:59Z
+  printf '// touched\n' >> src/route/Boundaries.java
+  printf '// touched\n' >> src/route/RouteRegistry.java
+
+  chmod 444 src/route/Boundaries.md > /dev/null 2>&1
+  if [ -w src/route/Boundaries.md ]; then
+    # Running as root, where a mode of 444 stops nothing. There is no unwritable
+    # file to be had here, so there is nothing to check.
+    _skip "a concept that cannot be stamped is warned about" \
+      "chmod 444 does not make a file unwritable here"
+    chmod 644 src/route/Boundaries.md > /dev/null 2>&1
+    return 0
+  fi
+
+  before="$(_okf_now)"
+  _okf_check check --stamp
+  after="$(_okf_now)"
+
+  assert_eq "1" "$OKF_CHECK_RC" \
+    "a --stamp that could not write a stale_after exits 1, not 0"
+  assert_eq "drifted: src/route/Boundaries.md
+drifted: src/route/RouteRegistry.md" "$OKF_CHECK_OUT" \
+    "and still prints the report it would have printed either way"
+  assert_contains "$OKF_CHECK_ERR" \
+    "src/route/Boundaries.md: could not be stamped" \
+    "naming the concept it could not stamp, on stderr"
+  assert_contains "$OKF_CHECK_ERR" "is not writable" "and saying why"
+
+  # A refusal decided before the concept was opened, which is what this one is,
+  # must not read like a write that failed part way through. The writer says
+  # which of the two happened; the warning above it deliberately does not
+  # guess.
+  case "$OKF_CHECK_ERR" in
+    *half-written*)
+      _fail "a concept okf never opened is not reported as half-written" \
+        "the refusal was decided by the -w check, before anything was written:" \
+        "$OKF_CHECK_ERR"
+      ;;
+    *) _pass "a concept okf never opened is not reported as half-written" ;;
+  esac
+
+  # One concept that could not be written does not stop the others: a bundle
+  # with a read-only file in it is still a bundle whose other drift is worth
+  # marking.
+  _okf_assert_stamped_now "$before" "$after" \
+    "$(_okf_stale_after src/route/RouteRegistry.md)" \
+    "while the drifted concept beside it is stamped all the same"
+  assert_eq "9999-12-31T23:59:59Z" "$(_okf_stale_after src/route/Boundaries.md)" \
+    "and the one that could not be written is exactly as it was"
+
+  # SPEC.md §7's 1 outranks `--strict`'s 3. The two say different kinds of
+  # thing and only one status can be returned: 3 is "this bundle has drift in
+  # it", which the listing has already said and which the caller opted into
+  # gating on, while 1 is "and I could not record it" — which nothing else in
+  # this run reports. A gate reading 3 still fails on 1, so preferring the news
+  # lets nothing through.
+  _okf_check check --strict --stamp
+  assert_eq "1" "$OKF_CHECK_RC" \
+    "a stamp that failed outranks --strict's 3, which the listing already said"
+
+  chmod 644 src/route/Boundaries.md > /dev/null 2>&1
+  git checkout -q -- src/route/
+  return 0
+}
+
+test_okf_check_stamp_says_when_it_could_not_write() {
+  if ! command -v date > /dev/null 2>&1; then
+    _skip "okf check --stamp says when it could not write" \
+      "date is not installed here, so there is no clock to stamp with"
+    return 0
+  fi
+  with_fixture_repo concepts _okf_check_stamp_refusal_probe
+}
+
+# SPEC.md §3's tool list has no clock in it, so `--stamp` is the one run that
+# reaches past it — and the preflight's promise is to name exactly what is
+# missing. Demanded of that run and of no other: `okf check` on a machine
+# without `date` is a perfectly good `okf check`, and refusing it would be okf
+# growing a requirement §3 never gave it.
+_okf_check_stamp_clock_probe() {
+  local -a hard=()
+  local name dir
+
+  while IFS= read -r name; do
+    [ -n "$name" ] && hard+=("$name")
+  done < <(_okf_spec_tools_in_tier A)
+  if [ "${#hard[@]}" -eq 0 ]; then
+    _fail "SPEC.md §3 names the tools bin/okf requires" \
+      "extracted no tool names from the runtime prerequisites section"
+    return 1
+  fi
+
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/toolkit-clock.XXXXXX")" || {
+    _fail "a probe PATH without date can be built" "mktemp -d failed"
+    return 1
+  }
+  printf '%s\n' "$dir" >> "$HARNESS_STATE/fixture_dirs"
+  if ! _okf_probe_path "$dir/tier-a" "${hard[@]}"; then
+    _fail "a probe PATH without date can be built" \
+      "a tool SPEC.md §3 requires is not installed here, so a missing date" \
+      "cannot be told from a missing anything else"
+    return 1
+  fi
+
+  # Drift, so the refusal is not something the run could have got away with
+  # never noticing.
+  printf '// touched\n' >> src/route/RouteRegistry.java
+
+  # The control first. §3's own list is enough for every run that does not
+  # stamp, including one that finds drift — so a `--stamp` refused below is
+  # refused for wanting a clock and not because the probe PATH is too thin to
+  # run okf at all.
+  assert_exit 0 _okf_with_path "$dir/tier-a" check
+  assert_contains "$(last_output)" "drifted: src/route/RouteRegistry.md" \
+    "a plain check needs nothing SPEC.md §3 does not list, and finds the drift"
+
+  assert_exit 1 _okf_with_path "$dir/tier-a" check --stamp
+  _okf_assert_names_tool "$(last_output)" date \
+    "--stamp on a machine without a clock is refused, naming date"
+  assert_contains "$(last_output)" "check --stamp" \
+    "and says which run wanted it, so date does not read as a new requirement of okf"
+
+  # Refused before anything was walked, let alone written: a run that got as far
+  # as a finding and only then discovered it had no clock would have spent the
+  # walk to say what the first line could have said.
+  case "$(last_output)" in
+    *"drifted:"*)
+      _fail "the clock is demanded before the bundle is walked" \
+        "the refusal came after a finding had already been printed:" \
+        "$(last_output)"
+      ;;
+    *) _pass "the clock is demanded before the bundle is walked" ;;
+  esac
+
+  git checkout -q -- src/route/
+  return 0
+}
+
+test_okf_check_stamp_names_the_clock_it_needs() {
+  with_fixture_repo concepts _okf_check_stamp_clock_probe
+}
+
+# A `date` that is installed and does not answer with a time: a busybox applet
+# that does not understand the format string, a Git-for-Windows shim, a wrapper
+# somebody put on PATH that prints a warning first. have_tool cannot tell those
+# from a working clock — it only asks whether the name resolves — so the run
+# gets as far as reading it and has to deal with what came back.
+#
+# The branch matters more than its size. It is the only place OKF_STAMP_ERROR is
+# printed and the only bulk assignment to the count that decides the exit
+# status, so a count left at zero here would be a run that stamped nothing,
+# warned about nothing a caller could act on, and exited 0.
+_okf_check_stamp_broken_clock_probe() {
+  local fakebin saved_path
+
+  _okf_assert_write src/route/Boundaries.md stale_after 9999-12-31T23:59:59Z
+  _okf_assert_write src/route/RouteRegistry.md stale_after 9999-12-31T23:59:59Z
+  printf '// touched\n' >> src/route/Boundaries.java
+  printf '// touched\n' >> src/route/RouteRegistry.java
+
+  # The same device the scope tests use for ripgrep: there is no way to make a
+  # working `date` answer wrongly, so a stand-in goes in front of it on PATH.
+  if ! fakebin="$(mktemp -d "${TMPDIR:-/tmp}/toolkit-fakedate.XXXXXX")"; then
+    _fail "a stand-in date can be made" "mktemp -d failed"
+    return 1
+  fi
+  printf '%s\n' "$fakebin" >> "$HARNESS_STATE/fixture_dirs"
+  # Two lines, because that is what a `date` which does not understand the
+  # format string actually does: it prints a usage screen. warn() promises one
+  # `okf: `-prefixed line per message, so a second line quoted back verbatim
+  # would land on stderr unprefixed, in among the findings, reading as output
+  # from okf itself.
+  printf '#!/bin/sh\nprintf "not a time\\nusage: date [-u] [+format]\\n"\nexit 0\n' \
+    > "$fakebin/date"
+  if ! chmod +x "$fakebin/date"; then
+    _fail "a stand-in date can be made" "chmod +x failed: $fakebin/date"
+    rm -rf "$fakebin"
+    return 1
+  fi
+
+  # In front for exactly this one run and taken off again: every other command
+  # this probe uses still resolves to the real one, and a fake left on PATH
+  # would silently degrade every test after this.
+  saved_path="$PATH"
+  PATH="$fakebin:$PATH"
+  _okf_check check --stamp
+  PATH="$saved_path"
+  rm -rf "$fakebin"
+
+  assert_eq "1" "$OKF_CHECK_RC" \
+    "a --stamp whose clock answered with something that is not a time exits 1"
+  assert_eq "drifted: src/route/Boundaries.md
+drifted: src/route/RouteRegistry.md" "$OKF_CHECK_OUT" \
+    "and still prints the report, which needed no clock to produce"
+  assert_contains "$OKF_CHECK_ERR" "did not print an ISO 8601 UTC instant" \
+    "saying on stderr what came back instead of an instant"
+
+  # Every line of it okf's own, prefix and all. A caller reads stderr for okf's
+  # errors, and a stray line out of some tool okf shelled out to is one they
+  # would go looking for in the wrong script.
+  local stray line
+  stray=""
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$line" in
+      "okf: "*) ;;
+      *) stray="$line" ;;
+    esac
+  done <<< "$OKF_CHECK_ERR"
+  if [ -n "$stray" ]; then
+    _fail "and quoting a two-line answer back does not put a bare line on stderr" \
+      "this line carries no okf: prefix:" "$stray"
+  else
+    _pass "and quoting a two-line answer back does not put a bare line on stderr"
+  fi
+
+  # Said once with the count rather than once per concept: every one of them
+  # would fail for the same reason, and the count is what the exit status is
+  # decided from.
+  assert_contains "$OKF_CHECK_ERR" \
+    "no stale_after was stamped on any of the 2 drifted concepts" \
+    "and how many concepts went unstamped because of it"
+
+  assert_eq "9999-12-31T23:59:59Z" "$(_okf_stale_after src/route/Boundaries.md)" \
+    "src/route/Boundaries.md is left exactly as it was"
+  assert_eq "9999-12-31T23:59:59Z" "$(_okf_stale_after src/route/RouteRegistry.md)" \
+    "and so is src/route/RouteRegistry.md — a clock read once is read for all of them"
+
+  git checkout -q -- src/route/
+  return 0
+}
+
+test_okf_check_stamp_refuses_a_clock_that_is_not_one() {
+  with_fixture_repo concepts _okf_check_stamp_broken_clock_probe
+}
+
+# A concept that is a symbolic link. `--stamp` is the only thing in okf that
+# opens a concept for writing, and a redirection writes *through* a link — so
+# without a refusal here a tracked `src/A.md -> /elsewhere/A.md` would have a
+# file outside the work tree rewritten, with `git status` having nothing to say
+# about it.
+#
+# Read through all the same: the link is a file git tracks, and comparing it
+# against its resource follows nothing anywhere it should not go. It is the
+# write that is refused, so the concept is still reported drifted.
+_okf_check_stamp_symlink_probe() {
+  local outside target
+
+  if ! outside="$(mktemp -d "${TMPDIR:-/tmp}/toolkit-outside.XXXXXX")"; then
+    _fail "a directory outside the work tree can be made" "mktemp -d failed"
+    return 1
+  fi
+  printf '%s\n' "$outside" >> "$HARNESS_STATE/fixture_dirs"
+
+  # A concept naming a resource that is in the fixture, carrying a digest that
+  # is not that resource's — drift, without having to edit a source.
+  target="$outside/Linked.md"
+  printf -- '---\ntype: Class\ntitle: Linked\nresource: /src/route/RouteSource.java\ncode:\n  content_hash: "sha256:0000000000000000000000000000000000000000000000000000000000000000"\n---\n' \
+    > "$target"
+
+  if ! ln -s "$target" src/route/Linked.md 2> /dev/null; then
+    _skip "a symlinked concept is not stamped through" \
+      "this filesystem has no symbolic links"
+    return 0
+  fi
+  _okf_stage src/route/Linked.md || return 1
+
+  local before
+  before="$(_okf_concept_bytes "$target")"
+
+  _okf_check check --stamp
+
+  assert_eq "1" "$OKF_CHECK_RC" \
+    "a --stamp that met a symlinked concept exits 1"
+  assert_eq "drifted: src/route/Linked.md" "$OKF_CHECK_OUT" \
+    "the link is still read and still reported drifted — only the write is refused"
+  assert_contains "$OKF_CHECK_ERR" "src/route/Linked.md: could not be stamped" \
+    "and the refusal names it on stderr"
+  assert_contains "$OKF_CHECK_ERR" "symbolic link" "saying that is what it is"
+  assert_eq "$before" "$(_okf_concept_bytes "$target")" \
+    "the file outside the work tree is byte for byte as it was"
+
+  # The half that `git status` could never have caught, said out loud: nothing
+  # in the repository changed either, so a caller who checked only this would
+  # have seen a clean tree over a write that had gone somewhere else entirely.
+  assert_contains "$(git status --porcelain)" "src/route/Linked.md" \
+    "the link itself is the only thing git has anything to say about"
+
+  rm -f src/route/Linked.md
+  git rm -q --cached src/route/Linked.md > /dev/null 2>&1
+  rm -rf "$outside"
+  return 0
+}
+
+test_okf_check_stamp_never_writes_through_a_link() {
+  if ! command -v date > /dev/null 2>&1; then
+    _skip "okf check --stamp never writes through a symlinked concept" \
+      "date is not installed here, so there is no clock to stamp with"
+    return 0
+  fi
+  with_fixture_repo concepts _okf_check_stamp_symlink_probe
+}
+
 # --- add new test_* functions above this line ------------------------------
 
 # ---------------------------------------------------------------------------

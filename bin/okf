@@ -2426,7 +2426,14 @@ write_frontmatter_field() { # $1 = concept path, $2 = field name, $3 = value
       fi
     done
   } 2> /dev/null > "$path" || {
-    OKF_FRONTMATTER_ERROR="cannot write $(display_path "$path")"
+    # The one failure here that is not a refusal. Every other reason this
+    # function returns 1 is decided before the concept is opened and leaves it
+    # exactly as it was; this one is the truncation having already happened —
+    # see the note above about SPEC.md §3's tool list having no `mktemp` and no
+    # `mv` to rename over it. A caller told only "cannot write" would read that
+    # as "so nothing was written", which is true of every other refusal and is
+    # the one thing that is not true here.
+    OKF_FRONTMATTER_ERROR="cannot write $(display_path "$path"): it was opened for writing, so it may now be half-written"
     return 1
   }
   return 0
@@ -2497,6 +2504,91 @@ load_concepts() {
     has_frontmatter "$path" || continue
     OKF_CONCEPTS+=("$path")
   done
+}
+
+# ---------------------------------------------------------------------------
+# The clock
+# ---------------------------------------------------------------------------
+
+# SPEC.md §3's tool list has no clock in it — no `date` — and that is a real
+# constraint rather than an oversight: the preflight's promise is to name
+# *exactly* what is missing, and it can only keep that promise about the tools
+# it knows to look for. root_index_document is written around the constraint by
+# stamping nothing at all. The two subcommands SPEC.md §7 gives a timestamp to
+# — `check --stamp` and `verify` — cannot do that, so they own the problem, and
+# this is where it is solved for both.
+#
+# Solved the way http_preflight solves curl's: the tool is demanded of the runs
+# that reach for it and of no others, with a line saying why this run wants
+# something `okf list` never mentions. `okf check` on a machine without `date`
+# is a perfectly good `okf check`; only `--stamp` is not.
+#
+# `date` and not bash's own `printf '%(...)T'`, which would need no tool at all.
+# That format needs bash 4.2 and macOS still ships 3.2 — this script is written
+# for 3.2 throughout, and a stamp that silently stopped working on the oldest
+# supported shell is worse than one dependency named out loud. It would also
+# have to be coaxed into UTC through TZ, where `date -u` simply is UTC.
+OKF_CLOCK_TOOLS=(date)
+
+# Exits 1 naming `date` when it is not installed, saying which run wanted it.
+require_clock() { # $1 = what needs the time, e.g. `check --stamp`
+  require_tools " (needed only by $1, which records the instant it ran)" \
+    "${OKF_CLOCK_TOOLS[@]}"
+}
+
+# The shape okf writes an instant in, and the only shape it will read one of its
+# own back out of: SPEC.md §4's `stale_after: 2026-11-24T00:00:00Z` — ISO 8601,
+# UTC, seconds, `Z`, and nothing optional about any of it.
+#
+# Fixed width with every varying field zero-padded is what makes two of these
+# comparable as strings, which is the whole reason the shape is pinned rather
+# than merely produced. Nothing here parses a date — SPEC.md §3 has no tool that
+# could, and `date -d` is a GNU extension the preflight never promised — so
+# "later than" is `[ "$a" \> "$b" ]` over two values this has vouched for, and a
+# value of any other shape is one no comparison can be made against.
+is_stamp_instant() { # $1 = a candidate timestamp
+  case "$1" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z)
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# Now, as SPEC.md §4 spells an instant. Left in OKF_STAMP_INSTANT rather than
+# printed, as file_digest leaves its digest: a caller stamping a hundred
+# concepts takes the time once, and a `$(...)` per concept would be both a fork
+# and a hundred slightly different answers to one question.
+#
+# `-u` so the answer is UTC whatever TZ says, because a `stale_after` is
+# compared against instants written by other people on other machines and a
+# local-time one is an hour wrong somewhere and thirteen hours wrong elsewhere.
+#
+# Checked rather than trusted, for file_digest's reason: what comes back is
+# written into a concept and compared as a string for ever after. A `date` that
+# printed a warning, or a format string that reached a `date` which does not
+# understand it, would otherwise land in `stale_after` as a value no reader —
+# okf's or OKF's — can do anything with.
+OKF_STAMP_INSTANT=""
+OKF_STAMP_ERROR=""
+stamp_instant() {
+  local now=""
+  OKF_STAMP_INSTANT=""
+  OKF_STAMP_ERROR=""
+
+  now="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2> /dev/null)" || now=""
+  if ! is_stamp_instant "$now"; then
+    # Quoted back so the caller can see what it got instead — but only the
+    # first line of it. warn() promises one `okf: `-prefixed line per message,
+    # and a `date` that answered with a usage screen would otherwise put the
+    # rest of that screen on stderr unprefixed, in among the findings, looking
+    # like output from okf itself. The first line is the informative one in
+    # every version of this that is worth reading.
+    OKF_STAMP_ERROR="date -u did not print an ISO 8601 UTC instant: ${now%%$'\n'*}"
+    return 1
+  fi
+  OKF_STAMP_INSTANT="$now"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -3472,6 +3564,93 @@ json_string_array() { # $1.. = the elements
   printf '%s\0' "$@" | jq -Rs 'split("\u0000")[:-1]'
 }
 
+# SPEC.md §8's `--stamp`, one concept at a time: "writes the standard
+# `stale_after` at the detection instant, so plain OKF consumers see the signal
+# without understanding `code:`".
+#
+# The instant is written into `stale_after`, not an interval added to it, and
+# that is the point of the sentence rather than a shortcut through it. A
+# `stale_after` in the past is what every OKF reader already treats as stale —
+# no extension, no `code.content_hash`, no okf — so setting it to the moment the
+# drift was found is precisely how a bundle says "this concept is stale now" in
+# the vocabulary OKF already has. A date some months out would say the opposite:
+# that the concept is good until then, which is the one thing this run has just
+# established is false.
+#
+#   0  a stale_after was written
+#   1  it could not be, with the reason in OKF_FRONTMATTER_ERROR
+#   2  there was nothing to write, and why that is not a failure is below
+#
+# Three statuses because the third case is common and is not a no-op that got
+# away: a concept already carrying a `stale_after` at or before this instant is
+# already saying what this run came to make it say, and the value already there
+# is the *earlier* detection — which is the truer fact of the two. Rewriting it
+# would move the moment this concept went stale forward to today, and would do
+# it again on the next run, so a hook running `okf check --stamp` on every
+# commit would produce a fresh diff every time over a bundle nobody had touched.
+# SPEC.md §8's neighbouring rule about `verified` entries — "never stripped,
+# they are historical facts" — is the same instinct applied to the other field.
+#
+# A `stale_after` this cannot compare against is overwritten rather than left
+# alone, which is the opposite call and the right one for the opposite reason.
+# A future instant is a concept claiming a freshness the drift has just ended; a
+# value of some other shape is one nothing here can place in time at all, and
+# leaving it would be a drifted concept still reading as fresh to the OKF
+# consumers this whole flag exists for. Neither is a fact worth keeping over the
+# one being written.
+#
+# **No `verified` entry is touched, and that is structural rather than
+# promised.** write_frontmatter_field replaces exactly one line and copies every
+# other byte of the concept out as it came in — see its own comment — and the
+# line it is given here names `stale_after`. There is no path from this function
+# to a list. The absent case inserts immediately above the closing `---`, which
+# is after any `verified:` entries rather than among them: an unindented key is
+# where that sequence ends, so the entries stay entries and stay every one of
+# them. tests/toolkit.sh holds this to both halves.
+# The reason a stamp was refused, for the caller to report. Its own variable
+# rather than write_frontmatter_field's, because not every refusal below is
+# that function's: the symlink is turned away before the writer is ever called.
+OKF_STAMP_REFUSAL=""
+stamp_concept() { # $1 = a drifted concept, $2 = the detection instant, $3 = its stored stale_after
+  local concept="$1" now="$2" existing="$3"
+  OKF_STAMP_REFUSAL=""
+
+  if is_stamp_instant "$existing"; then
+    # Not later than now, so the concept already reads as stale, and has done
+    # since an instant this run has no business moving forward.
+    [ "$existing" \> "$now" ] || return 2
+  fi
+
+  # A symbolic link, refused — init_guard's refusal, for init_guard's reason,
+  # and it belongs here rather than in load_concepts because this is the only
+  # place in okf that opens a concept for writing.
+  #
+  # A redirection writes *through* a link. `src/A.md -> /elsewhere/A.md` is a
+  # tracked file to git, a concept to load_concepts and a perfectly ordinary
+  # path to the writer, so a stamp would rewrite a file outside the work tree
+  # and `git status` would have nothing to say about it. There is no reading of
+  # `--stamp` under which that is what was asked for: the flag marks concepts in
+  # this bundle stale, and whatever the link points at is not in it.
+  #
+  # Refused rather than skipped in silence, and refused as a *failure* — this is
+  # a drifted concept that will never carry the signal `--stamp` exists to
+  # write, and the repair is somebody's to make.
+  #
+  # Only the write is refused. The concept is still read, still compared and
+  # still reported drifted, because none of that follows a link anywhere it
+  # should not go: reading through one is reading the file git tracks.
+  if [ -L "$concept" ]; then
+    OKF_STAMP_REFUSAL="it is a symbolic link, and a stamp would write through it into whatever it points at"
+    return 1
+  fi
+
+  if ! write_frontmatter_field "$concept" stale_after "$now"; then
+    OKF_STAMP_REFUSAL="$OKF_FRONTMATTER_ERROR"
+    return 1
+  fi
+  return 0
+}
+
 # okf check [--strict] [--stamp] [--json] — drift, missing and orphan concepts
 #
 # SPEC.md §8's drift rule, and nothing more than it: "stored `code.content_hash`
@@ -3484,7 +3663,9 @@ json_string_array() { # $1.. = the elements
 #   * It never mutates a file. Not the concept, not the source, not a cache.
 #     `--stamp` is the flag that writes, and it is a separate one precisely so
 #     that the run a hook or a CI job makes on every commit cannot dirty a work
-#     tree. Nothing below this line opens a file for writing.
+#     tree. There is exactly one place below that opens a file for writing —
+#     the stamping loop after the concept walk — and it is reached only when
+#     `--stamp` was asked for and only for concepts on the drifted list.
 #   * It always exits 0. "CI warns, never gates" — drift is the ordinary state
 #     of a repository between a refactor and the doc refresh that follows it,
 #     and a check that failed the build for it would be turned off within a
@@ -3517,6 +3698,24 @@ json_string_array() { # $1.. = the elements
 # A clean bundle prints nothing at all, which is `okf list --orphans`'s
 # convention and the one a warning should keep: something to read means
 # something to do.
+#
+# `--stamp` is the one flag that writes, and it writes nothing but SPEC.md §8's
+# `stale_after`, onto the `drifted:` set and onto nothing else. The other two
+# kinds are deliberately outside it: a `missing:` finding has no concept to
+# stamp, and an `orphan:`'s source is gone, so there is no version of it the
+# concept could be stale against — its repair is a deletion or a corrected
+# `resource`, and marking it stale would only add a second thing wrong with a
+# file that is going away. What each stamp does and does not disturb is
+# stamp_concept's, above.
+#
+# It changes nothing about the report. The same walk, the same findings on
+# stdout, the same warnings on stderr — a stamped concept is still drifted, and
+# still needs its body re-read against the source — so `--stamp` is a side
+# effect on the bundle rather than a fourth kind of line, and `--stamp --json`
+# is the same three sets as `--json`. What it does add is a status: a stamp that
+# could not be written leaves the run at 1, because unlike everything else this
+# subcommand warns about, that is okf failing to do what it was told rather than
+# a fact about one file. See the return at the bottom.
 #
 # `--json` prints the same three sets as one document — `{"drifted": [...],
 # "missing": [...], "orphan": [...]}` — keyed by the labels the plain report
@@ -3574,20 +3773,19 @@ cmd_check() {
   [ $# -eq 0 ] || die "check takes no arguments, but was given: $1" \
     "usage: okf check [--strict] [--stamp] [--json]"
 
-  # Recognised here so that the flag is answered by the subcommand that owns it
-  # rather than by "unknown flag", which would send a caller looking for a
-  # typo — and, for the one not written yet, refused, because it changes what a
-  # run *means*: `--stamp` decides whether files are written, and accepting it
-  # while quietly doing the plain read-only thing would be answering a different
-  # question than the one asked, in a way the caller cannot see.
+  # The clock, demanded of the run that will need it and of no other — see
+  # require_clock. Asked for here rather than at the first write, so that a
+  # machine without `date` is told immediately: a `--stamp` that exited 0
+  # because this particular bundle happened to have no drift in it would let
+  # somebody install okf, watch it succeed, and meet the missing tool for the
+  # first time on the run that finally had something to record.
   #
-  # `--strict` and `--json` are off that list because both are carried out at
-  # the bottom of this function and nowhere else. Neither changes what is
-  # walked or what is warned about — one decides the status the run comes back
-  # with, the other how the same three sets are spelled on stdout — so
+  # `--strict` and `--json` need nothing of the sort, and neither reaches
+  # anything before the bottom of this function: one decides the status the run
+  # comes back with, the other how the same three sets are spelled on stdout, so
   # everything between here and there is written as though neither flag were
-  # there.
-  [ "$stamp" -eq 0 ] || not_implemented "check --stamp"
+  # there. `--stamp` is the one that is not like them, because it writes.
+  [ "$stamp" -eq 0 ] || require_clock "check --stamp"
 
   load_bundle_globs
   load_concepts
@@ -3597,7 +3795,15 @@ cmd_check() {
   # concept walk above to keep them so. Nothing here is large: each set is
   # bounded by the bundle, and a report too big to hold in memory is a repository
   # nobody was going to work through a line at a time anyway.
-  local -a drifted=() missing=() orphans=()
+  # drifted_stale is drifted's twin, appended to at the same statement and read
+  # back by index: the `stale_after` each drifted concept already carried, kept
+  # because `--stamp` has to know whether the concept is already marked stale
+  # and read_frontmatter's variables hold only the concept last read. Taken as
+  # the drift is found rather than by opening every drifted concept a second
+  # time, which would be a second reading of a file that may have changed
+  # between the two — and so a decision made about a version of the concept
+  # this run never compared.
+  local -a drifted=() drifted_stale=() missing=() orphans=()
 
   local concept resource stored
   for concept in ${OKF_CONCEPTS[@]+"${OKF_CONCEPTS[@]}"}; do
@@ -3689,7 +3895,57 @@ cmd_check() {
 
     [ "$OKF_FILE_DIGEST" != "$stored" ] || continue
     drifted+=("$concept")
+    drifted_stale+=("$OKF_FM_STALE_AFTER")
   done
+
+  # SPEC.md §8's `--stamp`, carried out here: after the walk that found the
+  # drift, so "the detection instant" is one instant for one run rather than a
+  # clock read per concept — a run stamping two hundred concepts would otherwise
+  # spread them over a minute and invite somebody to read an ordering into the
+  # difference — and before the scope walk below, which can be the slow half and
+  # has nothing to do with any of this.
+  #
+  # Nothing is stamped when there is no drift, including the clock, so a
+  # `--stamp` over a clean bundle is byte for byte the run a plain `okf check`
+  # would have been.
+  local stamp_refused=0
+  if [ "$stamp" -eq 1 ] && [ "${#drifted[@]}" -gt 0 ]; then
+    if stamp_instant; then
+      local now="$OKF_STAMP_INSTANT" rc=0 at=0
+      for ((at = 0; at < ${#drifted[@]}; at++)); do
+        rc=0
+        stamp_concept "${drifted[at]}" "$now" "${drifted_stale[at]}" || rc=$?
+        # 2 is stamp_concept's "already said so, earlier" and is not a failure;
+        # 1 is a concept that could not be written, which is said out loud with
+        # the writer's own reason — a frontmatter block it never closes, a
+        # read-only file — rather than a paraphrase, because the two are
+        # different things to go and look at.
+        if [ "$rc" -eq 1 ]; then
+          # The concept named first and the writer's reason on its own line
+          # below, rather than folded into one: not every reason
+          # write_frontmatter_field gives names the file it was working on, and
+          # a warning about a concept has to say which concept whatever else it
+          # says.
+          #
+          # "could not be stamped" and not "was left as it was", because those
+          # are two different claims and only the refusal knows which one holds.
+          # Almost every one leaves the concept untouched; the one that does not
+          # — a write that failed part way through — says so itself, in the line
+          # printed just below this one.
+          warn "${drifted[at]}: could not be stamped" \
+            "  $OKF_STAMP_REFUSAL"
+          stamp_refused=$((stamp_refused + 1))
+        fi
+      done
+    else
+      # No usable clock, so none of them can be stamped and each would fail for
+      # the same reason. Said once, with the count, rather than once per
+      # concept.
+      warn "$OKF_STAMP_ERROR" \
+        "  so no stale_after was stamped on any of the ${#drifted[@]} drifted concepts"
+      stamp_refused="${#drifted[@]}"
+    fi
+  fi
 
   # SPEC.md §5's co-location read the third way: an in-scope source with nothing
   # documenting it. has_concept holds the whole of what "beside it" means — the
@@ -3806,6 +4062,22 @@ cmd_check() {
   # fifo somebody left in a work tree would be gating on the wrong thing. Nor
   # does a scope that could not be worked out — that costs this report its
   # `missing:` lines, which are not what `--strict` answers for.
+  # A `--stamp` that could not stamp is the one thing in this subcommand that
+  # is not a finding and not a fact about one file: it is okf failing to do
+  # what it was asked, which is SPEC.md §7's 1. Silence and a 0 there would
+  # leave a hook, or the caller who typed it, believing a signal had been
+  # written into concepts that do not carry it.
+  #
+  # Ahead of `--strict`'s 3, because the two say different kinds of thing and
+  # only one of them can be said. 3 is "this bundle has drift in it", which a
+  # caller opted into gating on and which the listing above has already told
+  # them; 1 is "and I could not record it", which nothing else in this run
+  # reports. A gate reading 3 still fails on 1, so nothing is let through by
+  # preferring the news.
+  if [ "$stamp_refused" -gt 0 ]; then
+    return 1
+  fi
+
   if [ "$strict" -eq 1 ] && [ "${#drifted[@]}" -gt 0 ]; then
     return 3
   fi
