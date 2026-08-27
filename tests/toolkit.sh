@@ -6666,6 +6666,798 @@ test_okf_check_stamp_never_writes_through_a_link() {
   with_fixture_repo concepts _okf_check_stamp_symlink_probe
 }
 
+# ---------------------------------------------------------------------------
+# okf index (SPEC.md §4)
+# ---------------------------------------------------------------------------
+
+# okf index's stdout, its stderr and its exit status, kept apart for the reason
+# _okf_check keeps check's apart: SPEC.md gives each a job — a `wrote` line per
+# file regenerated on stdout, a refusal on stderr, and a status that says
+# whether every index in the bundle is now the listing it should be.
+OKF_INDEX_OUT=""
+OKF_INDEX_ERR=""
+OKF_INDEX_RC=0
+_okf_index() { # $1.. = okf arguments
+  local stderr="$HARNESS_STATE/okf-index-stderr"
+  : > "$stderr"
+  OKF_INDEX_OUT="$("$TOOLKIT_ROOT/bin/okf" "$@" 2> "$stderr")"
+  OKF_INDEX_RC=$?
+  OKF_INDEX_ERR="$(cat "$stderr" 2> /dev/null)"
+  return 0
+}
+
+# okf index exits 0 and its stdout is exactly this. Exactly, and not a
+# substring: the `wrote` lines are the whole account of what the run changed in
+# the work tree, and an account that quietly named one more file than it should
+# is the one nobody would go looking at.
+_okf_assert_index() { # $1 = expected stdout, $2 = description, $3.. = okf arguments
+  local expected="$1" what="$2"
+  shift 2
+  _okf_index "$@"
+  if [ "$OKF_INDEX_RC" -ne 0 ]; then
+    local -a detail=("okf $* exited $OKF_INDEX_RC" "stderr:")
+    local line
+    while IFS= read -r line; do detail+=("$line"); done < <(_detail_lines "$OKF_INDEX_ERR")
+    _fail "$what" "${detail[@]}"
+    return 1
+  fi
+  assert_eq "$expected" "$OKF_INDEX_OUT" "$what"
+}
+
+# Every index.md in the work tree, bundle-relative and sorted, so that what a
+# run wrote can be compared as a set rather than one existence check at a time.
+# A set is what the interesting mistakes are about: an index in a directory
+# that should have none reads exactly like a correct run until the whole list
+# is looked at.
+_okf_index_files() {
+  find . -name index.md -not -path './.git/*' 2> /dev/null \
+    | sed 's|^\./||' | LC_ALL=C sort
+}
+
+# The same files with their digests, for asking whether a second run changed
+# anything at all.
+_okf_index_digests() {
+  local file
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    printf '%s  %s\n' "$(sha256sum < "$file" | awk '{print $1}')" "$file"
+  done < <(_okf_index_files)
+}
+
+# The link targets in one index.md, one per line, with CommonMark's
+# angle-bracket form unwrapped. What comes back is what a reader following a
+# link would resolve.
+_okf_index_targets() { # $1 = path
+  sed -n 's/^- \[.*\](\(.*\))$/\1/p' "$1" | sed -e 's/^<//' -e 's/>$//'
+}
+
+# Whole-line membership in a file, which is what a listing check wants:
+# `- [app](/src/app.md)` is a substring of nothing else in these documents, but
+# `- [a](/src/deep/a/index.md)` is a substring of nothing and a prefix of
+# plenty, and a check by substring would pass on a link pointing somewhere else
+# entirely.
+_okf_assert_file_line() { # $1 = path, $2 = the line, $3 = description
+  local line
+  while IFS= read -r line; do
+    if [ "$line" = "$2" ]; then
+      _pass "$3"
+      return 0
+    fi
+  done < "$1"
+  _fail "$3" "$1 does not contain the line: $2"
+  return 1
+}
+
+_okf_assert_no_file_line() { # $1 = path, $2 = the line, $3 = description
+  local line
+  while IFS= read -r line; do
+    if [ "$line" = "$2" ]; then
+      _fail "$3" "$1 contains the line: $2"
+      return 1
+    fi
+  done < "$1"
+  _pass "$3"
+  return 0
+}
+
+# SPEC.md §4's per-directory index, over a tree deep enough that the question
+# "which directories get one?" has a wrong answer to give.
+_okf_index_tree_probe() {
+  local before after expected
+
+  # The fixture is committed with exactly two index.md files: the bundle root's,
+  # and a hand-written one in src/core. Asserted rather than assumed, because
+  # every set comparison below is against the files this run produced, and a
+  # fixture that arrived carrying more of them would make those comparisons
+  # pass for reasons that have nothing to do with okf.
+  before="$(_okf_index_files)"
+  assert_eq 'index.md
+src/core/index.md' "$before" "the nested fixture starts with two index.md files"
+
+  # One `wrote` line per file, in the bundle's order — git's, which is the order
+  # `okf list` and `okf check` report in — and the bundle root first.
+  _okf_assert_index 'wrote index.md
+wrote docs/index.md
+wrote src/index.md
+wrote src/core/index.md
+wrote src/core/util/index.md
+wrote src/deep/index.md
+wrote src/deep/a/index.md
+wrote src/deep/a/b/index.md
+wrote src/odd/index.md' \
+    "okf index names every index.md it wrote, one per line, in the bundle's order" \
+    index
+
+  # The set, which is the whole of which directories get an index:
+  #
+  #   * every directory holding a concept — docs, src, src/core, src/core/util,
+  #     src/deep/a/b, src/odd;
+  #   * every ancestor of one — src/deep and src/deep/a hold no concept of their
+  #     own and would otherwise leave src/deep/a/b reachable only by someone who
+  #     already knew it was there;
+  #   * and the bundle root, always.
+  #
+  # And nothing else. src/plain holds a source with no concept beside it, so
+  # there is nothing for an index there to list; lib/vendor holds a concept
+  # inside a tree SPEC.md §6's `exclude` takes out of the bundle, and lib holds
+  # nothing but that.
+  expected='docs/index.md
+index.md
+src/core/index.md
+src/core/util/index.md
+src/deep/a/b/index.md
+src/deep/a/index.md
+src/deep/index.md
+src/index.md
+src/odd/index.md'
+  after="$(_okf_index_files)"
+  assert_eq "$expected" "$after" \
+    "okf index writes one index.md per documented directory and its ancestors, and no others"
+
+  # SPEC.md §4's two reserved identities, each in its own place: the repo-root
+  # index.md is the bundle root and is `type: Codebase`; every per-directory one
+  # is `type: Package`.
+  assert_eq "Codebase" "$(_okf_frontmatter_value "$(_okf_frontmatter index.md)" type)" \
+    "the bundle-root index.md is still type: Codebase"
+  local file
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    [ "$file" != "index.md" ] || continue
+    assert_eq "Package" "$(_okf_frontmatter_value "$(_okf_frontmatter "$file")" type)" \
+      "$file is type: Package"
+  done <<< "$after"
+
+  # The formatting contract is load-bearing, not cosmetic — the shell reads
+  # frontmatter with awk — so a generated index has to obey it like anything
+  # else okf writes.
+  _okf_assert_flat_frontmatter_contract src/core/index.md "a per-directory index.md"
+  return 0
+}
+
+# What each index lists, and what it must not.
+_okf_index_listing_probe() {
+  _okf_index index
+  if [ "$OKF_INDEX_RC" -ne 0 ]; then
+    _fail "okf index exits 0 over the nested fixture" "$OKF_INDEX_ERR"
+    return 1
+  fi
+  _pass "okf index exits 0 over the nested fixture"
+
+  # A directory's own concepts, and the directories below it that have an index
+  # of their own. Bundle-absolute — SPEC.md §4's leading-slash form, which OKF
+  # recommends because it survives a file move — so the same link resolves from
+  # wherever it is read.
+  _okf_assert_file_line src/index.md '- [app](/src/app.md)' \
+    "a directory's index lists the concept beside it"
+  _okf_assert_file_line src/index.md '- [core](/src/core/index.md)' \
+    "and links each subdirectory to that subdirectory's own index"
+  _okf_assert_file_line src/core/index.md '- [Engine](/src/core/Engine.md)' \
+    "one directory down, the same two sections name that directory's own files"
+  _okf_assert_file_line src/core/index.md '- [util](/src/core/util/index.md)'  \
+    "and its own subdirectory"
+
+  # A concept belongs to exactly one index. Listing it in an ancestor as well
+  # would make the tree a listing of everything repeated at every level, which
+  # is the one thing a per-directory index is not.
+  _okf_assert_no_file_line src/index.md '- [Engine](/src/core/Engine.md)' \
+    "a concept is listed by its own directory and not by its parent"
+
+  # SPEC.md §4's reserved names are the directory's own document and OKF's, so
+  # an index that listed index.md would link to itself and mark a file
+  # documented that documents nothing.
+  _okf_assert_no_file_line src/core/index.md '- [index](/src/core/index.md)' \
+    "an index does not list itself as one of the directory's concepts"
+
+  # An ancestor that holds no concept of its own gets the subdirectory half and
+  # not the other: a heading with no list under it reads as a listing that
+  # failed.
+  _okf_assert_file_line src/deep/index.md '- [a](/src/deep/a/index.md)' \
+    "an ancestor with no concepts of its own still links the directory below it"
+  _okf_assert_no_file_line src/deep/index.md '## Concepts' \
+    "and carries no empty Concepts section"
+  _okf_assert_no_file_line src/deep/a/b/index.md '## Subdirectories' \
+    "nor an empty Subdirectories section at the bottom of the tree"
+
+  # SPEC.md §4 puts the higher-order concepts under `docs/`, which no default
+  # `bundle.include` reaches — that setting says which *sources* are in scope to
+  # be documented. Filtered by it, a bundle's Playbooks would be linked from
+  # nowhere at all.
+  _okf_assert_file_line docs/index.md '- [Playbook](/docs/Playbook.md)' \
+    "a concept outside bundle.include is still part of the bundle and still listed"
+  _okf_assert_file_line index.md '- [docs](/docs/index.md)' \
+    "and the bundle root links the directory it is in"
+
+  # `exclude` is the other thing: it names trees that are no part of the bundle
+  # in any direction, and a concept found in one of them is not this bundle's to
+  # list.
+  _okf_assert_no_file_line index.md '- [lib](/lib/index.md)' \
+    "an excluded tree is not linked from the bundle root"
+
+  # A directory holding sources and no concepts has nothing for an index to
+  # list, so it gets none — and a link into a listing that does not exist is
+  # worse than no link at all.
+  _okf_assert_no_file_line src/index.md '- [plain](/src/plain/index.md)' \
+    "nor is a directory that has no index of its own"
+
+  # A file name is whatever the filesystem allowed. An unescaped `]` ends the
+  # link text early and an unescaped space or `(` ends the target early, and
+  # either way the link stops resolving — which is the one thing this listing is
+  # for.
+  _okf_assert_file_line 'src/odd/index.md' \
+    '- [Odd (name) \[1\]](</src/odd/Odd (name) [1].md>)' \
+    "a concept whose name needs escaping is still a link that resolves"
+
+  # The whole graph, checked the only way that matters: every link in every
+  # index points at a file that is there. A listing whose links dangle is worse
+  # than no listing, because it reads as a bundle that documents something it
+  # does not.
+  local file target dangling=0 unrooted=0
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    while IFS= read -r target; do
+      [ -n "$target" ] || continue
+      case "$target" in
+        /*) ;;
+        *)
+          unrooted=$((unrooted + 1))
+          _fail "every link okf index writes is bundle-absolute" \
+            "$file links to $target, which has no leading /"
+          ;;
+      esac
+      if [ ! -f ".$target" ]; then
+        dangling=$((dangling + 1))
+        _fail "every link okf index writes resolves to a file" \
+          "$file links to $target, which is not there"
+      fi
+    done < <(_okf_index_targets "$file")
+  done < <(_okf_index_files)
+  [ "$unrooted" -ne 0 ] || _pass "every link okf index writes is bundle-absolute"
+  [ "$dangling" -ne 0 ] || _pass "every link okf index writes resolves to a file"
+  return 0
+}
+
+# SPEC.md §4: the repo-root index.md is the only file in a bundle where
+# `okf_version` is legal. Both halves of that are this subcommand's to keep.
+_okf_index_version_probe() {
+  local was
+
+  # What the bundle root declared before the run, read back afterwards. The
+  # value is the bundle's own fact — which OKF version its concepts are written
+  # to — and okf index has no way to know it and no business changing it.
+  was="$(_okf_frontmatter_value "$(_okf_frontmatter index.md)" okf_version)"
+  assert_eq '"0.2"' "$was" "the nested fixture's bundle root declares an okf_version"
+
+  # src/core/index.md is committed carrying one it may not have, and the wrong
+  # `type` besides — the state a bundle is left in by anyone who copied the root
+  # document into a subdirectory.
+  assert_contains "$(_okf_frontmatter src/core/index.md)" "okf_version" \
+    "and its src/core/index.md carries one it may not"
+
+  _okf_index index
+  assert_eq 0 "$OKF_INDEX_RC" "okf index exits 0"
+
+  assert_eq "$was" "$(_okf_frontmatter_value "$(_okf_frontmatter index.md)" okf_version)" \
+    "okf index leaves the bundle-root index.md's okf_version exactly as it was"
+  # Counted over the whole file rather than the frontmatter alone: §4 calls this
+  # the only file where the key is legal, so a second one anywhere in it is a
+  # second answer to a question with one answer.
+  assert_eq "1" "$(grep -c 'okf_version' index.md | tr -d ' ')" \
+    "and the bundle root still names it exactly once"
+
+  # Every other index in the bundle, checked as a set: not one of them may carry
+  # the key, including the one that arrived carrying it.
+  local file offenders=""
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    [ "$file" != "index.md" ] || continue
+    if grep -q 'okf_version' "$file"; then
+      offenders="${offenders:+$offenders, }$file"
+    fi
+  done < <(_okf_index_files)
+  if [ -n "$offenders" ]; then
+    _fail "no per-directory index.md carries an okf_version" \
+      "SPEC.md §4 makes the bundle root the only file where the key is legal" \
+      "carried by: $offenders"
+  else
+    _pass "no per-directory index.md carries an okf_version"
+  fi
+
+  # The prose above the marker is a person's, and a regeneration is not licence
+  # to throw it away: the bundle root is the one index whose head okf index
+  # cannot author — SPEC.md §4 gives it a `type` and a version that are not
+  # derivable from the file tree — so it copies it through instead.
+  assert_contains "$(cat index.md)" "it has to survive every regeneration" \
+    "the bundle root's own prose survives the run that regenerated its listing"
+
+  # ...and goes on surviving. A head preserved once and dropped on the second
+  # run would pass every check above. Added above the marker, which is where the
+  # line between the two halves of this file is drawn: what is above it is a
+  # person's and is copied through, what is below it is this run's listing.
+  local edited="$HARNESS_STATE/okf-index-edited"
+  awk '
+    /^<!-- okf index -->$/ && !done {
+      print "A second paragraph, added by hand after the first run."
+      print ""
+      done = 1
+    }
+    { print }
+  ' index.md > "$edited" && mv "$edited" index.md
+  # A stale listing below the marker, to be regenerated away by the same run
+  # that keeps the paragraph above it.
+  printf -- '- [gone](/src/gone.md)\n' >> index.md
+
+  _okf_index index
+  assert_eq 0 "$OKF_INDEX_RC" "okf index exits 0 over a hand-edited bundle root"
+  assert_contains "$(cat index.md)" "added by hand after the first run" \
+    "a paragraph added above the marker is kept"
+  assert_contains "$(cat index.md)" "it has to survive every regeneration" \
+    "along with the one that was there before it"
+  _okf_assert_no_file_line index.md '- [gone](/src/gone.md)' \
+    "and everything below the marker is the listing this run wrote, not the last one"
+  return 0
+}
+
+# A regeneration that changes nothing writes nothing. An `okf index` in a
+# hook, or in a loop with `okf check`, would otherwise put every index.md in
+# the repository into `git status` on every run and drown the one that really
+# did change.
+_okf_index_idempotence_probe() {
+  local first second
+
+  _okf_index index
+  assert_eq 0 "$OKF_INDEX_RC" "the first okf index exits 0"
+  first="$(_okf_index_digests)"
+
+  _okf_assert_index '' "a second okf index over an unchanged bundle writes nothing" index
+  second="$(_okf_index_digests)"
+  assert_eq "$first" "$second" "and leaves every index.md byte for byte as it was"
+
+  # A third run after a real change says so, and says only that: the one
+  # directory whose listing is now different. Without this, "writes nothing"
+  # would be satisfied by a subcommand that had stopped working altogether.
+  printf -- '---\ntype: Module\ntitle: extra\nresource: /src/core/extra.ts\n---\n' \
+    > src/core/extra.md
+  printf 'export const extra = 1;\n' > src/core/extra.ts
+  if ! git add src/core/extra.md src/core/extra.ts > /dev/null 2>&1; then
+    _fail "a new concept can be staged in the fixture" "git add failed"
+    return 1
+  fi
+  _okf_assert_index 'wrote src/core/index.md' \
+    "a new concept rewrites its own directory's index and no other" index
+  _okf_assert_file_line src/core/index.md '- [extra](/src/core/extra.md)' \
+    "and that index now lists it"
+  return 0
+}
+
+# The bundle root is written when there is none, because a bundle without one
+# has nowhere to declare which OKF version it is written to — and because
+# add_index_dir's walk stops there.
+_okf_index_bare_root_probe() {
+  local spec_version front
+
+  spec_version="$(_okf_spec_config_json | jq -r '.okf_version // empty' 2> /dev/null)"
+  if [ -z "$spec_version" ]; then
+    _fail "SPEC.md §6 declares an okf_version" \
+      "extracted none from the okf.json block in the okf.json section"
+    return 1
+  fi
+
+  if [ -e index.md ]; then
+    _fail "the tiny fixture starts without a bundle-root index.md" \
+      "already present under $PWD"
+    return 1
+  fi
+
+  # No concepts anywhere in this fixture, so the root is the only index there is
+  # to write — and it is still written.
+  _okf_assert_index 'wrote index.md' \
+    "okf index authors the bundle-root index.md when there is none" index
+
+  front="$(_okf_frontmatter index.md)"
+  assert_eq "Codebase" "$(_okf_frontmatter_value "$front" type)" \
+    "and it is SPEC.md §4's type: Codebase"
+  # The same document `okf init` writes, from the same function, so a bundle
+  # rooted by either route declares the same OKF version in the same words.
+  assert_eq "\"$spec_version\"" "$(_okf_frontmatter_value "$front" okf_version)" \
+    "declaring SPEC.md §6's okf_version, as a string"
+  assert_eq "1" "$(grep -c 'okf_version' index.md | tr -d ' ')" \
+    "exactly once"
+
+  _okf_assert_index '' "and a second run over the same empty bundle writes nothing" index
+  return 0
+}
+
+# What okf index refuses, and what it does with the rest of the bundle while
+# refusing it.
+_okf_index_refusal_probe() {
+  local okf="$TOOLKIT_ROOT/bin/okf"
+
+  # SPEC.md §7 gives index neither a flag nor an argument. A mistyped one is
+  # answered rather than acted on — an `okf index --frce` that regenerated every
+  # index in the bundle would be a run nobody asked for.
+  assert_exit 1 "$okf" index --nope
+  assert_contains "$(last_output)" "unknown flag" \
+    "okf index refuses a flag it does not have"
+  assert_exit 1 "$okf" index somewhere
+  assert_contains "$(last_output)" "takes no arguments" \
+    "and refuses an operand"
+
+  if ! ln -s /dev/null docs/index.md 2> /dev/null; then
+    _skip "okf index never writes through a symlinked index.md" \
+      "this filesystem has no symbolic links"
+    return 0
+  fi
+
+  # A redirection writes *through* a link, so regenerating one would replace a
+  # file somewhere else entirely — outside the repository, if that is where the
+  # link points. Replacing the link instead would silently detach whoever put it
+  # there on purpose, and neither is what "regenerate this directory's index"
+  # asked for.
+  _okf_index index
+  assert_eq 1 "$OKF_INDEX_RC" \
+    "okf index exits 1 when an index.md it was asked to regenerate could not be written"
+  assert_contains "$OKF_INDEX_ERR" "symbolic link" \
+    "and says which file it left alone, and why"
+  if [ -L docs/index.md ]; then
+    _pass "the link itself is left exactly as it was"
+  else
+    _fail "the link itself is left exactly as it was" "docs/index.md is no longer a symlink"
+  fi
+
+  # One unwritable file is not a reason to leave the other twenty directories
+  # without a listing: the refusal is per file, and the run comes back with
+  # SPEC.md §7's 1 at the end having done the rest.
+  assert_contains "$OKF_INDEX_OUT" "wrote src/core/index.md" \
+    "and every other index in the bundle is regenerated anyway"
+  return 0
+}
+
+# The three ways a bundle changes underneath an index that was already written:
+# a concept appears, the last one in a directory goes, and the file the index
+# links to is renamed into something markdown cannot spell bare.
+_okf_index_deletion_probe() {
+  _okf_index index
+  assert_eq 0 "$OKF_INDEX_RC" "the first okf index exits 0"
+  _okf_assert_file_line 'src/odd/index.md' \
+    '- [Odd (name) \[1\]](</src/odd/Odd (name) [1].md>)' \
+    "src/odd's index lists the one concept in it"
+
+  # The index.md files this run wrote are part of the bundle now, so committing
+  # them is what a caller does next — and what the run after has to cope with.
+  if ! git add -A > /dev/null 2>&1 \
+    || ! git commit -q -m "okf index" > /dev/null 2>&1; then
+    _fail "the generated indexes can be committed in the fixture" "git commit failed"
+    return 1
+  fi
+
+  # The last concept in a directory goes. Left alone, that directory's index
+  # would keep a link to a file that is not there — a dangling link in the one
+  # document whose whole purpose is that its links resolve — and would stop
+  # being linked from its parent, because the parent no longer lists a directory
+  # with nothing to list.
+  if ! git rm -q 'src/odd/Odd (name) [1].md' 'src/odd/Odd (name) [1].ts' > /dev/null 2>&1; then
+    _fail "the fixture's only src/odd concept can be removed" "git rm failed"
+    return 1
+  fi
+
+  _okf_index index
+  assert_eq 0 "$OKF_INDEX_RC" "okf index exits 0 after the last concept in a directory is deleted"
+  if [ ! -f src/odd/index.md ]; then
+    _fail "the emptied directory's index.md is still there" "src/odd/index.md is gone"
+    return 1
+  fi
+  _okf_assert_no_file_line 'src/odd/index.md' \
+    '- [Odd (name) \[1\]](</src/odd/Odd (name) [1].md>)' \
+    "the emptied directory's index no longer links the concept that was deleted"
+  _okf_assert_file_line src/index.md '- [odd](/src/odd/index.md)' \
+    "and its parent goes on linking it, so no index in the bundle is unreachable"
+
+  # The invariant the whole tree is checked against, re-asserted after a change:
+  # every link in every index resolves.
+  local file target dangling=0
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    while IFS= read -r target; do
+      [ -n "$target" ] || continue
+      if [ ! -f ".$target" ]; then
+        dangling=$((dangling + 1))
+        _fail "every link still resolves once a concept has been deleted" \
+          "$file links to $target, which is not there"
+      fi
+    done < <(_okf_index_targets "$file")
+  done < <(_okf_index_files)
+  [ "$dangling" -ne 0 ] || _pass "every link still resolves once a concept has been deleted"
+  return 0
+}
+
+# A file name is whatever the filesystem allowed, and a tab in one truncates a
+# bare markdown destination exactly as a space does — while being the one a
+# reader proof-reading the file would never see.
+_okf_index_whitespace_probe() {
+  local odd
+  odd="$(printf 'src/tabs/a\tb')"
+  if ! mkdir -p src/tabs 2> /dev/null \
+    || ! printf 'export const t = 1;\n' > "$odd.ts" 2> /dev/null; then
+    _skip "a concept whose name holds a tab is still a link that resolves" \
+      "this filesystem will not take a tab in a file name"
+    return 0
+  fi
+  printf -- '---\ntype: Module\ntitle: tabbed\n---\n' > "$odd.md"
+  if ! git add src/tabs > /dev/null 2>&1; then
+    _skip "a concept whose name holds a tab is still a link that resolves" \
+      "git would not stage a path with a tab in it"
+    return 0
+  fi
+
+  _okf_index index
+  assert_eq 0 "$OKF_INDEX_RC" "okf index exits 0 over a concept whose name holds a tab"
+
+  # CommonMark's angle-bracket form, which is the one destination spelling that
+  # can carry it.
+  local want
+  want="$(printf -- '- [a\tb](</src/tabs/a\tb.md>)')"
+  _okf_assert_file_line src/tabs/index.md "$want" \
+    "a concept whose name holds a tab is still a link that resolves"
+
+  # A backslash needs no angle brackets and does need escaping: markdown reads
+  # one in a bare destination as an escape, so `/src/back\slash/index.md`
+  # written as it stands links to `/src/backslash/index.md`, which is not a
+  # path this bundle answers to.
+  local slashed='src/back\slash'
+  if ! mkdir -p "$slashed" 2> /dev/null \
+    || ! printf 'export const s = 1;\n' > "$slashed/Thing.ts" 2> /dev/null; then
+    _skip "a directory whose name holds a backslash is linked with it escaped" \
+      "this filesystem will not take a backslash in a directory name"
+    return 0
+  fi
+  printf -- '---\ntype: Module\ntitle: Thing\n---\n' > "$slashed/Thing.md"
+  if ! git add "$slashed" > /dev/null 2>&1; then
+    _skip "a directory whose name holds a backslash is linked with it escaped" \
+      "git would not stage a path with a backslash in it"
+    return 0
+  fi
+
+  _okf_index index
+  assert_eq 0 "$OKF_INDEX_RC" "okf index exits 0 over a directory whose name holds a backslash"
+  _okf_assert_file_line src/index.md '- [back\\slash](/src/back\\slash/index.md)' \
+    "a directory whose name holds a backslash is linked with it escaped"
+
+  # A tab in a *directory* name reaches somewhere a tab in a file name does not:
+  # the frontmatter, as that index's own `title` and `description`. SPEC.md §4's
+  # formatting contract forbids a tab anywhere in a block the shell reads, so it
+  # has to come out as YAML's own escape.
+  local tabbed
+  tabbed="$(printf 'src/ta\tbbed')"
+  if ! mkdir -p "$tabbed" 2> /dev/null \
+    || ! printf 'export const t = 1;\n' > "$tabbed/Thing.ts" 2> /dev/null \
+    || ! printf -- '---\ntype: Module\ntitle: Thing\n---\n' > "$tabbed/Thing.md" 2> /dev/null \
+    || ! git add "$tabbed" > /dev/null 2>&1; then
+    _skip "a directory whose name holds a tab keeps the tab out of its frontmatter" \
+      "this filesystem or git will not take a tab in a directory name"
+    return 0
+  fi
+
+  _okf_index index
+  assert_eq 0 "$OKF_INDEX_RC" "okf index exits 0 over a directory whose name holds a tab"
+  # The frontmatter block alone, not the whole file: §4's "no tabs anywhere" is
+  # a clause of the frontmatter contract, which is what the shell reads with
+  # awk. A tab inside the prose below it is the directory's real name written
+  # out, and reads as one.
+  case "$(_okf_frontmatter "$tabbed/index.md")" in
+    *$'\t'*)
+      _fail "a directory whose name holds a tab keeps the tab out of its frontmatter" \
+        "the frontmatter block of $tabbed/index.md contains a tab"
+      ;;
+    *) _pass "a directory whose name holds a tab keeps the tab out of its frontmatter" ;;
+  esac
+  _okf_assert_file_line "$tabbed/index.md" 'title: "ta\x09bbed"' \
+    "and spells it as YAML's own escape instead"
+  return 0
+}
+
+# A path markdown cannot spell at all.
+_okf_index_line_ending_probe() {
+  local broken
+  broken="$(printf 'src/two\nlines.md')"
+  if ! printf -- '---\ntype: Module\ntitle: broken\n---\n' > "$broken" 2> /dev/null \
+    || ! git add -- "$broken" > /dev/null 2>&1; then
+    _skip "a concept whose path holds a line ending is left out of the index" \
+      "this filesystem or git will not take a newline in a file name"
+    rm -f -- "$broken"
+    return 0
+  fi
+
+  _okf_index index
+  # Exits 0: this is a fact about one path, not okf failing to do what it was
+  # asked with the bundle — the same line `okf check` draws for a source it
+  # cannot hash.
+  assert_eq 0 "$OKF_INDEX_RC" \
+    "okf index still exits 0 when one path in the bundle cannot be spelled as a link"
+  assert_contains "$OKF_INDEX_ERR" "cannot be written as a markdown link" \
+    "and says which path it left out"
+
+  # And the concept really is left out, rather than written as something that
+  # looks like a link across two lines and is not one.
+  _okf_assert_no_file_line src/index.md '- [two' \
+    "the half of a broken link that would have opened it is nowhere in the index"
+  # Everything else in that directory is indexed as it always was.
+  _okf_assert_file_line src/index.md '- [app](/src/app.md)' \
+    "and the directory's other concepts are listed as usual"
+  return 0
+}
+
+# SPEC.md §4 reserves index.md for the bundle's own document, but a repository
+# that has never heard of OKF may well already have one — a landing page, a
+# directory README under another name. Regenerating over it is not something
+# `okf index` can offer to undo, and SPEC.md §7 gives it no --force to ask with.
+_okf_index_foreign_index_probe() {
+  local was
+
+  was='# docs
+
+A landing page somebody wrote, under a name OKF happens to reserve.'
+  printf '%s\n' "$was" > docs/index.md
+  if ! git add docs/index.md > /dev/null 2>&1; then
+    _fail "a hand-written docs/index.md can be staged" "git add failed"
+    return 1
+  fi
+
+  _okf_index index
+  assert_eq 1 "$OKF_INDEX_RC" \
+    "okf index exits 1 when a per-directory index.md is not an OKF document"
+  assert_contains "$OKF_INDEX_ERR" "docs/index.md carries no OKF frontmatter" \
+    "and names the file it left alone"
+  assert_eq "$was" "$(cat docs/index.md)" \
+    "leaving it exactly as it was, to the byte"
+  assert_contains "$OKF_INDEX_OUT" "wrote src/core/index.md" \
+    "and regenerating every other index in the bundle regardless"
+
+  # Still linked from the bundle root: the file is there, so the link resolves,
+  # and a directory dropped from its parent's listing for being awkward is a
+  # part of the bundle nobody can navigate to.
+  _okf_assert_file_line index.md '- [docs](/docs/index.md)' \
+    "the directory is still linked from its parent"
+  return 0
+}
+
+# The bundle root okf index can neither preserve nor author.
+_okf_index_headless_root_probe() {
+  local was
+
+  # Somebody's own notes under SPEC.md §4's reserved name: no frontmatter, so no
+  # `type: Codebase` and no `okf_version`. This is the state `okf init` refuses
+  # to overwrite without --force, and it is not one a regeneration may resolve
+  # on its own — appending a listing to it would leave the bundle rooted in a
+  # document that is a bundle root in name only, and it is the file where SPEC
+  # §4's one legal `okf_version` has to live.
+  was='# Notes I wrote myself'
+  printf '%s\n' "$was" > index.md
+
+  _okf_index index
+  assert_eq 1 "$OKF_INDEX_RC" \
+    "okf index exits 1 when the bundle root is not an OKF document"
+  assert_contains "$OKF_INDEX_ERR" "no OKF frontmatter" \
+    "and says what is wrong with it"
+  assert_contains "$OKF_INDEX_ERR" "okf init --force" \
+    "and what would put it right"
+  assert_eq "$was" "$(cat index.md)" \
+    "leaving the file exactly as it was, to the byte"
+
+  # The rest of the bundle is regenerated regardless: one document okf cannot
+  # write is not a reason to leave twenty directories without a listing.
+  assert_contains "$OKF_INDEX_OUT" "wrote src/core/index.md" \
+    "and every per-directory index is written anyway"
+  return 0
+}
+
+test_okf_index_writes_a_package_index_per_directory() {
+  _okf_preconditions || return 1
+  with_fixture_repo nested _okf_index_tree_probe
+}
+
+test_okf_index_lists_concepts_and_subdirectories() {
+  _okf_preconditions || return 1
+  with_fixture_repo nested _okf_index_listing_probe
+}
+
+test_okf_index_keeps_okf_version_where_spec_puts_it() {
+  _okf_preconditions || return 1
+  with_fixture_repo nested _okf_index_version_probe
+}
+
+test_okf_index_writes_nothing_when_nothing_changed() {
+  _okf_preconditions || return 1
+  with_fixture_repo nested _okf_index_idempotence_probe
+}
+
+test_okf_index_authors_a_bundle_root_that_is_not_there() {
+  _okf_preconditions || return 1
+  with_fixture_repo tiny _okf_index_bare_root_probe
+}
+
+test_okf_index_refuses_what_it_cannot_regenerate() {
+  _okf_preconditions || return 1
+  with_fixture_repo nested _okf_index_refusal_probe
+}
+
+test_okf_index_regenerates_a_directory_that_lost_its_concepts() {
+  _okf_preconditions || return 1
+  with_fixture_repo nested _okf_index_deletion_probe
+}
+
+test_okf_index_escapes_a_name_markdown_would_read() {
+  _okf_preconditions || return 1
+  with_fixture_repo nested _okf_index_whitespace_probe
+}
+
+test_okf_index_refuses_an_index_md_that_is_not_okfs() {
+  _okf_preconditions || return 1
+  with_fixture_repo nested _okf_index_foreign_index_probe
+}
+
+test_okf_index_leaves_out_a_path_markdown_cannot_spell() {
+  _okf_preconditions || return 1
+  with_fixture_repo nested _okf_index_line_ending_probe
+}
+
+test_okf_index_refuses_a_bundle_root_that_is_not_one() {
+  _okf_preconditions || return 1
+  with_fixture_repo nested _okf_index_headless_root_probe
+}
+
+test_okf_index_needs_a_git_work_tree() {
+  _okf_preconditions || return 1
+
+  local tmp
+  if ! tmp="$(mktemp -d "${TMPDIR:-/tmp}/toolkit-bare.XXXXXX")"; then
+    _fail "a directory outside any git repo can be made" "mktemp -d failed"
+    return 1
+  fi
+  printf '%s\n' "$tmp" >> "$HARNESS_STATE/fixture_dirs"
+
+  # See test_okf_list_needs_a_git_work_tree: a TMPDIR that is itself inside a
+  # work tree would fail this for a reason that has nothing to do with okf.
+  if (CDPATH= cd "$tmp" && git rev-parse --is-inside-work-tree > /dev/null 2>&1); then
+    _skip "okf index says why it cannot index a directory outside a work tree" \
+      "TMPDIR is itself inside a git work tree"
+    rm -rf "$tmp"
+    return 0
+  fi
+
+  assert_exit 1 "$TOOLKIT_ROOT/bin/okf" -C "$tmp" index
+  assert_contains "$(last_output)" "work tree" \
+    "okf index says why it cannot index a directory that is not in a work tree"
+  # Nothing written on the way to that refusal: the concepts an index lists come
+  # out of git, so a run that never reached git has no listing to write.
+  if [ -e "$tmp/index.md" ]; then
+    _fail "and writes nothing on the way to saying so" "$tmp/index.md was written"
+  else
+    _pass "and writes nothing on the way to saying so"
+  fi
+  rm -rf "$tmp"
+  return 0
+}
+
 # --- add new test_* functions above this line ------------------------------
 
 # ---------------------------------------------------------------------------

@@ -2628,6 +2628,54 @@ OKF_DEFAULT_CONFIG='{
   }
 }'
 
+# One value, spelled as a YAML double-quoted scalar, left in OKF_YAML_QUOTED
+# rather than printed so that building a document costs no subprocess per line.
+#
+# Quoting is not decoration here. Every value these documents carry is a
+# directory basename or a path built out of one, and so is whatever the
+# filesystem allowed: a `#`, a `:` or a leading `%` in it turns an unquoted
+# YAML scalar into a comment, a mapping or a parse error. A double-quoted
+# scalar is valid YAML for every one of those, and is how SPEC.md §4's own
+# example spells `signature`.
+#
+# A backslash first and then the quote, in that order: escaping the quotes
+# first would leave the backslashes this pass adds to be escaped a second time
+# by the next one.
+#
+# Control characters last, and as YAML's own `\xNN`. A tab in a name would
+# otherwise put a tab in the document, which SPEC.md §4's formatting contract
+# rules out anywhere at all — the shell reads frontmatter with awk — and a
+# newline would end the `title:` line halfway through and turn the rest of the
+# name into a key of its own. Both are rare and neither is impossible: a name is
+# whatever the filesystem allowed.
+#
+# Walked a character at a time only when there is a control character to find,
+# which on every ordinary name is never: the scan below is one `case` against
+# the whole value, and the loop is the slow path nothing normally takes.
+OKF_YAML_QUOTED=""
+yaml_quoted() { # $1 = the value to spell
+  local value="${1//\\/\\\\}"
+  value="${value//\"/\\\"}"
+
+  case "$value" in
+    *[[:cntrl:]]*) ;;
+    *)
+      OKF_YAML_QUOTED="$value"
+      return 0
+      ;;
+  esac
+
+  local out="" at ch
+  for ((at = 0; at < ${#value}; at++)); do
+    ch="${value:at:1}"
+    case "$ch" in
+      [[:cntrl:]]) out="$out\\x$(printf '%02x' "'$ch")" ;;
+      *) out="$out$ch" ;;
+    esac
+  done
+  OKF_YAML_QUOTED="$out"
+}
+
 # The bundle-root index.md `okf init` writes, per SPEC.md §4: the repo-root
 # index.md is the bundle root, it is `type: Codebase`, and it is the **only**
 # file in a bundle where `okf_version` is legal. Both facts are the reason this
@@ -2648,19 +2696,16 @@ OKF_DEFAULT_CONFIG='{
 root_index_document() { # $1 = the bundle's name, $2 = the okf_version it declares
   local name="$1" version="$2" quoted
 
-  # Quoted, and escaped for quoting, because the name is a directory basename
-  # and so is whatever the filesystem allowed: a `#`, a `:` or a leading `%` in
-  # it turns an unquoted YAML scalar into a comment, a mapping or a parse
-  # error. A double-quoted scalar is valid YAML for every one of those, and is
-  # how SPEC.md §4's own example spells `signature`.
+  # Quoted, and escaped for quoting — see yaml_quoted for why the name cannot
+  # be written bare.
   #
   # `okf_version` is quoted for the same reason SPEC.md §6 makes it a JSON
   # string: unquoted, YAML reads 0.2 as a float, and the next version but one
   # — 0.10 — is read as 0.1 and stops matching the okf.json it was copied from.
   # `type` and `status` are left bare: both are words out of a §4 vocabulary,
   # and nothing in either can be mistaken for a number.
-  quoted="${name//\\/\\\\}"
-  quoted="${quoted//\"/\\\"}"
+  yaml_quoted "$name"
+  quoted="$OKF_YAML_QUOTED"
 
   printf '%s\n' \
     '---' \
@@ -4084,8 +4129,621 @@ cmd_check() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# Per-directory indexes (SPEC.md §4)
+# ---------------------------------------------------------------------------
+
+# The line that separates what a person wrote in the bundle-root index.md from
+# what `okf index` regenerates underneath it. Everything from this line to the
+# end of that file belongs to okf; everything above it is left exactly as it
+# was found.
+#
+# Only the bundle root has one, and that asymmetry is the whole design of this
+# subcommand. SPEC.md §4 gives the root index.md an identity that cannot be
+# derived from the file tree — `type: Codebase`, and the bundle's only legal
+# `okf_version` — so okf index is not entitled to author it and does not try:
+# it appends its listing below the marker and copies the rest through byte for
+# byte, which is what leaves that `okf_version` intact in the strongest sense
+# available. A per-directory `type: Package` index is the opposite: it is
+# nothing but a listing of what is in that directory, every word of it
+# derivable, so okf index writes the whole document and says so in the document
+# itself.
+#
+# An HTML comment because that is the one thing markdown renders as nothing at
+# all, and a marker a reader has to look at is one they will eventually delete.
+OKF_INDEX_MARKER="<!-- okf index -->"
+
+# The directories `okf index` writes an index.md into, and the order it writes
+# them in: the bundle root first, then every directory holding a concept and
+# every ancestor of one, each outermost-first and otherwise in git's order —
+# which is the order `okf list` and `okf check` report in.
+OKF_INDEX_DIRS=()
+
+# The concepts those indexes list. load_concepts' set, less anything under an
+# `exclude` glob — see cmd_index for why `include` is not applied here.
+OKF_INDEX_CONCEPTS=()
+
+# A directory, as this section spells one: `.` for the bundle root, and a
+# bundle-relative path with no trailing slash for every other. One spelling
+# throughout, because "the root" turns up as the empty string, as `.` and as a
+# path in three different quarters of a shell script and a comparison between
+# two of those spellings silently answers no.
+OKF_DIR_PARENT=""
+dir_parent() { # $1 = a directory
+  case "$1" in
+    # The bundle root has no parent inside the bundle. Deliberately not `.`,
+    # which would make the root its own parent and list it as a subdirectory of
+    # itself.
+    .) OKF_DIR_PARENT="" ;;
+    */*) OKF_DIR_PARENT="${1%/*}" ;;
+    *) OKF_DIR_PARENT="." ;;
+  esac
+}
+
+# Whether a directory is already in a list.
+#
+# Linear, and deliberately so. bash 3.2 — still what macOS ships, and what this
+# script is written for throughout — has no associative arrays, and the obvious
+# alternative is `sort -u` over a newline-separated list, which would split a
+# path containing a newline into two directories that do not exist. git allows
+# such a path; this cannot. The lists are bounded by the number of directories
+# in one bundle, so the cost is not the kind anyone notices.
+dir_listed() { # $1 = a directory, $2.. = the list so far
+  local wanted="$1" seen
+  shift
+  for seen in ${1+"$@"}; do
+    [ "$seen" != "$wanted" ] || return 0
+  done
+  return 1
+}
+
+# Adds a directory and every one of its ancestors to OKF_INDEX_DIRS, outermost
+# first, skipping any already there.
+#
+# The ancestors are what keeps the link graph whole. A concept in
+# `src/core/util` earns that directory an index.md, and if `src/core` and `src`
+# had none the only way to reach it would be to already know it was there —
+# which is the one thing an index exists to spare a reader.
+#
+# Walked child-to-parent and replayed in reverse, because a chain built the
+# other way round would need to ask "does this directory hold a concept?" of
+# every directory between the root and this one, and the answer for the ones in
+# between is exactly what is not known yet.
+add_index_dir() { # $1 = a directory
+  local dir="$1"
+  local -a chain=()
+
+  while ! dir_listed "$dir" ${OKF_INDEX_DIRS[@]+"${OKF_INDEX_DIRS[@]}"}; do
+    chain=("$dir" ${chain[@]+"${chain[@]}"})
+    case "$dir" in
+      # The root is where the walk stops: it is in the list before the first
+      # concept is looked at, so this is reached only when the list was empty.
+      .) break ;;
+      */*) dir="${dir%/*}" ;;
+      *) dir="." ;;
+    esac
+  done
+
+  [ "${#chain[@]}" -eq 0 ] || OKF_INDEX_DIRS+=("${chain[@]}")
+}
+
+# One markdown link, `[text](target)`, left in OKF_INDEX_LINK.
+#
+# Both halves are escaped, because both are file names and a file name is
+# whatever the filesystem allowed. An unescaped `]` in the text ends the link
+# early and leaves the rest of the name as prose; an unescaped space or `(` in
+# the target ends the target early and leaves a link pointing at nothing. The
+# whole point of this listing is that its links resolve, so a name nobody
+# expected must not be the thing that breaks them.
+#
+# The target takes CommonMark's angle-bracket form when it holds a character
+# the bare form cannot carry, and the bare form otherwise — `<>` around every
+# link would be correct and would also make every one of these files harder to
+# read than the directory listing it replaces.
+#
+# What the bare form cannot carry is CommonMark's own list: a space, an ASCII
+# control character, or an unbalanced parenthesis. Whitespace and control
+# characters are tested as classes rather than as the space alone, because a
+# tab in a file name truncates a bare destination exactly as a space does and
+# is the one a reader proof-reading the file would never see.
+OKF_INDEX_LINK=""
+index_link() { # $1 = the link text, $2 = the bundle-absolute target
+  local text="${1//\\/\\\\}" target="${2//\\/\\\\}"
+  text="${text//\[/\\[}"
+  text="${text//\]/\\]}"
+
+  # The backslash is doubled above, before either form is chosen, because both
+  # of them read one as an escape: a directory called `we\_ird` written bare
+  # links to `/src/we_ird/index.md`, which is not a path anything in this
+  # bundle answers to.
+  case "$target" in
+    *[[:space:][:cntrl:]\(\)\<\>]*)
+      # Inside `<...>` only `<` and `>` still need escaping on top of that; a
+      # space or a parenthesis is ordinary there, which is the reason for this
+      # form.
+      target="${target//</\\<}"
+      target="${target//>/\\>}"
+      target="<$target>"
+      ;;
+  esac
+
+  OKF_INDEX_LINK="[$text]($target)"
+}
+
+# The bundle-absolute path of a directory's own index.md — SPEC.md §4's
+# leading-slash form, which OKF recommends because it survives a file move.
+index_target() { # $1 = a directory
+  case "$1" in
+    .) printf '%s\n' "/index.md" ;;
+    *) printf '%s\n' "/$1/index.md" ;;
+  esac
+}
+
+# The two listing sections for one directory: the concepts it holds and the
+# subdirectories that have an index of their own. Printed, because this is
+# built once per directory rather than once per line.
+#
+# A section with nothing in it is left out entirely rather than printed empty.
+# A heading with no list under it reads as a listing that failed, and the fact
+# it would be conveying — this directory documents nothing yet — is already
+# what `okf list --missing` is for.
+#
+# Only directories that are in OKF_INDEX_DIRS are listed as subdirectories, so
+# every link written here has a file at the other end of it. A directory
+# holding sources and no concepts gets no index and so is not linked: there is
+# nothing to point at, and a link into a listing that does not exist is worse
+# than no link at all.
+index_sections() { # $1 = a directory
+  local dir="$1" concept child base
+  local -a concepts=() subdirs=()
+
+  for concept in ${OKF_INDEX_CONCEPTS[@]+"${OKF_INDEX_CONCEPTS[@]}"}; do
+    case "$concept" in
+      */*) [ "${concept%/*}" = "$dir" ] || continue ;;
+      *) [ "$dir" = "." ] || continue ;;
+    esac
+    concepts+=("$concept")
+  done
+
+  for child in ${OKF_INDEX_DIRS[@]+"${OKF_INDEX_DIRS[@]}"}; do
+    dir_parent "$child"
+    [ "$OKF_DIR_PARENT" = "$dir" ] || continue
+    subdirs+=("$child")
+  done
+
+  if [ "${#concepts[@]}" -gt 0 ]; then
+    printf '\n## Concepts\n\n'
+    for concept in "${concepts[@]}"; do
+      base="${concept##*/}"
+      # The text is SPEC.md §5's concept ID last component — the bundle-relative
+      # path minus `.md` — and the target is the file itself. The two are the
+      # same fact spelled for two readers: a person following the link, and a
+      # tool resolving it.
+      index_link "${base%.md}" "/$concept"
+      printf -- '- %s\n' "$OKF_INDEX_LINK"
+    done
+  fi
+
+  if [ "${#subdirs[@]}" -gt 0 ]; then
+    printf '\n## Subdirectories\n\n'
+    for child in "${subdirs[@]}"; do
+      index_link "${child##*/}" "$(index_target "$child")"
+      printf -- '- %s\n' "$OKF_INDEX_LINK"
+    done
+  fi
+}
+
+# A per-directory index.md, whole: SPEC.md §4's `type: Package`, and a body
+# that is the listing and nothing else.
+#
+# No `okf_version` anywhere in it, and not by omission — §4 makes the bundle
+# root the only file where that key is legal, so a Package index carrying one
+# would be a second answer to a question the bundle has one answer to. This
+# function is the only thing that writes a non-root index.md, which is what
+# makes that a property of the code rather than a rule someone has to remember.
+#
+# Written to §4's formatting contract for the reason every writer here is: the
+# shell reads frontmatter with awk, so `---` on line 1, a closing `---`,
+# top-level keys unindented, no tabs and no folded scalars.
+#
+# `status: draft` because nothing has reviewed it — SPEC.md §8's trust rules
+# are about `verified` entries, and a file okf regenerates on demand is never
+# going to carry one. There is no `generated:` stamp, for the reason
+# root_index_document has none: SPEC.md §3's tool list has no clock in it, and
+# a document with no timestamp is worth more than one with an unportable one.
+package_index_document() { # $1 = a directory
+  local dir="$1" name quoted
+
+  name="${dir##*/}"
+  yaml_quoted "$name"
+  quoted="$OKF_YAML_QUOTED"
+  local description
+  yaml_quoted "OKF package index for /$dir."
+  description="$OKF_YAML_QUOTED"
+
+  printf '%s\n' \
+    '---' \
+    'type: Package' \
+    "title: \"$quoted\"" \
+    "description: \"$description\"" \
+    'status: draft' \
+    '---' \
+    '' \
+    "# $name" \
+    '' \
+    "What the bundle documents under \`/$dir\`." \
+    '' \
+    'Regenerated in full by `okf index`, so anything written into this file by' \
+    'hand is overwritten on the next run.'
+
+  index_sections "$dir"
+}
+
+# Everything above OKF_INDEX_MARKER in an existing bundle-root index.md, with
+# its trailing blank lines removed, left in OKF_INDEX_HEAD. Returns 1 when
+# there is no such file to read, which is the caller's cue to author one.
+#
+# The whole file when it carries no marker: a root index.md that predates this
+# subcommand — the one `okf init` writes, or one somebody wrote themselves — is
+# all head, and its listing gets appended below it on this run and regenerated
+# in place on every run after.
+#
+# Read line by line rather than with `cat`, for the reason usage() prints with
+# printf: SPEC.md §3's preflight can only promise to name exactly what is
+# missing about the tools it knows to look for, and `cat` is not one of them.
+#
+# CRLF and a UTF-8 BOM are stripped from the *comparison* and not from the
+# line, which is the difference that matters: a root index.md written on
+# Windows keeps its line endings through a regeneration, and its marker is
+# still recognised as one.
+OKF_INDEX_HEAD=""
+index_head() { # $1 = a path
+  local path="$1" line probe
+  OKF_INDEX_HEAD=""
+
+  [ -f "$path" ] && [ -r "$path" ] || return 1
+
+  local -a lines=()
+  # `|| [ -n "$line" ]` so a last line with no newline after it is still read.
+  while IFS= read -r line || [ -n "$line" ]; do
+    probe="${line#$'\xef\xbb\xbf'}"
+    probe="${probe%$'\r'}"
+    [ "$probe" != "$OKF_INDEX_MARKER" ] || break
+    lines+=("$line")
+  done 2> /dev/null < "$path"
+
+  # Trailing blank lines dropped, because the marker is written back with
+  # exactly one blank line in front of it. Left in, each run would add another
+  # and the file would grow a line every time nothing at all had changed.
+  local count="${#lines[@]}"
+  while [ "$count" -gt 0 ]; do
+    probe="${lines[$((count - 1))]}"
+    probe="${probe%$'\r'}"
+    [ -z "$probe" ] || break
+    count=$((count - 1))
+  done
+
+  local at=0
+  for ((at = 0; at < count; at++)); do
+    OKF_INDEX_HEAD="$OKF_INDEX_HEAD${lines[at]}"$'\n'
+  done
+  # The final newline comes off so that what is left composes like every other
+  # `$(...)` in this script: a document is its lines, and the newline after the
+  # last of them belongs to whatever writes it out.
+  OKF_INDEX_HEAD="${OKF_INDEX_HEAD%$'\n'}"
+  return 0
+}
+
+# The bundle-root index.md, whole: the head above the marker exactly as it was
+# found, then the marker, then this run's listing.
+#
+# Authored from scratch only when there is no file to preserve, and then it is
+# `okf init`'s own document — the same function, so the two cannot come apart
+# and a bundle initialised by either route declares the same OKF version in the
+# same words.
+root_index_regenerated() { # $1 = the bundle's name, $2 = the okf_version to declare if authoring
+  if index_head "index.md"; then
+    printf '%s\n' "$OKF_INDEX_HEAD"
+  else
+    root_index_document "$1" "$2"
+  fi
+  printf '\n%s\n' "$OKF_INDEX_MARKER"
+  index_sections "."
+}
+
+# Whether a file already holds exactly the document about to be written to it.
+#
+# Asked so that a regeneration that changes nothing writes nothing: an `okf
+# index` run over an up-to-date bundle should leave the work tree as clean as
+# it found it, and rewriting identical bytes would put every index.md in the
+# repository into `git status` and into whatever watches the tree for changes.
+#
+# Compared line by line, which is a comparison of what the document says rather
+# than of its bytes: a file whose last line has no newline after it reads the
+# same here as one properly terminated, and is left alone. That is the right
+# answer — there is nothing to regenerate — and the wrong one costs a rewrite
+# nobody sees.
+index_unchanged() { # $1 = a path, $2 = the document
+  local path="$1" want="$2" line existing=""
+
+  [ -f "$path" ] && [ -r "$path" ] || return 1
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    existing="$existing$line"$'\n'
+  done 2> /dev/null < "$path"
+
+  [ "$existing" = "$want"$'\n' ]
+}
+
+# Writes one index.md, if it needs writing. Returns 0 when it wrote, 2 when the
+# file was already the document, and 1 when it refused or could not — having
+# said why.
+#
+# Refusals are per file rather than per run. A bundle with one unwritable
+# directory in it is a bundle whose other twenty indexes are still worth
+# regenerating, and the caller counts what was refused and comes back with
+# SPEC.md §7's 1 at the end.
+#
+# A symbolic link is refused whichever way it points, for the reason init_guard
+# refuses one: a redirection writes *through* the link, so a regeneration would
+# replace a file somewhere else entirely — outside the repository, if that is
+# where the link goes. Replacing the link instead would silently detach whoever
+# put it there on purpose, and neither is what "regenerate this directory's
+# index" asked for.
+index_write() { # $1 = a path, $2 = the document
+  local path="$1" content="$2"
+
+  if [ -L "$path" ]; then
+    warn "$path is a symbolic link, so it was left alone" \
+      "  okf index writes this directory's own index, not whatever the link points at"
+    return 1
+  fi
+  if [ -e "$path" ] && [ ! -f "$path" ]; then
+    warn "$path is not a regular file, so it was left alone"
+    return 1
+  fi
+
+  index_unchanged "$path" "$content" && return 2
+
+  # stderr silenced for the reason init_write silences it: what bash prints
+  # here names a line number inside bin/okf, and it arrives ahead of the line
+  # that actually says which file the caller has to do something about.
+  printf '%s\n' "$content" 2> /dev/null > "$path" || {
+    warn "cannot write $path"
+    return 1
+  }
+  return 0
+}
+
 # okf index — regenerate the per-directory index.md files
-cmd_index() { not_implemented index; }
+cmd_index() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      # The subcommand's own end-of-flags marker — parse_globals passes this
+      # one through — after which index still takes no operands, so whatever
+      # follows falls to the check below and is named there.
+      --)
+        shift
+        break
+        ;;
+      -*) die "index: unknown flag: $1" "usage: okf index" ;;
+      *) break ;;
+    esac
+    shift
+  done
+
+  # SPEC.md §7 gives index neither a flag nor an argument, and a mistyped one
+  # is answered rather than acted on: `okf index --frce` is not a run that
+  # quietly regenerated every index.md in the bundle.
+  [ $# -eq 0 ] || die "index takes no arguments, but was given: $1" \
+    "usage: okf index"
+
+  load_bundle_globs
+  load_concepts
+
+  OKF_INDEX_CONCEPTS=()
+  OKF_INDEX_DIRS=()
+  # The bundle root is indexed whatever the bundle holds, and is first in the
+  # list so that add_index_dir's walk always terminates on a directory that is
+  # already there. A bundle with no concepts in it still has a root, and a root
+  # index.md that stopped existing because the last concept was deleted would
+  # take the bundle's `okf_version` with it.
+  add_index_dir "."
+
+  # One pass over the index, in git's order — the order `okf list` and `okf
+  # check` report in, and so the order every listing here comes out in. Two
+  # things are picked out of it, and picking them out together is what keeps
+  # that one order: walked separately, a directory found only by the second
+  # walk would be appended after every directory found by the first, and a
+  # parent's `## Subdirectories` would reshuffle on the run where an unrelated
+  # concept happened to be deleted.
+  local ci=0 ccount="${#OKF_CONCEPTS[@]}" tracked dir is_concept
+  for tracked in ${OKF_TRACKED[@]+"${OKF_TRACKED[@]}"}; do
+    # load_concepts builds OKF_CONCEPTS by walking this same list and appending,
+    # so it is a subsequence of it in the same order and a cursor is enough to
+    # say whether this path is one — no search, and no second reading of every
+    # markdown file in the repository to find out. Advanced here, ahead of every
+    # reason this path might be passed over, because a cursor that stopped
+    # moving would stop recognising every concept after the one it stuck on.
+    is_concept=0
+    if [ "$ci" -lt "$ccount" ] && [ "${OKF_CONCEPTS[ci]}" = "$tracked" ]; then
+      ci=$((ci + 1))
+      is_concept=1
+    fi
+
+    # Whether this path is one the index would have anything to say about. A
+    # concept is listed; an index.md earns its directory a listing of its own,
+    # for the reasons below. Everything else in the repository — the sources
+    # themselves, okf.json, a README — is not indexed and is passed over here
+    # rather than half-considered below. SPEC.md §4's reserved names keep an
+    # index.md out of OKF_CONCEPTS, so the two cases cannot both hold.
+    if [ "$is_concept" -eq 0 ]; then
+      case "$tracked" in
+        index.md | */index.md) ;;
+        *) continue ;;
+      esac
+    fi
+
+    # A path with a line ending in it cannot be written into either half of this
+    # listing: markdown has no spelling for a link destination that spans two
+    # lines, in the bare form or in `<...>`, and a `- [name](target)` broken
+    # across two is not a link at all. Left out, and said out loud, rather than
+    # written as something that looks like a link and is not — an index whose
+    # links resolve is the whole of what this subcommand is for.
+    #
+    # Warned about and not counted as a refusal, which is the line `okf check`
+    # draws for a source it cannot hash: this is a fact about one path, not okf
+    # failing to do what it was asked with the bundle.
+    #
+    # Line endings alone. A tab is awkward and perfectly spellable — index_link
+    # puts the destination in `<...>` and yaml_quoted writes `\x09` — so
+    # refusing one would drop a documented directory out of the bundle for
+    # nothing.
+    case "$tracked" in
+      *[$'\n'$'\r']*)
+        warn "a path with a line ending in it cannot be written as a markdown link, so it is left out of the index:" \
+          "  $tracked"
+        continue
+        ;;
+    esac
+
+    # `exclude` is applied and `include` is not, and the asymmetry is
+    # deliberate. SPEC.md §6's `include` says which *sources* are in scope to be
+    # documented — under the defaults, `src/**` and `lib/**` — while SPEC.md §4
+    # puts the higher-order concepts under `docs/`, which no default `include`
+    # reaches. Filtered by `include`, a bundle's Playbooks and Architecture
+    # Decisions would be linked from nowhere at all. `exclude` is the other
+    # thing: it names trees that are not part of the bundle in any direction —
+    # `node_modules`, `vendor`, a build output — and a concept found in one of
+    # those is not this bundle's to list.
+    if matches_any "$tracked" ${OKF_EXCLUDE_RES[@]+"${OKF_EXCLUDE_RES[@]}"}; then
+      continue
+    fi
+
+    if [ "$is_concept" -eq 1 ]; then
+      OKF_INDEX_CONCEPTS+=("$tracked")
+      case "$tracked" in
+        */*) dir="${tracked%/*}" ;;
+        *) dir="." ;;
+      esac
+      add_index_dir "$dir"
+      continue
+    fi
+
+    # An index.md earns its directory a place in the walk whether or not that
+    # directory still holds a concept, and this is what makes a deletion
+    # regenerate rather than rot. A directory whose last concept is removed
+    # drops out of the concept half above, and left there its index.md would
+    # keep a link to the file that just went — a dangling link, in the one
+    # document whose whole purpose is that its links resolve — while no longer
+    # being linked from its own parent, because the parent stopped listing a
+    # directory that had nothing to list. Adopted here, it is regenerated into
+    # an index with nothing in it, its ancestors keep pointing at it, and the
+    # day somebody deletes the file it stays deleted.
+    #
+    # From the index rather than from the filesystem, so this reads the bundle
+    # the same way everything else in okf does — and so an index.md okf itself
+    # wrote a moment ago and nobody has committed does not make its directory
+    # permanent.
+    #
+    # Gone from the working tree is nothing to regenerate and nothing to link:
+    # `git ls-files` answers from the index, which still holds a file deleted
+    # and not yet staged as removed.
+    [ -f "$tracked" ] || continue
+    case "$tracked" in
+      index.md) dir="." ;;
+      *) dir="${tracked%/index.md}" ;;
+    esac
+    add_index_dir "$dir"
+  done
+
+  # Only wanted when there is no bundle-root index.md to preserve, and read out
+  # of the settings for the same reason `okf init` reads it out of the defaults:
+  # SPEC.md §6 settles the version in okf.json and §4 makes the root index.md
+  # the only other file allowed to name one, so the two had better be the same
+  # number. A root index.md that is already there declares whatever it declares
+  # and this run does not look — that value is the bundle's own, and copying the
+  # head through untouched is what leaves it intact.
+  local version=""
+  version="$(printf '%s\n' "$OKF_SETTINGS" | jq -r '.okf_version // empty')" || version=""
+
+  local name="${OKF_ROOT##*/}"
+  [ -n "$name" ] || name="$OKF_ROOT"
+
+  local refused=0 rc path content remedy
+  for dir in "${OKF_INDEX_DIRS[@]}"; do
+    if [ "$dir" = "." ]; then
+      path="index.md"
+      remedy="  write the bundle root with: okf init --force"
+    else
+      path="$dir/index.md"
+      remedy="  move it aside and re-run, and okf index will write this directory's listing there"
+    fi
+
+    # A file under one of SPEC.md §4's reserved names that is not an OKF
+    # document — an empty file, a block that opens and is never closed,
+    # somebody's own landing page — is one okf index will not write over.
+    #
+    # Refused rather than replaced because there is no way back from the
+    # replacement and no flag to ask for it: SPEC.md §7 gives index neither a
+    # --force nor anything else, and a run that silently overwrote a page
+    # somebody wrote would be discovered by them and not by okf. Refused rather
+    # than preserved, too, at least at the root: appending a listing to it
+    # would leave the bundle rooted in a document with no `type: Codebase` and
+    # no `okf_version`, which is SPEC.md §4's bundle root in name only.
+    #
+    # Said out loud, counted, and then the rest of the bundle is regenerated
+    # regardless — one document okf may not write is no reason to leave twenty
+    # directories without a listing.
+    #
+    # `-L` first, so a symlinked index is diagnosed as the link it is by
+    # index_write rather than answered for by whatever it points at.
+    if [ ! -L "$path" ] && [ -f "$path" ] && ! has_frontmatter "$path"; then
+      warn "$path carries no OKF frontmatter, so it was left alone" \
+        "  SPEC.md §4 reserves index.md for the bundle's own document, and this file is not one" \
+        "$remedy"
+      refused=$((refused + 1))
+      continue
+    fi
+
+    if [ "$dir" = "." ]; then
+      if [ ! -f "$path" ] && [ -z "$version" ]; then
+        # Authoring the root document needs a version and there is none to be
+        # had: `okf.json` names none and there is no index.md to take one from.
+        # Said once and skipped, rather than written with an empty value — SPEC
+        # §4's one legal `okf_version` spelled as nothing at all is worse than
+        # the file not being there, because the second is visibly unfinished.
+        warn "no okf_version to declare, so the bundle-root index.md was not written" \
+          "  add one to $(display_path "$OKF_CONFIG"), or run okf init"
+        refused=$((refused + 1))
+        continue
+      fi
+      content="$(root_index_regenerated "$name" "$version")"
+    else
+      content="$(package_index_document "$dir")"
+    fi
+
+    rc=0
+    index_write "$path" "$content" || rc=$?
+    case "$rc" in
+      # Reported as it happens and one line per file, which is the convention
+      # `okf init` prints in. Nothing is printed for a file that was already
+      # the document it would have been written: an `okf index` over an
+      # up-to-date bundle prints nothing at all, for the reason a clean `okf
+      # check` does — something to read has to mean something to do.
+      0) printf 'wrote %s\n' "$path" ;;
+      2) ;;
+      *) refused=$((refused + 1)) ;;
+    esac
+  done
+
+  # SPEC.md §7's 1: okf was asked to regenerate the bundle's indexes and some
+  # of them are not regenerated. Silence and a 0 would leave a hook, or the
+  # caller who typed it, believing a listing had been written that is not
+  # there. Every refusal has already said which file and why.
+  [ "$refused" -eq 0 ] || return 1
+  return 0
+}
 
 # okf verify <concept> [--by ACTOR] — append a verified entry
 cmd_verify() { not_implemented verify; }
