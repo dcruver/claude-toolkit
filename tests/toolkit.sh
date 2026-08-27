@@ -3861,6 +3861,395 @@ test_okf_hash_needs_no_repository() {
   return 0
 }
 
+# SPEC.md §5's fan-in: "a whole-word ripgrep count across in-scope files, minus
+# the declaration site". Every expected number below is written out as a
+# constant over committed fixture bytes, for the reason the digest probe gives
+# — a test that recomputed it with its own ripgrep call would agree with okf
+# about anything, including being wrong the same way.
+_okf_fanin_count_probe() {
+  # tests/fixtures/scoped's in-scope sources are lib/conventions.py,
+  # lib/core.py, src/app.ts, src/generated/Handwritten.java,
+  # src/util/Accessors.java and src/util/helper.ts — the listing
+  # _okf_list_scope_probe pins down. Every count here is over those six files.
+
+  # `helper` is named four times across them: three in src/app.ts — twice on the
+  # import line, once in the call — and once in src/util/helper.ts's own
+  # `export function helper`. The fourth is the declaration site, and SPEC.md §5
+  # takes it out, so the answer is 3 and not 4.
+  #
+  # _okf_assert_listing is "okf exits 0 and its stdout is exactly this", which is
+  # the check a bare count wants as much as a listing does; only its name is
+  # about `okf list`. Exactly, and not a substring: `3` and `13` share one, and a
+  # fan-in read by a tier rule is a number, not a line to be searched.
+  _okf_assert_listing "3" \
+    "okf fanin counts a known name across the in-scope sources" \
+    fanin helper
+
+  # The zero SPEC.md §5's tier rules have to be able to read: a name nothing
+  # refers to is 0 on stdout and exit 0, not an empty line and not a refusal.
+  # ripgrep exits 1 when it matches nothing, so this is also the check that okf
+  # is not passing that status on as its own.
+  _okf_assert_listing "0" \
+    "a name nothing refers to counts zero, and is not an error" \
+    fanin NoSuchTypeAnywhere
+
+  # Whole words, which is the part of §5's definition that keeps a fan-in from
+  # being a substring count. `Generated` is named five times in the in-scope
+  # files — twice in src/util/Accessors.java, three times in
+  # src/generated/Handwritten.java — and Handwritten.java also carries
+  # `@NotGenerated("hand-written")`, which ends with the letters and is not the
+  # word. A count of 6 here is a --word-regexp that got dropped.
+  _okf_assert_listing "5" \
+    "a name is counted as a whole word, so @NotGenerated is not a Generated" \
+    fanin Generated
+
+  # And case-sensitively. The same six files name `generated` in lower case
+  # seven times — three in Handwritten.java's prose, four in
+  # lib/conventions.py's — so a smart-case or case-insensitive count would
+  # answer 12 for either spelling and make two different names one number.
+  _okf_assert_listing "7" \
+    "and case-sensitively, so generated and Generated are counted apart" \
+    fanin generated
+  return 0
+}
+
+# Matches and not matching lines, and the declaration-site rule seen moving.
+# Written into the fixture copy rather than counted over the committed tree,
+# because what these pin down is a shape no fixture file happens to have: two
+# references on one line, and one file that is the declaration site for one name
+# and an ordinary reference for another.
+_okf_fanin_granularity_probe() {
+  # Two references on one line, and nothing else on it. `rg --count` would
+  # report the line and answer 1; `rg --count-matches` reports the references
+  # and answers 2. That is the whole difference, and it is the one flag here
+  # easy to reach for by mistake.
+  printf 'export const pair: [Widget, Widget] = [makeWidget(), makeWidget()];\n' \
+    > src/pair.ts
+  _okf_stage src/pair.ts || return 1
+
+  _okf_assert_listing "2" \
+    "two references on one line count twice, so a fan-in is matches and not lines" \
+    fanin Widget
+
+  # The declaration site, added second so the number before and after it says
+  # what the rule did. src/Widget.ts names `Widget` three times and `makeWidget`
+  # once; SPEC.md §5 co-locates a concept beside its source as `<stem>.md`, so
+  # `Widget.ts` is where a type called `Widget` is declared and its own mentions
+  # of itself are not fan-in.
+  printf 'export class Widget {}\nexport function makeWidget(): Widget { return new Widget(); }\n' \
+    > src/Widget.ts
+  _okf_stage src/Widget.ts || return 1
+
+  _okf_assert_listing "2" \
+    "a name's own declaration site is left out, so adding it moves nothing" \
+    fanin Widget
+
+  # The same file, asked about the other name it declares. `makeWidget` is not
+  # `Widget`, so src/Widget.ts is an ordinary in-scope file for this count and
+  # its one mention is counted — two in src/pair.ts and one here. This is the
+  # limit of what co-location can decide, stated as a number: only the type the
+  # file is named after gets its declaration taken out.
+  _okf_assert_listing "3" \
+    "a second type declared in that file keeps its own declaration in the count" \
+    fanin makeWidget
+
+  # A second file bearing the same stem, which is where "the declaration site"
+  # stops being a thing co-location can point at. lib/Widget.ts declares no
+  # `Widget` at all — it imports one and names a variable — but nothing okf can
+  # see tells it apart from src/Widget.ts, so neither is taken out and the
+  # count is 8: two in src/pair.ts, three in src/Widget.ts, three here.
+  #
+  # 5 would be this probe's own second file thrown away, and 2 would be both of
+  # them. Either is a name counted *low* for having callers in like-named files
+  # — the failure worth avoiding, since SPEC.md §5's tier rules read fan-in
+  # against a threshold and a hot type counted low is one nobody documents.
+  printf 'import { Widget } from "../src/Widget";\nexport const spare = new Widget();\n' \
+    > lib/Widget.ts
+  _okf_stage lib/Widget.ts || return 1
+
+  _okf_assert_listing "8" \
+    "two files could be the declaration site, so neither is taken out" \
+    fanin Widget
+
+  # And the ambiguity is over the stem alone: `makeWidget` still has exactly one
+  # candidate file — none — so its count is unchanged by lib/Widget.ts, which
+  # never names it.
+  _okf_assert_listing "3" \
+    "and a name with no candidate file at all is unaffected by the ambiguity" \
+    fanin makeWidget
+
+  rm -f src/pair.ts src/Widget.ts lib/Widget.ts
+  git rm -q --cached src/pair.ts src/Widget.ts lib/Widget.ts > /dev/null 2>&1
+
+  # The declaration site is found by name and by case, and lib/core.py is where
+  # that shows: it declares `Core`, but §5's `<stem>.md` co-location has nothing
+  # to match `core` against `Core` with, so the declaration stays in the count
+  # and the answer is 1 rather than 0. Asserted rather than left implicit —
+  # SPEC.md §5 makes fan-in a ranking signal and not a correctness claim, and
+  # this is one of the places the difference is visible.
+  _okf_assert_listing "1" \
+    "a file whose stem differs in case from the type is not spotted as its declaration" \
+    fanin Core
+
+  # The other side of the same rule: src/util/Accessors.java is named after the
+  # only type that mentions `Accessors`, so taking it out leaves nothing at all.
+  _okf_assert_listing "0" \
+    "and a name mentioned only where it is declared counts zero" \
+    fanin Accessors
+  return 0
+}
+
+# The one case where SPEC.md §5's co-location reads a fan-in *low*: a single
+# in-scope file bears the name as its stem and is not the file that declares it.
+# Pinned as a number rather than left to be discovered, because it is the shape
+# of wrongness a caller acting on `fan_in` has to be able to recognise — and
+# because an okf that quietly started counting these would be changing what §5
+# defines without anything saying so.
+_okf_fanin_misread_declaration_probe() {
+  # `Gauge` is declared in src/index.ts, which names it twice, and referenced
+  # three times from src/probes/Gauge.ts, which declares nothing at all. Five
+  # references are there; the stem match takes src/probes/Gauge.ts out whole,
+  # and 2 comes back.
+  printf 'export class Gauge {}\nexport const first = new Gauge();\n' > src/index.ts
+  mkdir -p src/probes
+  printf 'import { Gauge } from "../index";\nexport const g = new Gauge();\nexport const h = new Gauge();\n' \
+    > src/probes/Gauge.ts
+  _okf_stage src/index.ts src/probes/Gauge.ts || return 1
+
+  _okf_assert_listing "2" \
+    "a lone stem match is taken for the declaration site even when it is not one" \
+    fanin Gauge
+
+  # Renaming that file — the same three references, in a file no longer named
+  # after them — is what the missing 3 were, and 5 is the count with nothing
+  # excluded. Asserted so the 2 above reads as an exclusion rather than as three
+  # references okf failed to find.
+  git mv -f src/probes/Gauge.ts src/probes/gauges.ts > /dev/null 2>&1 \
+    || { _fail "the fixture copy accepts a git mv" "git mv src/probes/Gauge.ts failed"; return 1; }
+  _okf_assert_listing "5" \
+    "and the same references count in full once the file is not named after them" \
+    fanin Gauge
+  return 0
+}
+
+# One ripgrep per OKF_FANIN_BATCH paths, summed across batches. Nothing in
+# tests/fixtures/ is big enough to reach a second batch, so the tree is built
+# here: without it, a total reset or dropped per batch would leave every
+# repository over 400 in-scope files reporting one batch's count, and the suite
+# would still say PASS.
+_okf_fanin_batching_probe() {
+  # One over the batch size, so the second batch holds exactly one file. 401 is
+  # then the only right answer: 1 is a total reset per batch, 400 is a last
+  # batch never counted, and 800 is a batch counted twice.
+  local batch i
+  batch="$(sed -n 's/^OKF_FANIN_BATCH=\([0-9][0-9]*\)$/\1/p' "$TOOLKIT_ROOT/bin/okf")"
+  if [ -z "$batch" ]; then
+    _fail "bin/okf declares OKF_FANIN_BATCH" "no OKF_FANIN_BATCH=<number> line in bin/okf"
+    return 1
+  fi
+
+  mkdir -p src/bulk
+  i=0
+  while [ "$i" -le "$batch" ]; do
+    # Named so no stem is `Bulkref`: a file the declaration-site rule took out
+    # would make this off by one for a reason that has nothing to do with
+    # batching.
+    printf 'export const u%s = new Bulkref();\n' "$i" > "src/bulk/ref$i.ts"
+    i=$((i + 1))
+  done
+  _okf_stage src/bulk || return 1
+
+  _okf_assert_listing "$((batch + 1))" \
+    "a reference in every file of a tree larger than one batch is counted once" \
+    fanin Bulkref
+  return 0
+}
+
+# The "across in-scope files" half of SPEC.md §5's definition: the same scope
+# `okf list` prints, so every exclusion that keeps a file out of the listing
+# keeps its references out of the count. Each rule is asked about a word that
+# appears only in the file that rule excludes, so a failure names which
+# exclusion stopped working.
+_okf_fanin_scope_probe() {
+  # `pong` is returned by src/generated/Api.java and by src/generated/ping.go,
+  # and by nothing in scope. Neither file's stem is `pong`, so a count of 2 here
+  # would be the @Generated exclusion gone rather than the declaration-site rule
+  # doing the work.
+  _okf_assert_listing "0" \
+    "a word only generated sources use is not counted" \
+    fanin pong
+
+  # src/target/Stale.java, excluded by the `**/target/**` glob. Its stem is
+  # `Stale`, so the word asked about is the package it declares instead.
+  _okf_assert_listing "0" \
+    "nor one only a build-output directory uses" \
+    fanin target
+
+  # lib/vendor/pinned.py and lib/node_modules/left-pad/index.js, excluded by
+  # `**/vendor/**` and `**/node_modules/**`. `leftPad` is named in index.js,
+  # whose stem is `index`, and `vendored` in pinned.py, whose stem is `pinned`.
+  _okf_assert_listing "0" "nor one only a vendored file uses" fanin vendored
+  _okf_assert_listing "0" "nor one only node_modules uses" fanin leftPad
+
+  # tools/build.js, outside the `include` globs. Its stem is `build`, so the
+  # word is one from the line it prints.
+  _okf_assert_listing "0" \
+    "nor one only a file outside the include globs uses" \
+    fanin tooling
+
+  # src/ignored/secret.ts, gitignored and so absent from `git ls-files`. Checked
+  # to be on disk first: the file is committed in the toolkit's own repository
+  # with `git add -f`, and without it every count below would be 0 for want of
+  # anything to exclude.
+  if [ -f src/ignored/secret.ts ]; then
+    _pass "the gitignored fixture source reached the fixture copy"
+  else
+    _fail "the gitignored fixture source reached the fixture copy" \
+      "no src/ignored/secret.ts under $PWD — it needs a git add -f in the toolkit repo"
+  fi
+  _okf_assert_listing "0" "nor one only a gitignored file uses" fanin gitignored
+
+  # src/notes.md and src/data.json, which are not listed extensions. So is
+  # src/util/helper.md, a concept file — its own prose must not count as fan-in
+  # for the type it documents, or every documented type would out-rank an
+  # undocumented one for having been documented.
+  _okf_assert_listing "0" "nor one only a non-source extension uses" fanin sample
+  _okf_assert_listing "0" "nor one only a concept file uses" fanin Prints
+  return 0
+}
+
+_okf_fanin_refusal_probe() {
+  local okf="$TOOLKIT_ROOT/bin/okf"
+
+  assert_exit 1 "$okf" fanin
+  assert_contains "$(last_output)" "usage: okf fanin" \
+    "okf fanin with no name says what it takes"
+
+  # The second name is in the refusal, because the alternative okf must not
+  # choose is counting the first and saying nothing about the second — a fan_in
+  # that is right for a type the caller did not ask about.
+  assert_exit 1 "$okf" fanin Widget Gadget
+  assert_contains "$(last_output)" "Gadget" \
+    "okf fanin refuses a second name rather than silently dropping it"
+
+  assert_exit 1 "$okf" fanin --bogus
+  assert_contains "$(last_output)" "unknown flag: --bogus" \
+    "okf fanin names a flag it does not know"
+
+  # ripgrep reads the empty pattern as a match at every position, so an okf that
+  # passed this through would answer with roughly the size of the repository —
+  # wrong, and wrong in the direction that promotes a concept to Tier 2.
+  assert_exit 1 "$okf" fanin ""
+  assert_contains "$(last_output)" "empty" \
+    "an empty name is refused rather than counted as every position in the repo"
+
+  # A newline is the one ripgrep itself rejects, outside multiline mode. Refused
+  # here so the caller is told their name is malformed rather than that the scan
+  # failed.
+  assert_exit 1 "$okf" fanin "$(printf 'Route\nRegistry')"
+  assert_contains "$(last_output)" "whitespace" \
+    "and so is a name with a newline in it, before ripgrep is asked"
+
+  assert_exit 1 "$okf" fanin "Route Registry"
+  assert_contains "$(last_output)" "whitespace" \
+    "and one with a space, which is a quoting slip and not a word to count"
+
+  # -- is the escape hatch for a name beginning with a dash. No type is called
+  # this, but without it there would be a name okf could not be asked about at
+  # all — and what comes back has to be a count, not the flag refusal.
+  _okf_assert_listing "0" "-- ends the flags, so a dash-led name is counted" \
+    fanin -- -Weird
+  return 0
+}
+
+# The PLAN.md item itself: a whole-word ripgrep count over the in-scope files,
+# asserted against known numbers, with an unreferenced name coming back as 0.
+test_okf_fanin_counts_whole_word_references() {
+  _okf_preconditions || return 1
+  with_fixture_repo scoped _okf_fanin_count_probe
+}
+
+# SPEC.md §5's "minus the declaration site", and the matches-not-lines reading
+# of "count" that the same sentence settles.
+test_okf_fanin_excludes_the_declaration_site() {
+  _okf_preconditions || return 1
+  with_fixture_repo scoped _okf_fanin_granularity_probe
+}
+
+# "Across in-scope files": the same scope `okf list` prints, exclusion by
+# exclusion.
+test_okf_fanin_counts_only_in_scope_files() {
+  _okf_preconditions || return 1
+  with_fixture_repo scoped _okf_fanin_scope_probe
+}
+
+# The failure direction SPEC.md §5's co-location cannot avoid, pinned as a
+# number so it is a documented limit rather than a surprise in somebody's tier
+# rule.
+test_okf_fanin_can_mistake_a_like_named_file_for_the_declaration() {
+  _okf_preconditions || return 1
+  with_fixture_repo scoped _okf_fanin_misread_declaration_probe
+}
+
+# The count is summed across ripgrep invocations, and no fixture is big enough
+# to need a second one.
+test_okf_fanin_sums_across_ripgrep_batches() {
+  _okf_preconditions || return 1
+  with_fixture_repo scoped _okf_fanin_batching_probe
+}
+
+test_okf_fanin_refuses_what_it_cannot_count() {
+  _okf_preconditions || return 1
+  with_fixture_repo scoped _okf_fanin_refusal_probe
+}
+
+# SPEC.md §7's -C, asked of the subcommand whose answer is a bare number: the
+# count is over the bundle -C names and not over the directory okf was invoked
+# from. Run from the toolkit checkout, whose own sources mention none of this —
+# so a -C that had been ignored would answer 0 rather than fail, and a check
+# that only asserted "not an error" would pass.
+_okf_fanin_root_probe() {
+  local okf="$TOOLKIT_ROOT/bin/okf" outside
+  outside="$(CDPATH= cd "$TOOLKIT_ROOT" && "$okf" -C "$FIXTURE_DIR" fanin helper 2>&1)"
+  assert_eq "3" "$outside" "-C names the bundle okf fanin counts across"
+  return 0
+}
+
+test_okf_fanin_counts_across_the_root_given_by_C() {
+  _okf_preconditions || return 1
+  with_fixture_repo scoped _okf_fanin_root_probe
+}
+
+# Scope is read out of git, so a bundle root outside a work tree is a count okf
+# cannot make — and says so rather than printing 0 and exiting 0, which is the
+# answer a tier rule would act on.
+test_okf_fanin_needs_a_git_work_tree() {
+  _okf_preconditions || return 1
+
+  local tmp
+  if ! tmp="$(mktemp -d "${TMPDIR:-/tmp}/toolkit-bare.XXXXXX")"; then
+    _fail "a directory outside any git repo can be made" "mktemp -d failed"
+    return 1
+  fi
+  printf '%s\n' "$tmp" >> "$HARNESS_STATE/fixture_dirs"
+
+  # The same skip `okf list`'s work-tree check takes, and for the same reason: a
+  # TMPDIR that is itself inside somebody's dotfiles repo would fail this for a
+  # reason that has nothing to do with okf.
+  if (CDPATH= cd "$tmp" && git rev-parse --is-inside-work-tree > /dev/null 2>&1); then
+    _skip "okf fanin says why it cannot count outside a work tree" \
+      "TMPDIR is itself inside a git work tree"
+    rm -rf "$tmp"
+    return 0
+  fi
+
+  assert_exit 1 "$TOOLKIT_ROOT/bin/okf" -C "$tmp" fanin Widget
+  assert_contains "$(last_output)" "work tree" \
+    "okf fanin says why it cannot count in a directory that is not in a work tree"
+  rm -rf "$tmp"
+  return 0
+}
+
 # --- add new test_* functions above this line ------------------------------
 
 # ---------------------------------------------------------------------------

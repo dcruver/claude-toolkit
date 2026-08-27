@@ -2161,7 +2161,253 @@ cmd_hash() {
 }
 
 # okf fanin <Name> — whole-word reference count across in-scope files
-cmd_fanin() { not_implemented fanin; }
+#
+# SPEC.md §5's fan-in, and its caveat is part of the definition rather than a
+# footnote on it: this is a ripgrep count of a *name*, so it counts the word in
+# a comment, in a string literal and in an unrelated type that happens to share
+# the name, and it misses every reference written through an alias or an import
+# rename. §5 settles what that makes it — "a ranking signal for where
+# documentation effort goes, never a correctness claim" — and settles the one
+# repair anybody would reach for: a parser resolves references by name too, so
+# adding one buys the same number with a compiler in front of it. Do not.
+#
+# What it is good for is the comparison. A name at 40 and a name at 1 differ by
+# more than any of the above can explain, and SPEC.md §5's tier rules ask
+# exactly that kind of question — `fan_in >= tier2_min_fan_in`, `exported with
+# fan_in >= 4`. Between two names a few apart, the number is not evidence.
+#
+# Matches and not matching lines: two references on one line are two references,
+# and a `Map<RouteKey, RouteKey>` counting once would make a line's layout part
+# of the answer. `rg --count-matches` is the flag for it; plain `--count` is the
+# line count and is the one thing here easy to reach for by mistake.
+#
+# One name per invocation, and so one `git ls-files` and one @Generated scan per
+# name — which is what a caller asking about every type in the repo pays twice
+# over. That is SPEC.md §7's surface and §7 is read-only, so it is not something
+# to route around here: the fix is not a cache under `.okf/`, whose invalidation
+# would be a second drift rule to get wrong, but a caller that asks once per
+# type and reads the numbers it gets back. Said here so the cost is a known one.
+
+# How many paths go to ripgrep at once, for the same reason as the generated
+# scan's own batch: the argument list stays well inside any ARG_MAX, and a
+# repository of ordinary size is still one invocation. Its own constant rather
+# than a shared one, because the two scans are bounded by different things —
+# that one by the per-batch membership test it does afterwards, this one by
+# nothing but the argument list.
+OKF_FANIN_BATCH=400
+
+# Running total for count_batch_references, which cannot hand a number back
+# through a command substitution: `die` inside one exits the subshell, and the
+# caller reads a failed scan as an empty count and adds nothing to it.
+OKF_FANIN_TOTAL=0
+
+# Adds one batch's whole-word match count to OKF_FANIN_TOTAL.
+count_batch_references() { # $1 = the name, $2.. = one batch of in-scope paths
+  local name="$1"
+  shift
+
+  local -a records=()
+  local record
+  while IFS= read -r record; do
+    records+=("$record")
+  done < <(
+    # ripgrep's status carried out in the stream, as the generated scan carries
+    # its own: a process substitution's exit status is invisible to the shell
+    # reading it, and a ripgrep that failed outright prints no counts at all —
+    # which is indistinguishable from a batch nothing matched, and would report
+    # a fan-in of 0 for a name referenced everywhere. `set +e` so the inherited
+    # errexit does not act on the 1 that means "matched nothing", which is the
+    # ordinary answer for most names in most batches.
+    #
+    # --no-filename is what makes this stream safe to read as lines: every
+    # record is then a bare count, so no path — with a newline, a colon or a
+    # backslash in it — is ever parsed back out of ripgrep's output.
+    #
+    # --case-sensitive and --fixed-strings are both spelled out. ripgrep already
+    # defaults to the first, but the default is smart-case in some builds'
+    # configuration files, and `RouteKey` matching `routekey` would silently
+    # inflate every count; the second is what keeps a name from being read as a
+    # pattern, so a `.` in a qualified name matches a dot and not any character.
+    # --no-config turns off the file that could have changed either.
+    #
+    # --text because a source file with a stray NUL in it is still a file whose
+    # references count, and binary detection would drop it from the total with
+    # nothing said on stdout to show a file had been skipped.
+    set +e
+    rg --no-config --no-ignore --case-sensitive --fixed-strings --word-regexp \
+      --text --count-matches --no-filename -e "$name" -- "$@"
+    printf 'status:%s\n' "$?"
+  )
+
+  local count="${#records[@]}"
+  [ "$count" -gt 0 ] \
+    || die "the fan-in scan wrote nothing at all, not even its exit status"
+  local status="${records[$((count - 1))]}"
+  unset "records[$((count - 1))]"
+  case "$status" in
+    # Matched, or matched nothing. Anything else is a scan that did not happen,
+    # and a scan that did not happen looks exactly like a name nobody
+    # references — so it is said rather than added up. ripgrep's own message,
+    # naming the file it could not read, has already gone to stderr.
+    status:0 | status:1) ;;
+    *)
+      die "ripgrep could not count references to $name — see its message above" \
+        "okf will not print a fan-in it could not finish counting"
+      ;;
+  esac
+
+  for record in ${records[@]+"${records[@]}"}; do
+    # Every record should be a bare count, so one that is not means ripgrep
+    # printed something into this stream that --no-filename was supposed to keep
+    # out. Adding it as 0 would leave a total that is quietly short.
+    case "$record" in
+      "" | *[!0-9]*)
+        die "ripgrep printed something other than a count while counting $name: $record"
+        ;;
+    esac
+    OKF_FANIN_TOTAL=$((OKF_FANIN_TOTAL + record))
+  done
+}
+
+cmd_fanin() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --)
+        # End of flags, as for `okf hash`. Past it a word beginning with a dash
+        # is the name — which no type is called, but the escape hatch costs a
+        # line and its absence would be a name okf could not be asked about.
+        shift
+        break
+        ;;
+      -*)
+        die "fanin: unknown flag: $1" \
+            "put it after --, if that really is the name" \
+            "usage: okf fanin <Name>"
+        ;;
+      *) break ;;
+    esac
+    shift
+  done
+
+  [ $# -gt 0 ] || die "fanin needs a name to count references to" \
+    "usage: okf fanin <Name>"
+
+  # One name and not a list, for the reason `okf hash` takes one file: the
+  # output is a bare number with nothing in it naming what it counted, so a
+  # second name could only come back as a second unlabelled line to be matched
+  # up by position — or be dropped in silence, leaving the caller storing the
+  # first name's fan-in on the second name's concept.
+  [ $# -eq 1 ] || die "fanin takes one name, but was given $#: $*" \
+    "usage: okf fanin <Name>"
+
+  local name="$1"
+
+  # An empty name is refused rather than counted. ripgrep reads the empty
+  # pattern as a match at every position, so this would come back as a number
+  # roughly the size of the repository — a fan-in that is not merely wrong but
+  # wrong in the direction that promotes a concept to Tier 2.
+  #
+  # Whitespace goes with it, and a newline is the reason: ripgrep refuses a
+  # literal newline outside multiline mode, so `okf fanin` would report a failed
+  # scan for what is really a malformed name. The rest of the whitespace is
+  # refused alongside it because it is the same mistake — a shell quoting slip,
+  # or a `<Name>` pasted with its surroundings — and because `-w` around a space
+  # counts word boundaries rather than references.
+  case "$name" in
+    "") die "fanin needs a name to count references to, and was given an empty one" \
+          "usage: okf fanin <Name>" ;;
+    *[[:space:]]*)
+      die "fanin takes one name, and this one has whitespace in it: $name" \
+          "a fan-in count is over a single whole word — check the quoting" \
+          "usage: okf fanin <Name>"
+      ;;
+  esac
+
+  load_in_scope
+
+  # SPEC.md §5's "minus the declaration site", decided by co-location because
+  # that is the only thing the shell has to decide it with: §5 puts a concept
+  # beside its source as `<stem>.md`, so a type named `RouteRegistry` is
+  # declared in a `RouteRegistry.<ext>` and its own file's mentions of itself —
+  # the declaration, the constructors, its own javadoc — are not fan-in.
+  #
+  # The whole file goes rather than one line of it. What "the declaration site"
+  # names is the place the type is defined, and subtracting a single occurrence
+  # would leave a Java class's constructors counting as references to
+  # themselves, so a big self-contained type would out-rank a small
+  # widely-used one.
+  #
+  # One file, or none. Two in-scope files can bear the name as their stem —
+  # `src/a/config.ts` and `src/b/config.ts`, `com/a/Result.java` and
+  # `com/b/Result.java` — and then nothing here can say which of them declares
+  # the name being counted, or whether either does. Dropping both would throw
+  # away every reference they make as well as any declaration they hold, and a
+  # widely-used name would come back under SPEC.md §5's `tier2_min_fan_in` for
+  # having callers in like-named files. So an ambiguous stem excludes nothing
+  # and the declarations stay in the count.
+  #
+  # Where it is still wrong, and in which direction, since neither is a thing to
+  # find out from a number that comes back looking the same either way.
+  #
+  # High, when the file okf cannot spot as a declaration site keeps its own
+  # declaration in: a language that does not name the file after the type —
+  # `Core` in `core.py` — a second top-level type sharing a file, and the
+  # ambiguous stem above. Each of those adds a handful to a name that is
+  # under-referenced anyway.
+  #
+  # Low, in the one case a single stem match is not the declaration: `Widget`
+  # declared in `src/index.ts` and referenced from `src/tests/Widget.ts` loses
+  # that file's references. Nothing short of reading the source tells that file
+  # from the declaring one — which is why SPEC.md §5 calls fan-in "a ranking
+  # signal for where documentation effort goes, never a correctness claim", and
+  # rules out the parser that would look like the fix. It is left as §5 defines
+  # it, and named here so that a fan_in that reads low against
+  # `tier2_min_fan_in` has somewhere to be explained rather than trusted.
+  #
+  # Between the two, ties break high: that is what the ambiguous-stem rule above
+  # buys, and it is the cheap half. A name counted a little high costs a concept
+  # more prose than it needed; a hot type counted low is a type nobody documents.
+  local -a named=()
+  local path base stem
+  for path in ${OKF_IN_SCOPE[@]+"${OKF_IN_SCOPE[@]}"}; do
+    base="${path##*/}"
+    stem="${base%.*}"
+    [ "$stem" = "$name" ] || continue
+    named+=("$path")
+  done
+
+  local -a targets=()
+  for path in ${OKF_IN_SCOPE[@]+"${OKF_IN_SCOPE[@]}"}; do
+    if [ "${#named[@]}" -eq 1 ]; then
+      base="${path##*/}"
+      stem="${base%.*}"
+      [ "$stem" != "$name" ] || continue
+    fi
+    targets+=("$path")
+  done
+
+  OKF_FANIN_TOTAL=0
+
+  # No files left to search is 0 references and not an error: a bundle whose
+  # only in-scope file is the one declaring this name is a real answer, and so
+  # is a repository with nothing in scope yet. ripgrep given no paths at all
+  # would read stdin instead, and hang.
+  if [ "${#targets[@]}" -gt 0 ]; then
+    local -a batch=()
+    for path in "${targets[@]}"; do
+      batch+=("$path")
+      if [ "${#batch[@]}" -ge "$OKF_FANIN_BATCH" ]; then
+        count_batch_references "$name" "${batch[@]}"
+        batch=()
+      fi
+    done
+    [ "${#batch[@]}" -eq 0 ] || count_batch_references "$name" "${batch[@]}"
+  fi
+
+  # One number and nothing else, so `fan_in=$(okf fanin RouteRegistry)` is the
+  # whole of reading it and a threshold test is arithmetic on what comes back.
+  printf '%d\n' "$OKF_FANIN_TOTAL"
+}
 
 # okf check [--strict] [--stamp] [--json] — drift, missing and orphan concepts
 cmd_check() { not_implemented check; }
