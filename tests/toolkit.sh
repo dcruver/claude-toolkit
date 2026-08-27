@@ -8979,6 +8979,213 @@ test_gitignore_ignores_the_toolkit_scratch_directories() {
   assert_exit 1 _git_ignores src/parser/okf.md
 }
 
+# SPEC.md §11: the okf-* commands follow commands/onboard.md's house style —
+# frontmatter, an explicit stopping point, explicit non-goals. /okf-init is the
+# one that opens a bundle, and the division of labour in §1 puts every `okf`
+# call on the shell side and every word of prose on Claude's: this command runs
+# the former and writes none of the latter, so it is pinned to naming real
+# subcommands and to handing concept authoring on to /okf-generate.
+#
+# The frontmatter itself is checked for every command file by
+# test_commands_have_frontmatter_description; only what is specific to this one
+# is asserted here.
+test_okf_init_command_reports_scope_without_authoring() {
+  local doc="$TOOLKIT_ROOT/commands/okf-init.md"
+  if [ ! -f "$doc" ]; then
+    _fail "commands/okf-init.md exists" "no such file: $doc"
+    return 1
+  fi
+  # The body, with the frontmatter block cut off. Every check below reads this
+  # rather than the whole file: the description names both `okf init` and
+  # `okf list --missing`, so a check run over the file would go on passing with
+  # the instructions themselves deleted.
+  local body_text
+  body_text="$(awk '{ sub(/\r$/, "") }
+                    NR == 1 && $0 == "---" { in_front = 1; next }
+                    in_front && $0 == "---" { in_front = 0; next }
+                    !in_front { print }' "$doc")"
+  if [ -z "$body_text" ]; then
+    _fail "commands/okf-init.md has a body below its frontmatter" \
+      "nothing follows the frontmatter block in $doc"
+    return 1
+  fi
+
+  # It passes $ARGUMENTS through to `okf init`, and SPEC.md §11 asks for an
+  # argument-hint from any command that takes arguments — it is what Claude
+  # Code shows the user at the prompt, so an undocumented flag is an invisible
+  # one.
+  if grep -q '\$ARGUMENTS' "$doc"; then
+    # CR stripped first, as the sibling frontmatter check does: on a CRLF
+    # checkout every line ends in one, and comparing it to "---" unstripped
+    # would report a perfectly good argument-hint as missing.
+    if awk '{ sub(/\r$/, "") }
+            NR == 1 && $0 != "---" { exit 1 }
+            NR > 1 && $0 == "---" { exit 1 }
+            NR > 1 && /^argument-hint:[[:space:]]*[^[:space:]]/ { found = 1; exit 0 }
+            END { exit found ? 0 : 1 }' "$doc"; then
+      _pass "commands/okf-init.md documents its arguments with an argument-hint"
+    else
+      _fail "commands/okf-init.md documents its arguments with an argument-hint" \
+        "it passes \$ARGUMENTS through but its frontmatter has no non-empty" \
+        "argument-hint line"
+    fi
+  fi
+
+  # The two calls the item exists for: init opens the bundle, `list --missing`
+  # is how its scope gets reported.
+  assert_contains "$body_text" 'okf init' "it runs okf init"
+  assert_contains "$body_text" 'okf list --missing' \
+    "it reports scope with okf list --missing"
+
+  # Every subcommand it names has to be one bin/okf actually dispatches. A doc
+  # that invents `okf scan` reads perfectly and fails only when someone runs
+  # it.
+  #
+  # Only backticked mentions are collected, because the document writes every
+  # invocation as code and its prose does not: without the anchor, a sentence
+  # such as "okf reads the repo's scope" would be read as a subcommand called
+  # `reads`. `okf.json` is not matched either — the pattern needs a space after
+  # the name.
+  #
+  # What the anchor cannot settle is "run `okf list`" against "do not run
+  # `okf embed`": a prohibition written as code is held to the same standard as
+  # an instruction. That is deliberate — every subcommand the document names,
+  # in either voice, is one a reader may go and run — and the failure message
+  # below says how to phrase a mention that is meant to stay unrunnable, so the
+  # check is one somebody can act on rather than only fail.
+  local -a named=()
+  local sub
+  while IFS= read -r sub; do
+    [ -n "$sub" ] && named+=("$sub")
+  done < <(printf '%s\n' "$body_text" | grep -oE '`okf [a-z][a-z-]*' |
+    awk '{print $2}' | sort -u)
+  # Guards the extraction: were the doc reworded past this pattern the loop
+  # below would vanish and this test would pass having checked nothing. Bailing
+  # also keeps "${named[@]}" off an empty array, which aborts the run under
+  # `set -u` on bash 3.2.
+  if [ "${#named[@]}" -eq 0 ]; then
+    _fail "commands/okf-init.md names the okf subcommands it runs" \
+      "no 'okf <subcommand>' mention found in the document"
+    return 1
+  fi
+  local okf="$TOOLKIT_ROOT/bin/okf"
+  if [ ! -x "$okf" ]; then
+    _fail "bin/okf is an executable script" "missing or not executable: $okf"
+    return 1
+  fi
+  # What dispatch will actually accept, which is the OKF_SUBCOMMANDS array
+  # rather than the set of cmd_ functions that happen to be defined.
+  local dispatched
+  dispatched="$(_okf_dispatch_subcommands)"
+  if [ -z "$dispatched" ]; then
+    _fail "bin/okf lists the subcommands it dispatches" \
+      "no OKF_SUBCOMMANDS array in bin/okf, or it is empty"
+    return 1
+  fi
+
+  for sub in "${named[@]}"; do
+    if ! printf '%s\n' "$dispatched" | grep -Fqx -- "$sub"; then
+      _fail "commands/okf-init.md names a working subcommand: okf $sub" \
+        "bin/okf's OKF_SUBCOMMANDS does not list $sub, so dispatch would" \
+        "reject it as an unknown subcommand"
+    elif ! grep -qE "^cmd_$sub\(\)" "$okf"; then
+      _fail "commands/okf-init.md names a working subcommand: okf $sub" \
+        "bin/okf has no cmd_$sub function, so this document tells the reader" \
+        "to run a subcommand that does not exist"
+    elif grep -qE "(^|[^_[:alnum:]])not_implemented[[:space:]]+$sub([^_[:alnum:]]|\$)" "$okf"; then
+      # Dispatchable is not the same as usable: chunk, embed and search are
+      # stubs until later in the checklist, and a document sending the reader
+      # to one of them is as broken as one inventing a name outright. Asked of
+      # the not_implemented call sites rather than of cmd_$sub's body, because
+      # finding where a shell function ends means matching braces past
+      # here-docs and embedded awk, and a body cut short at the wrong one would
+      # turn this check into a silent pass.
+      _fail "commands/okf-init.md names a working subcommand: okf $sub" \
+        "cmd_$sub in bin/okf is still a not_implemented stub" \
+        "if the mention is not an instruction to run it, name it as a bare" \
+        "word — only backticked 'okf <name>' mentions are collected"
+    else
+      _pass "commands/okf-init.md names a working subcommand: okf $sub"
+    fi
+  done
+
+  # The house-style pair from commands/onboard.md, which every okf-* command
+  # owes the reader: where it ends, and what it deliberately does not do.
+  if printf '%s\n' "$body_text" | grep -qi 'stop there'; then
+    _pass "commands/okf-init.md has an explicit stopping point"
+  else
+    _fail "commands/okf-init.md has an explicit stopping point" \
+      "no 'Stop there' in the document — SPEC.md §11 asks every okf-* command" \
+      "for one, in the style of commands/onboard.md"
+  fi
+  if printf '%s\n' "$body_text" | grep -qi 'non-goal'; then
+    _pass "commands/okf-init.md states its non-goals explicitly"
+  else
+    _fail "commands/okf-init.md states its non-goals explicitly" \
+      "the words 'non-goal' appear nowhere in the document"
+  fi
+
+  # Authoring is the next command's job. Naming it is what makes the handoff a
+  # handoff rather than an omission the reader fills in by documenting things
+  # here.
+  assert_contains "$body_text" '/okf-generate' \
+    "it hands concept authoring on to /okf-generate rather than doing it"
+}
+
+# install.sh copies commands/*.md by glob but announces them by hand, so a new
+# command is installed and never mentioned — the one failure mode a glob cannot
+# have. Pinned here rather than left to review, alongside the check that
+# install.sh copies every script in bin/.
+test_install_sh_announces_every_command() {
+  local script="$TOOLKIT_ROOT/install.sh"
+  local banner
+  banner="$(awk '/And in Claude Code:/ { in_banner = 1 }
+                 in_banner { print }
+                 in_banner && /should now be available/ { exit }' "$script")"
+  # Guards the extraction: a reworded banner would otherwise leave every check
+  # below reading an empty string, and grep finding nothing in nothing would
+  # fail them all with a misleading reason.
+  if [ -z "$banner" ]; then
+    _fail "install.sh names the slash commands it installed" \
+      "no 'And in Claude Code: … should now be available' banner in install.sh"
+    return 1
+  fi
+
+  local f name found=0
+  for f in "$TOOLKIT_ROOT"/commands/*.md; do
+    [ -e "$f" ] || continue
+    found=$((found + 1))
+    name="$(basename "$f" .md)"
+    # Matched to the end of the name, so /okf-init is not answered for by a
+    # banner that only mentions /okf-initialise.
+    if printf '%s\n' "$banner" | grep -qE "/$name([^a-zA-Z0-9_-]|\$)"; then
+      _pass "install.sh's banner names /$name"
+    else
+      _fail "install.sh's banner names /$name" \
+        "commands/$name.md is installed by the commands/*.md glob but the" \
+        "closing 'should now be available' line never mentions it"
+    fi
+  done
+  if [ "$found" -eq 0 ]; then
+    _fail "commands/ contains at least one command file" "no commands/*.md found"
+  fi
+
+  # And the other direction: a command that was renamed or removed leaves the
+  # banner promising a slash command that will not be there, which is the same
+  # drift read from the other end.
+  local announced
+  while IFS= read -r announced; do
+    [ -n "$announced" ] || continue
+    if [ -f "$TOOLKIT_ROOT/commands/$announced.md" ]; then
+      _pass "install.sh's banner promises a command that exists: /$announced"
+    else
+      _fail "install.sh's banner promises a command that exists: /$announced" \
+        "the banner names /$announced but there is no commands/$announced.md"
+    fi
+  done < <(printf '%s\n' "$banner" | grep -oE '/[a-z][a-z0-9-]*' |
+    sed 's|^/||' | sort -u)
+}
+
 # --- add new test_* functions above this line ------------------------------
 
 # ---------------------------------------------------------------------------

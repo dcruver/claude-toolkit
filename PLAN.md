@@ -52,7 +52,7 @@ there). Items are ordered so none depends on a later one. Every item verifies wi
 
 ## Phase 7 — slash commands
 
-- [ ] Add commands/okf-init.md following the house style of commands/onboard.md with YAML frontmatter, an explicit stopping point and explicit non-goals, which runs okf init and reports scope via okf list --missing without authoring any prose (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
+- [x] Add commands/okf-init.md following the house style of commands/onboard.md with YAML frontmatter, an explicit stopping point and explicit non-goals, which runs okf init and reports scope via okf list --missing without authoring any prose (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Add commands/okf-generate.md following the house style of commands/onboard.md, which reads each in-scope source, extracts its declared types, calls okf fanin for the ranking signal, assigns a tier by the SPEC.md §5 rules, and writes co-located concept files obeying the SPEC.md §4 formatting contract stamped generated.by claude-code/<model> with no verified entry (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Add commands/okf-refresh.md following the house style of commands/onboard.md, which runs okf check, re-authors the bodies of drifted concepts, and updates their code.content_hash and generated.at without removing any verified entry (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Add commands/okf-verify.md following the house style of commands/onboard.md, which walks draft or drifted concepts with the user and stamps each confirmed one via okf verify --by human:<id> (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
