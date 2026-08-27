@@ -7458,6 +7458,555 @@ test_okf_index_needs_a_git_work_tree() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# okf verify (SPEC.md §7, §8)
+# ---------------------------------------------------------------------------
+
+# okf verify's stdout, its stderr and its exit status, kept apart for the reason
+# _okf_check keeps check's apart: the line naming what was written is stdout,
+# the reason a run could not write is stderr, and the status says which of the
+# two happened.
+OKF_VERIFY_OUT=""
+OKF_VERIFY_ERR=""
+OKF_VERIFY_RC=0
+_okf_verify() { # $1.. = arguments after `verify`
+  local stderr="$HARNESS_STATE/okf-verify-stderr"
+  : > "$stderr"
+  OKF_VERIFY_OUT="$("$TOOLKIT_ROOT/bin/okf" verify "$@" 2> "$stderr")"
+  OKF_VERIFY_RC=$?
+  OKF_VERIFY_ERR="$(cat "$stderr" 2> /dev/null)"
+  return 0
+}
+
+# Every `verified[].at` one concept carries, in document order, read back
+# through bin/okf's own reader rather than off the line — src/route/Legacy.md
+# quotes every value and ends every line with a CR, so a probe reading the text
+# would be asserting a quoting convention where what is being checked is a list
+# of instants.
+#
+# The probe is preloaded with a concept that carries two entries, which is what
+# _okf_frontmatter_probe's own comment says that argument is for: an empty
+# answer here then means this concept has no entries, rather than meaning
+# nothing was ever read.
+_okf_verified_ats() { # $1 = a concept
+  local out
+  out="$(_okf_frontmatter_probe \
+    "$FIXTURES_DIR/concepts/src/route/RouteRegistry.md" "$1" "verified[].at")"
+  if [ "$(_okf_frontmatter_status "$out")" != "0" ]; then
+    printf '%s\n' "!read_frontmatter refused $1!"
+    return 0
+  fi
+  _okf_frontmatter_field "$out" "verified[].at"
+}
+
+# The line following the first line with the given literal prefix, exactly as it
+# is written in the file. An entry is two lines and the second one carries no
+# name of its own, so this is what says the `at:` landed under the `by:` it
+# belongs to, at the column SPEC.md §4 puts it.
+_okf_concept_line_after() { # $1 = path, $2 = literal line prefix
+  local line hit=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$hit" -eq 1 ]; then
+      printf '%s\n' "$line"
+      return 0
+    fi
+    case "$line" in
+      "$2"*) hit=1 ;;
+    esac
+  done < "$1"
+  return 0
+}
+
+# The last of a concept's verified instants — the one a run under test has just
+# appended.
+_okf_last_verified_at() { # $1 = a concept
+  local at last=""
+  while IFS= read -r at; do
+    [ -n "$at" ] && last="$at"
+  done < <(_okf_verified_ats "$1")
+  printf '%s\n' "$last"
+}
+
+# PLAN.md's Phase 5 verify item: the entry carries the --by actor and the
+# current UTC instant, and every unknown key in the concept survives.
+#
+# The fixture is the one the reader and the writer are both tested against,
+# which is the point: it carries keys SPEC.md §4 defines and bin/okf has no
+# variable for (`title`, `tags`, `sources`), keys inside `code:` in the same
+# position (`kind`, `members`, `commit`), and two verified entries already —
+# SPEC.md §8's "verified entries are never stripped. They are historical facts."
+_okf_verify_appends_probe() {
+  local concept="src/route/RouteRegistry.md"
+  local pristine="$FIXTURES_DIR/concepts/$concept"
+  local before after at
+
+  before="$(_okf_now)"
+  _okf_verify src/route/RouteRegistry --by human:reviewer
+  after="$(_okf_now)"
+
+  assert_eq "0" "$OKF_VERIFY_RC" "okf verify exits 0 on a concept it could append to"
+  assert_eq "" "$OKF_VERIFY_ERR" "and says nothing on stderr"
+
+  at="$(_okf_last_verified_at "$concept")"
+  _okf_assert_stamped_now "$before" "$after" "$at" \
+    "the appended entry carries the instant the run was made at"
+  assert_eq "verified $concept by human:reviewer at $at" "$OKF_VERIFY_OUT" \
+    "and stdout names the concept, the actor and that same instant"
+
+  # SPEC.md §8's sentence, asserted as the whole list rather than as a count:
+  # the two entries the fixture came with are still there, still in order, and
+  # the new one is after them.
+  assert_eq "$(printf '2026-08-26T15:00:00Z\n2026-08-26T16:40:00Z\n%s' "$at")" \
+    "$(_okf_verified_ats "$concept")" \
+    "the entries it already carried survive, in order, with the new one last"
+  assert_eq "  - by: process:okf/0.2" \
+    "$(_okf_concept_line "$concept" "  - by: process:okf/0.2")" \
+    "and the first entry's own line is byte for byte as it was"
+
+  # Two lines, `by` then `at`, in the shape SPEC.md §4's example writes them.
+  assert_eq "  - by: human:reviewer" \
+    "$(_okf_concept_line "$concept" "  - by: human:reviewer")" \
+    "the entry is written as SPEC.md §4 writes one: the actor on the \`-\` line"
+  assert_eq "    at: $at" \
+    "$(_okf_concept_line_after "$concept" "  - by: human:reviewer")" \
+    "with its instant on the line below, at the entry's own key column"
+
+  # PLAN.md's "preserving all unknown frontmatter keys", named outright before
+  # the whole-file comparison says the same thing about every other line.
+  assert_eq "title: RouteRegistry" "$(_okf_concept_line "$concept" "title:")" \
+    "an unknown top-level key survives the append"
+  assert_eq "  kind: class" "$(_okf_concept_line "$concept" "  kind:")" \
+    "an unknown key inside the code: block survives the append"
+  assert_eq "  - resource: https://example.invalid/DON-86" \
+    "$(_okf_concept_line "$concept" "  - resource:")" \
+    "and so does a list SPEC.md §4 defines and the shell never reads"
+
+  # Every line of both files except the entries' own, which are the only ones
+  # this run is allowed to have added to. Compared with the same prefixes
+  # dropped from each side, so what is left is the claim being made: nothing
+  # outside the verified block moved.
+  assert_eq "$(_okf_concept_bytes "$pristine" "  - by:" "    at:")" \
+    "$(_okf_concept_bytes "$concept" "  - by:" "    at:")" \
+    "every byte outside the verified block is exactly as it was"
+
+  # Appended and never merged: the same actor twice is two reviews, at two
+  # instants, and SPEC.md §8 keeps both.
+  _okf_verify "$concept" --by human:reviewer
+  assert_eq "0" "$OKF_VERIFY_RC" \
+    "a second verify by the same actor is accepted, and takes the path spelling too"
+  assert_eq "4" "$(_okf_verified_ats "$concept" | grep -c .)" \
+    "and appends a fourth entry rather than moving the third one's instant"
+  return 0
+}
+
+test_okf_verify_appends_a_verified_entry() {
+  _okf_preconditions || return 1
+  if ! command -v date > /dev/null 2>&1; then
+    _skip "okf verify appends a verified entry" \
+      "date is not installed here, so there is no clock to record an instant with"
+    return 0
+  fi
+  with_fixture_repo concepts _okf_verify_appends_probe
+}
+
+# SPEC.md §4's `human:<id>`, with the id defaulting to the current username.
+#
+# Asserted against a username this test sets rather than against whatever
+# account happens to be running the suite: `human:$USER` compared with
+# `human:$USER` is a check that cannot fail.
+_okf_verify_default_actor_probe() {
+  local concept="src/route/RouteSource.md" out
+
+  out="$(USER=toolkit-tester "$TOOLKIT_ROOT/bin/okf" verify "$concept" 2>&1)"
+  assert_contains "$out" "by human:toolkit-tester" \
+    "okf verify with no --by records human: and the current username"
+  assert_eq "  - by: human:toolkit-tester" \
+    "$(_okf_concept_line "$concept" "  - by:")" \
+    "and that is the actor written into the concept"
+
+  # LOGNAME, for the environments that carry it and not USER — a login shell
+  # started by something that sets only the POSIX one.
+  out="$(env -u USER LOGNAME=toolkit-logname "$TOOLKIT_ROOT/bin/okf" \
+    verify src/route/RouteRegistry.md 2>&1)"
+  assert_contains "$out" "by human:toolkit-logname" \
+    "and falls back to LOGNAME when USER is not set"
+
+  # Neither one set, which is a cron job or a container. `id -un` is the
+  # fallback, and it is the one thing here that is a tool SPEC.md §3 does not
+  # list — so what is checked is that the run either answers with that name or
+  # says why it cannot, and never invents one.
+  if command -v id > /dev/null 2>&1; then
+    out="$(env -u USER -u LOGNAME "$TOOLKIT_ROOT/bin/okf" \
+      verify src/route/Boundaries.md 2>&1)"
+    assert_contains "$out" "by human:$(id -un)" \
+      "and falls back to id -un when neither variable is set"
+  else
+    _skip "okf verify falls back to id -un" "id is not installed here"
+  fi
+  return 0
+}
+
+test_okf_verify_defaults_to_the_current_username() {
+  _okf_preconditions || return 1
+  if ! command -v date > /dev/null 2>&1; then
+    _skip "okf verify defaults to the current username" \
+      "date is not installed here, so there is no clock to record an instant with"
+    return 0
+  fi
+  with_fixture_repo concepts _okf_verify_default_actor_probe
+}
+
+# A concept with no `verified:` key at all — the inserting half. The block is
+# opened in SPEC.md §4's own shape, above the closing `---`, and nothing else in
+# the file moves.
+_okf_verify_opens_a_block_probe() {
+  local concept="src/route/RouteSource.md"
+  local pristine="$FIXTURES_DIR/concepts/$concept"
+  local at
+
+  assert_eq "" "$(_okf_verified_ats "$concept")" \
+    "the fixture's RouteSource.md starts out with no verified entries at all"
+
+  _okf_verify src/route/RouteSource --by process:okf/0.2
+  assert_eq "0" "$OKF_VERIFY_RC" "okf verify opens a verified block that is not there"
+
+  at="$(_okf_last_verified_at "$concept")"
+  assert_eq "$at" "$(_okf_verified_ats "$concept")" \
+    "and read_frontmatter reads back exactly the one entry"
+  assert_eq "verified:" "$(_okf_concept_line "$concept" "verified:")" \
+    "the block header is a bare top-level key, as SPEC.md §4's contract asks"
+  assert_eq "  - by: process:okf/0.2" \
+    "$(_okf_concept_line "$concept" "  - by:")" \
+    "the entry's \`-\` is at SPEC.md §4's two spaces"
+  assert_eq "    at: $at" "$(_okf_concept_line_after "$concept" "  - by:")" \
+    "and its keys at four"
+
+  assert_eq "$(_okf_concept_bytes "$pristine")" \
+    "$(_okf_concept_bytes "$concept" "verified:" "  - by:" "    at:")" \
+    "every other byte of the concept is exactly as it was"
+  return 0
+}
+
+test_okf_verify_opens_a_verified_block_when_there_is_none() {
+  _okf_preconditions || return 1
+  if ! command -v date > /dev/null 2>&1; then
+    _skip "okf verify opens a verified block when there is none" \
+      "date is not installed here, so there is no clock to record an instant with"
+    return 0
+  fi
+  with_fixture_repo concepts _okf_verify_opens_a_block_probe
+}
+
+# SPEC.md §4's example indents an entry's `-` by two and its keys by four; most
+# YAML writers put them at zero and two, and read_frontmatter reads both. So the
+# entry is written in the style the block is already in — a writer that imposed
+# one spelling would reindent somebody else's block for no change in meaning.
+_okf_verify_entry_style_probe() {
+  local flush="src/route/Boundaries.md"
+  local crlf="src/route/Legacy.md"
+  local pristine="$FIXTURES_DIR/concepts/$crlf"
+  local at
+
+  # src/route/Boundaries.md writes its entries flush left, with nested mappings
+  # and a nested list inside them — the block read_frontmatter's own comment is
+  # written about.
+  _okf_verify "$flush" --by process:okf/0.2
+  assert_eq "0" "$OKF_VERIFY_RC" "okf verify appends to a block written flush left"
+  at="$(_okf_last_verified_at "$flush")"
+  assert_eq "$(printf '2026-08-27T09:00:00Z\n2026-08-27T10:00:00Z\n2026-08-27T11:00:00Z\n%s' "$at")" \
+    "$(_okf_verified_ats "$flush")" \
+    "and every entry that block already carried still reads as its own"
+  assert_eq "    at: 2001-01-01T00:00:00Z" \
+    "$(_okf_concept_line "$flush" "    at: 2001")" \
+    "the mapping nested inside the first entry is untouched"
+
+  # src/route/Legacy.md is the same block written with CRLF and a UTF-8 BOM.
+  # The entry follows the file's own line ending, or a concept checked out on
+  # Windows gains one line that is not like the others.
+  _okf_verify "$crlf" --by human:reviewer
+  assert_eq "0" "$OKF_VERIFY_RC" "okf verify appends to a CRLF concept"
+  at="$(_okf_last_verified_at "$crlf")"
+  assert_eq "$(printf '2026-08-26T16:40:00Z\n%s' "$at")" "$(_okf_verified_ats "$crlf")" \
+    "and its existing entry survives"
+  assert_eq "$(printf '  - by: human:reviewer\r')" \
+    "$(_okf_concept_line "$crlf" "  - by: human:reviewer")" \
+    "the appended line carries the CR the rest of the file carries"
+  assert_eq "$(printf '    at: %s\r' "$at")" \
+    "$(_okf_concept_line_after "$crlf" "  - by: human:reviewer")" \
+    "and so does the line below it"
+  assert_eq "$(_okf_concept_bytes "$pristine" "  - by:" "    at:")" \
+    "$(_okf_concept_bytes "$crlf" "  - by:" "    at:")" \
+    "with the BOM and every other byte of that concept left alone"
+  return 0
+}
+
+test_okf_verify_writes_the_entry_style_it_finds() {
+  _okf_preconditions || return 1
+  if ! command -v date > /dev/null 2>&1; then
+    _skip "okf verify writes the entry style it finds" \
+      "date is not installed here, so there is no clock to record an instant with"
+    return 0
+  fi
+  with_fixture_repo concepts _okf_verify_entry_style_probe
+}
+
+# What okf verify refuses, and the one thing every refusal has to have in
+# common: the file it refused is exactly as it was.
+_okf_verify_refusal_probe() {
+  local before
+
+  before="$(_okf_concept_bytes src/route/Interrupted.md)"
+  _okf_verify src/route/Interrupted
+  assert_eq "1" "$OKF_VERIFY_RC" "a concept whose block is never closed is refused"
+  assert_contains "$OKF_VERIFY_ERR" "never closes" "saying which end is missing"
+  assert_eq "$before" "$(_okf_concept_bytes src/route/Interrupted.md)" \
+    "and it is left exactly as it was"
+
+  before="$(_okf_concept_bytes src/route/README.md)"
+  _okf_verify src/route/README.md
+  assert_eq "1" "$OKF_VERIFY_RC" "a markdown file with no frontmatter is refused"
+  assert_contains "$OKF_VERIFY_ERR" "carries no frontmatter block" "saying so"
+  assert_eq "$before" "$(_okf_concept_bytes src/route/README.md)" \
+    "and it is left exactly as it was"
+
+  _okf_verify src/route/Nope
+  assert_eq "1" "$OKF_VERIFY_RC" "a concept that is not there is refused"
+  assert_contains "$OKF_VERIFY_ERR" "no such concept: src/route/Nope" "naming it"
+
+  # SPEC.md §4 spells path-valued fields bundle-absolute, so a `resource` or a
+  # link target handed straight to verify names a file that is not there. Named
+  # rather than guessed at — see cmd_hash, which answers the same slip.
+  _okf_verify /src/route/RouteSource
+  assert_eq "1" "$OKF_VERIFY_RC" "a bundle-absolute concept id is refused"
+  assert_contains "$OKF_VERIFY_ERR" "did you mean src/route/RouteSource ?" \
+    "and the other spelling is named rather than acted on"
+
+  _okf_verify src/route
+  assert_eq "1" "$OKF_VERIFY_RC" "a directory is refused"
+  assert_contains "$OKF_VERIFY_ERR" "not a regular file" "as what it is"
+
+  # A `verified:` that is not the list SPEC.md §4 makes it. Appending a `- `
+  # item to either of these produces a document no YAML reader will take, and
+  # okf guessing which was meant would be okf editing a structure it did not
+  # write.
+  printf -- '---\ntype: Class\nresource: /src/route/RouteSource.java\nverified: yes\n---\n' \
+    > src/route/Scalar.md
+  before="$(_okf_concept_bytes src/route/Scalar.md)"
+  _okf_verify src/route/Scalar
+  assert_eq "1" "$OKF_VERIFY_RC" "a verified: that carries a value is refused"
+  assert_contains "$OKF_VERIFY_ERR" "verified:" "naming the key"
+  assert_eq "$before" "$(_okf_concept_bytes src/route/Scalar.md)" \
+    "and that concept is left exactly as it was"
+
+  printf -- '---\ntype: Class\nresource: /src/route/RouteSource.java\nverified:\n  by: human:dcruver\n  at: 2026-08-26T16:40:00Z\n---\n' \
+    > src/route/Mapping.md
+  before="$(_okf_concept_bytes src/route/Mapping.md)"
+  _okf_verify src/route/Mapping
+  assert_eq "1" "$OKF_VERIFY_RC" "a verified: holding a block of fields is refused"
+  assert_contains "$OKF_VERIFY_ERR" "not the list" "saying what it is not"
+  assert_eq "$before" "$(_okf_concept_bytes src/route/Mapping.md)" \
+    "and that concept is left exactly as it was"
+
+  # Unwritable, which is the one refusal decided by the filesystem rather than
+  # by what the file says.
+  chmod 444 src/route/RouteSource.md > /dev/null 2>&1
+  if [ -w src/route/RouteSource.md ]; then
+    # Running as root, where a mode of 444 stops nothing.
+    _skip "a concept that cannot be written is refused" \
+      "chmod 444 does not make a file unwritable here"
+  else
+    before="$(_okf_concept_bytes src/route/RouteSource.md)"
+    _okf_verify src/route/RouteSource
+    assert_eq "1" "$OKF_VERIFY_RC" "a concept that cannot be written is refused"
+    assert_contains "$OKF_VERIFY_ERR" "is not writable" "saying why"
+    # A refusal decided before the concept was opened must not read like a
+    # write that failed part way through — see okf check --stamp's own probe.
+    case "$OKF_VERIFY_ERR" in
+      *half-written*)
+        _fail "a concept okf never opened is not reported as half-written" \
+          "$OKF_VERIFY_ERR"
+        ;;
+      *) _pass "a concept okf never opened is not reported as half-written" ;;
+    esac
+    assert_eq "$before" "$(_okf_concept_bytes src/route/RouteSource.md)" \
+      "and it is left exactly as it was"
+  fi
+  chmod 644 src/route/RouteSource.md > /dev/null 2>&1
+  return 0
+}
+
+test_okf_verify_refuses_what_it_cannot_append_to() {
+  _okf_preconditions || return 1
+  if ! command -v date > /dev/null 2>&1; then
+    _skip "okf verify refuses what it cannot append to" \
+      "date is not installed here, so there is no clock to record an instant with"
+    return 0
+  fi
+  with_fixture_repo concepts _okf_verify_refusal_probe
+}
+
+# stamp_concept's refusal, for stamp_concept's reason: a redirection writes
+# *through* a link, so an entry appended to a symlinked concept would land in a
+# file outside the work tree and `git status` would have nothing to say about it.
+_okf_verify_symlink_probe() {
+  local outside target before
+
+  if ! outside="$(mktemp -d "${TMPDIR:-/tmp}/toolkit-outside.XXXXXX")"; then
+    _fail "a directory outside the work tree can be made" "mktemp -d failed"
+    return 1
+  fi
+  printf '%s\n' "$outside" >> "$HARNESS_STATE/fixture_dirs"
+
+  target="$outside/Linked.md"
+  printf -- '---\ntype: Class\ntitle: Linked\nresource: /src/route/RouteSource.java\n---\n' \
+    > "$target"
+
+  if ! ln -s "$target" src/route/Linked.md 2> /dev/null; then
+    _skip "a symlinked concept is not written through" \
+      "this filesystem has no symbolic links"
+    rm -rf "$outside"
+    return 0
+  fi
+
+  before="$(_okf_concept_bytes "$target")"
+  _okf_verify src/route/Linked.md --by human:reviewer
+
+  assert_eq "1" "$OKF_VERIFY_RC" "a verify that met a symlinked concept exits 1"
+  assert_contains "$OKF_VERIFY_ERR" "symbolic link" "saying that is what it is"
+  assert_eq "$before" "$(_okf_concept_bytes "$target")" \
+    "and the file outside the work tree is byte for byte as it was"
+  assert_eq "" "$OKF_VERIFY_OUT" \
+    "with nothing on stdout claiming an entry was appended"
+
+  rm -f src/route/Linked.md
+  rm -rf "$outside"
+  return 0
+}
+
+test_okf_verify_never_writes_through_a_link() {
+  _okf_preconditions || return 1
+  if ! command -v date > /dev/null 2>&1; then
+    _skip "okf verify never writes through a symlinked concept" \
+      "date is not installed here, so there is no clock to record an instant with"
+    return 0
+  fi
+  with_fixture_repo concepts _okf_verify_symlink_probe
+}
+
+# SPEC.md §7 gives verify one operand and one flag. A mistyped one is answered
+# rather than acted on: nothing here is a run that quietly wrote an entry
+# crediting somebody else.
+_okf_verify_flag_probe() {
+  local concept="src/route/RouteSource.md" before
+
+  before="$(_okf_concept_bytes "$concept")"
+
+  _okf_verify
+  assert_eq "1" "$OKF_VERIFY_RC" "verify with no concept at all is refused"
+  assert_contains "$OKF_VERIFY_ERR" "usage: okf verify <concept> [--by ACTOR]" \
+    "printing SPEC.md §7's usage line"
+
+  _okf_verify "$concept" src/route/RouteRegistry.md
+  assert_eq "1" "$OKF_VERIFY_RC" "verify with two concepts is refused"
+  assert_contains "$OKF_VERIFY_ERR" "takes one concept" "saying it takes one"
+
+  _okf_verify "$concept" --force
+  assert_eq "1" "$OKF_VERIFY_RC" "an unknown flag is refused"
+  assert_contains "$OKF_VERIFY_ERR" "unknown flag: --force" "naming it"
+
+  _okf_verify "$concept" --by
+  assert_eq "1" "$OKF_VERIFY_RC" "a --by with no actor after it is refused"
+  assert_contains "$OKF_VERIFY_ERR" "--by needs an actor" "saying what is missing"
+
+  # The slip one argument later: `--by --strict` is a --by whose actor was left
+  # out, and recording the flag as the reviewer is not what was meant.
+  _okf_verify "$concept" --by --by
+  assert_eq "1" "$OKF_VERIFY_RC" "a --by whose value is itself a flag is refused"
+
+  _okf_verify "$concept" --by human:one --by human:two
+  assert_eq "1" "$OKF_VERIFY_RC" "a repeated --by is refused rather than last-wins"
+
+  assert_eq "$before" "$(_okf_concept_bytes "$concept")" \
+    "and not one of those runs wrote anything into the concept"
+
+  # An actor outside SPEC.md §4's vocabulary is a warning and not a refusal: §4
+  # is OKF's list, and a caller with a reason to write something else is not
+  # making a mistake okf should be overruling. What it costs is said out loud,
+  # because SPEC.md §8 reads the `human:` prefix and nothing else.
+  _okf_verify "$concept" --by dcruver
+  assert_eq "0" "$OKF_VERIFY_RC" "an actor outside SPEC.md §4's vocabulary is still written"
+  assert_contains "$OKF_VERIFY_ERR" "actor strings" "with a warning naming the vocabulary"
+  assert_eq "  - by: dcruver" "$(_okf_concept_line "$concept" "  - by:")" \
+    "and the actor is recorded exactly as it was given"
+
+  # --by after the concept, which is how anybody types it, and the GNU spelling
+  # that would otherwise be read as a second concept.
+  _okf_verify src/route/RouteRegistry.md --by=process:ci
+  assert_eq "0" "$OKF_VERIFY_RC" "--by=ACTOR after the concept is accepted"
+  assert_contains "$OKF_VERIFY_OUT" "by process:ci" "and is the actor recorded"
+  return 0
+}
+
+test_okf_verify_answers_for_its_own_flags() {
+  _okf_preconditions || return 1
+  if ! command -v date > /dev/null 2>&1; then
+    _skip "okf verify answers for its own flags" \
+      "date is not installed here, so there is no clock to record an instant with"
+    return 0
+  fi
+  with_fixture_repo concepts _okf_verify_flag_probe
+}
+
+# SPEC.md §3's tool list has no clock in it, and the preflight's promise is to
+# name exactly what is missing. `okf verify` records the instant it ran at, so
+# it is one of the two runs that reach past that list — and it has to say so
+# rather than let `date` read as a new requirement of okf.
+_okf_verify_clock_probe() {
+  local -a hard=()
+  local name dir before
+
+  while IFS= read -r name; do
+    [ -n "$name" ] && hard+=("$name")
+  done < <(_okf_spec_tools_in_tier A)
+  if [ "${#hard[@]}" -eq 0 ]; then
+    _fail "SPEC.md §3 names the tools bin/okf requires" \
+      "extracted no tool names from the runtime prerequisites section"
+    return 1
+  fi
+
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/toolkit-clock.XXXXXX")" || {
+    _fail "a probe PATH without date can be built" "mktemp -d failed"
+    return 1
+  }
+  printf '%s\n' "$dir" >> "$HARNESS_STATE/fixture_dirs"
+  if ! _okf_probe_path "$dir/tier-a" "${hard[@]}"; then
+    _fail "a probe PATH without date can be built" \
+      "a tool SPEC.md §3 requires is not installed here, so a missing date" \
+      "cannot be told from a missing anything else"
+    return 1
+  fi
+
+  # The control first: §3's own list is enough for every run that does not
+  # record an instant, so a verify refused below is refused for wanting a clock
+  # and not because the probe PATH is too thin to run okf at all.
+  assert_exit 0 _okf_with_path "$dir/tier-a" list
+  before="$(_okf_concept_bytes src/route/RouteSource.md)"
+
+  assert_exit 1 _okf_with_path "$dir/tier-a" verify src/route/RouteSource
+  _okf_assert_names_tool "$(last_output)" date \
+    "verify on a machine without a clock is refused, naming date"
+  assert_contains "$(last_output)" "verify" \
+    "and says which run wanted it, so date does not read as a new requirement of okf"
+  assert_eq "$before" "$(_okf_concept_bytes src/route/RouteSource.md)" \
+    "and the concept is not written to on the way to saying so"
+  return 0
+}
+
+test_okf_verify_names_the_clock_it_needs() {
+  _okf_preconditions || return 1
+  with_fixture_repo concepts _okf_verify_clock_probe
+}
+
 # --- add new test_* functions above this line ------------------------------
 
 # ---------------------------------------------------------------------------

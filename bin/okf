@@ -2439,6 +2439,339 @@ write_frontmatter_field() { # $1 = concept path, $2 = field name, $3 = value
   return 0
 }
 
+# Appends one SPEC.md §4 `verified` entry to a concept, in place, leaving every
+# other byte of the file exactly as it was.
+#
+#   append_verified_entry <concept> <actor> <instant>
+#
+# The list operation write_frontmatter_field refuses, and refuses by name: an
+# `  at:` inserted under a `verified:` whose entries are `- ` items turns a list
+# into a mapping. This is the other half — SPEC.md §7's `okf verify` — and it is
+# separate for the reason that refusal gives rather than because two writers
+# were wanted.
+#
+# The entry is two lines, `by` then `at`, which is the order SPEC.md §4's own
+# example writes them in:
+#
+#   verified:
+#     - by: human:dcruver
+#       at: 2026-08-26T16:40:00Z
+#
+# **Appended, never merged.** SPEC.md §8: "verified entries are never stripped.
+# They are historical facts." So an actor who has verified this concept before
+# gets a second entry rather than the first one's instant moved forward — the
+# two reviews happened, at two instants, and a writer that collapsed them would
+# be deleting the older of the two facts. Nothing else in the block is read,
+# reordered or rewritten.
+#
+# Byte for byte for everything else, for write_frontmatter_field's reason and
+# by the same means: the whole file is read, the replacement built, and only
+# then is the concept opened for writing. Every line but the two inserted keeps
+# its CRLF, its BOM, its trailing comment and the absence of a final newline.
+# SPEC.md §1 puts a concept's unknown keys and its prose on Claude's side of the
+# division of labour, so a writer that reflowed either would be the shell
+# overwriting work it cannot reproduce.
+#
+# **The entry is written in the style it finds.** SPEC.md §4's example puts an
+# entry's `-` at two spaces and its keys at four; most YAML writers put them at
+# zero and two, and the two spellings are the same document — read_frontmatter
+# reads both. So the indentation of the existing entries is measured and
+# matched, and §4's own shape is used only when there is nothing to measure. A
+# writer that imposed one spelling would reindent a block somebody else's tool
+# wrote, which is a diff on every line of it for no change in meaning.
+#
+# Where the entry goes: after the last line of the first `verified:` block, so
+# the entries stay in the order they were made — SPEC.md §8 compares a
+# `verified[].at` against `generated.at`, and a history is only a history in
+# order. The *first* block, because that is the one read_frontmatter reads
+# fields out of; a second `verified:` key is a malformed document either way,
+# and appending to the one nothing reads would be a write that silently did
+# nothing.
+#
+# An absent `verified:` opens one immediately above the closing `---`, which is
+# write_frontmatter_field's position for a new top-level key and makes the
+# written block the first of its name.
+#
+# What it refuses, and why each is a refusal rather than a best effort:
+#
+#   * A file with no frontmatter, one that opens a block it never closes, or no
+#     file at all — read_frontmatter's own definition of "not a concept". The
+#     answer to a half-written concept is to finish writing it.
+#   * A `verified:` that is a scalar, or a block of fields rather than a list.
+#     Appending a `- ` item to either produces a document no YAML reader will
+#     take, and okf guessing which one was meant would be okf editing a
+#     structure it did not write.
+#   * A symbolic link. stamp_concept's refusal for stamp_concept's reason: a
+#     redirection writes *through* a link, so the entry would land in a file
+#     outside the work tree and `git status` would have nothing to say about it.
+#     There is no reading of `okf verify` under which that is what was asked
+#     for.
+#
+# The reason for a refusal is left in OKF_VERIFY_ERROR rather than printed, as
+# write_frontmatter_field leaves its own: what the subcommand needs to say about
+# it is the subcommand's to decide.
+OKF_VERIFY_ERROR=""
+append_verified_entry() { # $1 = concept path, $2 = actor, $3 = instant
+  local path="$1" actor="$2" instant="$3"
+  OKF_VERIFY_ERROR=""
+
+  # Both values rendered before the file is opened — before it is even read —
+  # for render_frontmatter_scalar's reason: a value that cannot be written is
+  # not a reason to have touched the concept at all.
+  if ! render_frontmatter_scalar "$actor"; then
+    OKF_VERIFY_ERROR="$OKF_FRONTMATTER_ERROR"
+    return 1
+  fi
+  local by_value="$OKF_FRONTMATTER_RENDERED"
+  if ! render_frontmatter_scalar "$instant"; then
+    OKF_VERIFY_ERROR="$OKF_FRONTMATTER_ERROR"
+    return 1
+  fi
+  local at_value="$OKF_FRONTMATTER_RENDERED"
+
+  if [ -L "$path" ]; then
+    OKF_VERIFY_ERROR="$(display_path "$path") is a symbolic link, and the entry would be written through it into whatever it points at"
+    return 1
+  fi
+  if [ ! -f "$path" ] || [ ! -r "$path" ]; then
+    OKF_VERIFY_ERROR="$(display_path "$path") is not a readable file"
+    return 1
+  fi
+
+  # The whole file, in order, before anything is decided about it — see
+  # write_frontmatter_field.
+  local -a lines=()
+  local line final_nl=1
+  while true; do
+    if IFS= read -r line; then
+      lines+=("$line")
+    else
+      if [ -n "$line" ]; then
+        lines+=("$line")
+        final_nl=0
+      fi
+      break
+    fi
+  # stderr redirected before the input and not after it — see read_frontmatter.
+  done 2> /dev/null < "$path"
+
+  local total="${#lines[@]}"
+  if [ "$total" -eq 0 ]; then
+    OKF_VERIFY_ERROR="$(display_path "$path") carries no frontmatter block"
+    return 1
+  fi
+
+  # Where the block is, read by read_frontmatter's rules because the two have to
+  # agree: an entry appended where the reader does not look is a write that
+  # silently did nothing.
+  local i probe bare rest pad indent
+  local close=-1 hdr=-1 scalar=0 block_end=-1
+  for ((i = 0; i < total; i++)); do
+    probe="${lines[i]}"
+    # A BOM belongs to the first line only, a CR to any of them. Both are
+    # stripped for the comparison and neither from what is written back.
+    if [ "$i" -eq 0 ]; then
+      probe="${probe#$'\xef\xbb\xbf'}"
+    fi
+    probe="${probe%$'\r'}"
+
+    if [ "$i" -eq 0 ]; then
+      if [ "$probe" != "---" ]; then
+        OKF_VERIFY_ERROR="$(display_path "$path") carries no frontmatter block"
+        return 1
+      fi
+      continue
+    fi
+    if [ "$probe" = "---" ]; then
+      close="$i"
+      break
+    fi
+
+    case "$probe" in
+      [![:space:]#-]*)
+        # An unindented line that is neither a comment nor a list item: a
+        # top-level key, and the end of whatever block was open. That boundary
+        # is read_frontmatter's, and a flush-left `- ` is deliberately not one
+        # — YAML lets a sequence sit at its parent key's own column, and that
+        # is how most writers spell §4's `verified:`.
+        if [ "$hdr" -ge 0 ] && [ "$block_end" -lt 0 ]; then
+          block_end="$i"
+        fi
+        if [ "$hdr" -lt 0 ] && [ "$scalar" -eq 0 ]; then
+          case "$probe" in
+            "verified:"*)
+              frontmatter_scalar "${probe#"verified:"}"
+              if [ -n "$OKF_FRONTMATTER_SCALAR" ]; then
+                # `verified: yes` opens no block, and the first key of that
+                # name is the one the reader takes — so a bare `verified:`
+                # further down is not a second chance. This is the answer for
+                # the file.
+                scalar=1
+              else
+                hdr="$i"
+              fi
+              ;;
+          esac
+        fi
+        ;;
+    esac
+  done
+
+  if [ "$close" -lt 0 ]; then
+    OKF_VERIFY_ERROR="$(display_path "$path") opens a frontmatter block it never closes"
+    return 1
+  fi
+  if [ "$scalar" -eq 1 ]; then
+    OKF_VERIFY_ERROR="verified: carries a value in $(display_path "$path") and is not the list SPEC.md §4 makes it"
+    return 1
+  fi
+  if [ "$hdr" -ge 0 ] && [ "$block_end" -lt 0 ]; then
+    # Nothing after the block but the closing `---`.
+    block_end="$close"
+  fi
+
+  # SPEC.md §4's own shape, used when there is no existing entry to measure.
+  local dash=2 keycol=4
+  local insert_at anchor open_new=0
+  if [ "$hdr" -lt 0 ]; then
+    insert_at="$close"
+    anchor="$close"
+    open_new=1
+  else
+    # The block's own layout, measured from its first entry: where the `-`
+    # sits, and the column the entry's keys line up in.
+    local first_dash=-1 first_key=-1 last=-1
+    for ((i = hdr + 1; i < block_end; i++)); do
+      probe="${lines[i]}"
+      probe="${probe%$'\r'}"
+      bare="${probe#"${probe%%[![:space:]]*}"}"
+      # A blank line is not the end of the block and not a line to append
+      # after: a concept whose block ends in one keeps it as the separator it
+      # was written as.
+      [ -n "$bare" ] || continue
+      last="$i"
+      case "$bare" in
+        # A whole-line comment says nothing about what shape the block is, and
+        # is not an entry to measure — but it is a line, so an entry appended
+        # after it goes after it.
+        "#"*) continue ;;
+      esac
+
+      if [ "$first_dash" -lt 0 ]; then
+        case "$bare" in
+          -*)
+            first_dash=$((${#probe} - ${#bare}))
+            rest="${bare#-}"
+            pad="${rest%%[![:space:]]*}"
+            rest="${rest#"$pad"}"
+            if [ -n "$rest" ]; then
+              # `- by: …`: the entry's keys start right there, past the `-`
+              # and the space after it.
+              first_key=$((first_dash + 1 + ${#pad}))
+            fi
+            ;;
+          *)
+            # `verified:` with a mapping under it. A `- ` appended there would
+            # turn a mapping into a list, which is the objection
+            # write_frontmatter_field makes from the other end.
+            OKF_VERIFY_ERROR="verified: holds a block of fields in $(display_path "$path") and is not the list SPEC.md §4 makes it"
+            return 1
+            ;;
+        esac
+      elif [ "$first_key" -lt 0 ]; then
+        # A `-` with nothing after it put the entry's first key on a following
+        # line, at a column the `-` could not predict; this is that line.
+        indent=$((${#probe} - ${#bare}))
+        if [ "$indent" -gt "$first_dash" ]; then
+          first_key="$indent"
+        fi
+      fi
+    done
+
+    if [ "$first_dash" -ge 0 ]; then
+      dash="$first_dash"
+      if [ "$first_key" -ge 0 ]; then
+        keycol="$first_key"
+      else
+        # An entry whose keys were never found — a `-` alone, or a block whose
+        # only entry is empty. One space past the dash is what §4's example and
+        # every YAML writer produce.
+        keycol=$((dash + 2))
+      fi
+    fi
+
+    if [ "$last" -ge 0 ]; then
+      insert_at=$((last + 1))
+      anchor="$last"
+    else
+      # A bare `verified:` with nothing under it at all.
+      insert_at=$((hdr + 1))
+      anchor="$hdr"
+    fi
+  fi
+
+  # The line ending is copied from the line the entry goes in beside, so a
+  # concept written on Windows stays that way and one that is not does not
+  # acquire a stray CR.
+  local eol=""
+  case "${lines[anchor]}" in
+    *$'\r') eol=$'\r' ;;
+  esac
+
+  local gap=$((keycol - dash - 1))
+  # Every path above leaves the key column past the dash, so this is a floor
+  # and not a correction: a `-` with no space after it is not a list item.
+  [ "$gap" -ge 1 ] || gap=1
+  local dash_pad="" gap_pad="" key_pad=""
+  printf -v dash_pad '%*s' "$dash" ''
+  printf -v gap_pad '%*s' "$gap" ''
+  printf -v key_pad '%*s' "$keycol" ''
+
+  local by_line="$dash_pad-${gap_pad}by: $by_value$eol"
+  local at_line="${key_pad}at: $at_value$eol"
+
+  # Built whole before the concept is opened, so that the only thing left to go
+  # wrong after the truncation is the write.
+  local -a out=()
+  for ((i = 0; i < total; i++)); do
+    if [ "$i" -eq "$insert_at" ]; then
+      if [ "$open_new" -eq 1 ]; then
+        out+=("verified:$eol")
+      fi
+      out+=("$by_line")
+      out+=("$at_line")
+    fi
+    out+=("${lines[i]}")
+  done
+
+  # Asked before the truncation rather than left to it — see
+  # write_frontmatter_field.
+  if [ ! -w "$path" ]; then
+    OKF_VERIFY_ERROR="$(display_path "$path") is not writable"
+    return 1
+  fi
+
+  local n="${#out[@]}" last_out
+  last_out=$((n - 1))
+  {
+    for ((i = 0; i < n; i++)); do
+      if [ "$i" -eq "$last_out" ] && [ "$final_nl" -eq 0 ]; then
+        printf '%s' "${out[i]}"
+      else
+        printf '%s\n' "${out[i]}"
+      fi
+    done
+  } 2> /dev/null > "$path" || {
+    # The one failure here that is not a refusal: every other reason this
+    # returns 1 is decided before the concept is opened and leaves it exactly
+    # as it was. See write_frontmatter_field's note on SPEC.md §3's tool list
+    # having no `mktemp` and no `mv` to rename over it.
+    OKF_VERIFY_ERROR="cannot write $(display_path "$path"): it was opened for writing, so it may now be half-written"
+    return 1
+  }
+  return 0
+}
+
 # Fills OKF_CONCEPTS with the repo's concept files, in the order `load_in_scope`
 # lists its sources: every tracked `.md` that carries SPEC.md §4 frontmatter and
 # is not one of §4's reserved names.
@@ -2588,6 +2921,83 @@ stamp_instant() {
     return 1
   fi
   OKF_STAMP_INSTANT="$now"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# The actor (SPEC.md §4)
+# ---------------------------------------------------------------------------
+
+# SPEC.md §4's actor vocabulary: `claude-code/<model>`, `ralph/<model>`,
+# `human:<id>`, `process:<id>`. Whether a string is one of them, asked as a
+# shape and not as a lookup — the identifier half is a model name, a username
+# or a process name and okf has no register of any of those.
+#
+# It matters more than a spelling check. SPEC.md §8's trust rule turns entirely
+# on the `human:` prefix — an entry by any other kind of actor leaves a concept
+# Machine-confirmed — so `--by human/dcruver` is not a cosmetic slip: it is a
+# review that silently does not count. Warned about rather than refused, because
+# §4's list is OKF's vocabulary and a caller who has good reason to write
+# something outside it is not making a mistake okf should be overruling.
+is_actor_string() { # $1 = a candidate actor
+  case "$1" in
+    "human:"?* | "process:"?* | "claude-code/"?* | "ralph/"?*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# The tool the default actor falls back to, on the runs that need it and no
+# others — see require_clock for why that is how a tool outside SPEC.md §3's
+# list is asked for at all. `id -un` and not `whoami`, which is the same answer
+# from a command POSIX marks obsolete, and not `logname`, which answers for the
+# login session and so comes back empty under cron, in a container and over
+# anything that is not a terminal.
+OKF_ACTOR_TOOLS=(id)
+
+# Who okf records as having verified a concept when `--by` was not given:
+# SPEC.md §4's `human:<id>`, with the id taken from the environment first and
+# from `id -un` only when the environment says nothing.
+#
+# The environment first, deliberately. `$USER` is what the person running okf
+# calls themselves and what every other tool reads — it is also the one an
+# automated caller can set, which `id -un` is not — while `id -un` is the
+# account the process happens to be running as. For a `human:` entry, which is
+# a claim about *who reviewed this*, the first is the better answer and the
+# second is the fallback for an environment that carries neither variable. A
+# caller for whom neither is right has `--by`, which is what it is for.
+#
+# `${USER:-}` and not `$USER`: under `set -u` an unset variable is not an empty
+# one, it is the end of the run.
+OKF_ACTOR=""
+OKF_ACTOR_ERROR=""
+default_actor() {
+  local name=""
+  OKF_ACTOR=""
+  OKF_ACTOR_ERROR=""
+
+  name="${USER:-}"
+  [ -n "$name" ] || name="${LOGNAME:-}"
+  if [ -z "$name" ] && have_tool id; then
+    # The first line of it, for stamp_instant's reason: an `id` that answered
+    # with something other than a name would otherwise put the rest of that
+    # answer into the concept.
+    name="$(id -un 2> /dev/null)" || name=""
+    name="${name%%$'\n'*}"
+  fi
+  # Whitespace off both ends, because an id with a space around it is the same
+  # id and a value that needs quoting for it is one no reader compares equal.
+  name="${name#"${name%%[![:space:]]*}"}"
+  name="${name%"${name##*[![:space:]]}"}"
+
+  if [ -z "$name" ]; then
+    OKF_ACTOR_ERROR="there is no username to record: USER and LOGNAME are both unset"
+    if ! have_tool id; then
+      OKF_ACTOR_ERROR="$OKF_ACTOR_ERROR, and id is not installed"
+    fi
+    return 1
+  fi
+
+  OKF_ACTOR="human:$name"
   return 0
 }
 
@@ -4746,7 +5156,158 @@ cmd_index() {
 }
 
 # okf verify <concept> [--by ACTOR] — append a verified entry
-cmd_verify() { not_implemented verify; }
+#
+# SPEC.md §8's trust half, written the only way a shell script honestly can: okf
+# does not review anything. What it records is that somebody says they did, at
+# an instant, and the record is a `verified` entry in SPEC.md §4's own shape.
+# Everything that decides what the entry is worth — SPEC.md §8's trust tiers —
+# is read back out of the concept afterwards, by whoever is asking.
+#
+# The actor defaults to `human:` and the current username, because the caller
+# who typed this is the person who did the reviewing. `--by` is for the other
+# cases §4's vocabulary names: `process:okf/0.2` for something automated,
+# `claude-code/<model>` for a slash command that read the source. SPEC.md §11
+# rules out one of them explicitly — ralph-authored prose never gets a verified
+# entry at all, because unattended regeneration is safe precisely because it
+# cannot forge review — and that is a rule about who runs this, not one this
+# subcommand can enforce.
+#
+# Entries accumulate, and are never merged or replaced: see
+# append_verified_entry, and SPEC.md §8's "verified entries are never stripped.
+# They are historical facts."
+#
+# `<concept>` is SPEC.md §5's concept ID — the bundle-relative path minus `.md`
+# — and the path itself is accepted too, since §5's whole point is that the two
+# are the same fact. `okf verify src/route/RouteRegistry` and `okf verify
+# src/route/RouteRegistry.md` are one invocation, which is what lets a caller
+# pipe `okf check`'s own `drifted:` lines back in without editing them.
+#
+# Nothing here reads git. A concept is a file with §4 frontmatter in it, and
+# `okf verify` on one that was written a second ago and not staged yet is a
+# perfectly good verify — `okf check`'s reasons for asking git which concepts
+# exist are about walking a bundle, and this walks nothing. The path is the
+# caller's own; the only thing that has to be true of it is that it is a
+# concept.
+cmd_verify() {
+  local usage="usage: okf verify <concept> [--by ACTOR]"
+  local by="" seen_by=0 endflags=0
+  local -a rest=()
+
+  # Flags are read across the whole line rather than only ahead of the operand,
+  # for parse_globals' reason: `okf verify src/route/RouteRegistry --by
+  # human:dcruver` is how anybody types this, and a parser that stopped at the
+  # first non-flag would take `--by` for a second concept and refuse it.
+  while [ $# -gt 0 ]; do
+    if [ "$endflags" -eq 1 ]; then
+      rest+=("$1")
+      shift
+      continue
+    fi
+    case "$1" in
+      --) endflags=1 ;;
+      --by)
+        shift
+        [ $# -gt 0 ] || die "verify: --by needs an actor" "$usage"
+        # A value that is itself a flag is a --by whose actor was left out —
+        # parse_globals' objection for --config, and the same slip.
+        case "$1" in
+          -*) die "verify: --by needs an actor, but the next word is a flag: $1" "$usage" ;;
+        esac
+        [ "$seen_by" -eq 0 ] || die "verify: --by given more than once"
+        seen_by=1
+        by="$1"
+        ;;
+      # Accepted for the reason `--config=PATH` is: it is what anyone used to
+      # the GNU tools will type, and left to fall through it would be an actor
+      # silently recorded as a concept.
+      --by=*)
+        [ "$seen_by" -eq 0 ] || die "verify: --by given more than once"
+        seen_by=1
+        by="${1#--by=}"
+        ;;
+      -*) die "verify: unknown flag: $1" "$usage" ;;
+      *) rest+=("$1") ;;
+    esac
+    shift
+  done
+
+  [ "$seen_by" -eq 0 ] || [ -n "$by" ] || die "verify: --by needs an actor, not an empty argument"
+
+  local count="${#rest[@]}"
+  [ "$count" -gt 0 ] || die "verify needs a concept to verify" "$usage"
+  # One concept and not a list. A run over several would have to decide what to
+  # do about the third when the second could not be written, and there is no
+  # answer to that which is not either "stop, having half done it" or "carry
+  # on, having said so in a line the caller has to go and find". A caller who
+  # wants several has a loop, and a status per concept.
+  [ "$count" -eq 1 ] || die "verify takes one concept, but was given $count: ${rest[*]}" \
+    "$usage"
+
+  # The clock, demanded before anything is read or written — see require_clock.
+  # A verify that got as far as opening the concept and only then discovered it
+  # had no instant to record would have found that out after the one step that
+  # can leave a file half-written.
+  require_clock verify
+
+  local given="${rest[0]}" concept=""
+  if [ -f "$given" ]; then
+    # The path as typed, which is `<concept>.md` and also the way a `drifted:`
+    # line from `okf check` spells it.
+    concept="$given"
+  elif [ -f "$given.md" ]; then
+    # SPEC.md §5's concept ID: the bundle-relative path minus `.md`.
+    concept="$given.md"
+  else
+    # SPEC.md §4 spells path-valued fields bundle-absolute — a leading `/` that
+    # means the bundle root and not the filesystem's — so a `resource` or a
+    # link target handed straight to this names a file that is almost never
+    # there. cmd_hash's line, for cmd_hash's reason: the argument stays a
+    # filesystem path, and the guess is spent on naming the other spelling
+    # rather than on quietly acting for it.
+    local rooted="${given#/}"
+    if [ "$rooted" != "$given" ] && { [ -f "$rooted" ] || [ -f "$rooted.md" ]; }; then
+      die "no such concept: $given" \
+        "paths are read as the filesystem's, not as SPEC.md §4's bundle-absolute form" \
+        "did you mean $rooted ?"
+    fi
+    if [ -e "$given" ]; then
+      # There, and not a regular file: a directory named like a concept, or a
+      # device. "No such concept" would read as okf having failed to see
+      # something the caller can see perfectly well.
+      die "verify takes a concept file, but $given is not a regular file"
+    fi
+    die "no such concept: $given" \
+      "a concept is a markdown file carrying SPEC.md §4 frontmatter, named <concept>.md"
+  fi
+
+  if [ "$seen_by" -eq 1 ]; then
+    if ! is_actor_string "$by"; then
+      # Said, and then done as asked — see is_actor_string. The line names what
+      # it costs rather than what it looks like, because "not one of §4's
+      # actors" is a spelling complaint and "this review will not count as a
+      # human's" is the consequence.
+      warn "$by is not one of SPEC.md §4's actor strings: claude-code/<model>, ralph/<model>, human:<id>, process:<id>" \
+        "  it is recorded as given, but SPEC.md §8 reads a verified entry as a human's only when its actor begins human:"
+    fi
+  else
+    default_actor || die "$OKF_ACTOR_ERROR" \
+      "name the actor with --by, as in: okf verify $given --by human:<id>"
+    by="$OKF_ACTOR"
+  fi
+
+  stamp_instant || die "$OKF_STAMP_ERROR" \
+    "so there is no instant to record, and no entry was written"
+  local now="$OKF_STAMP_INSTANT"
+
+  append_verified_entry "$concept" "$by" "$now" \
+    || die "$concept: no verified entry was appended" "  $OKF_VERIFY_ERROR"
+
+  # One line, naming all three of the things this run decided: which file was
+  # written, who it credits, and when. The actor especially — a default that
+  # went unprinted is a caller finding out whose name is in their bundle by
+  # opening the file.
+  printf 'verified %s by %s at %s\n' "$concept" "$by" "$now"
+}
 
 # okf chunk <concept> — Tier B: emit JSON chunks for one concept
 cmd_chunk() { not_implemented chunk; }
