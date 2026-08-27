@@ -13,7 +13,7 @@ there). Items are ordered so none depends on a later one. Every item verifies wi
 
 - [x] Add bin/okf as an executable bash script whose subcommand dispatch recognises every subcommand name in SPEC.md §7, routing each to a stub function, and exits 1 naming the offender on an unknown subcommand (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [x] Add a --help output to bin/okf listing every subcommand in SPEC.md §7 with its flags, printed for both --help and a bare invocation with no subcommand (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
-- [ ] Add a preflight to bin/okf that runs on every invocation and exits 1 with a single line naming exactly which of the SPEC.md §3 required tools are missing, treating jq and rg as hard requirements (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
+- [x] Add a preflight to bin/okf that runs on every invocation and exits 1 with a single line naming exactly which of the SPEC.md §3 required tools are missing, treating jq and rg as hard requirements (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Add the global -C DIR and --config PATH flags to bin/okf, where -C changes the repo root every subcommand resolves paths against and --config overrides the default ./okf.json (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 
 ## Phase 2 — Tier A: bundle initialisation

@@ -44,33 +44,36 @@ OKF_SUBCOMMANDS=(init list hash fanin check index verify chunk embed search)
 # unknown subcommand is worse than help that omits it. The PLAN.md item adding
 # them adds their lines here.
 usage() {
-  cat <<'USAGE'
-okf — OKF code knowledge for a repository.
-
-Usage: okf <subcommand> [flags]
-
-Subcommands:
-  init [--force]                       write okf.json + the bundle-root index.md
-  list [--missing] [--orphans]         in-scope source files
-  hash <file>                          the sha256: digest of one file
-  fanin <Name>                         whole-word reference count for a name
-  check [--strict] [--stamp] [--json]  drift, missing and orphan concepts
-  index                                regenerate the per-directory index.md files
-  verify <concept> [--by ACTOR]        append a verified entry
-  chunk <concept>                      JSON chunks for one concept
-  embed [--all]                        embed and upsert to Qdrant
-  search <query> [--hyde-prompt] [--k N] [--repo R] [--type T]
-
-  -h, --help                           print this help
-
-chunk, embed and search are Tier B: each needs an `index` block in okf.json.
-
-Exit codes:
-  0  success
-  1  error, or a missing prerequisite
-  2  a Tier B subcommand was invoked without an `index` block in okf.json
-  3  `check --strict` found drift
-USAGE
+  # Printed with printf rather than a here-document into `cat`: what bin/okf
+  # needs is SPEC.md §3's list and nothing besides. A `cat` here would be a
+  # tool the preflight does not know to check and so could never name — the
+  # one failure it exists to turn into a single readable line.
+  printf '%s\n' \
+    'okf — OKF code knowledge for a repository.' \
+    '' \
+    'Usage: okf <subcommand> [flags]' \
+    '' \
+    'Subcommands:' \
+    '  init [--force]                       write okf.json + the bundle-root index.md' \
+    '  list [--missing] [--orphans]         in-scope source files' \
+    '  hash <file>                          the sha256: digest of one file' \
+    '  fanin <Name>                         whole-word reference count for a name' \
+    '  check [--strict] [--stamp] [--json]  drift, missing and orphan concepts' \
+    '  index                                regenerate the per-directory index.md files' \
+    '  verify <concept> [--by ACTOR]        append a verified entry' \
+    '  chunk <concept>                      JSON chunks for one concept' \
+    '  embed [--all]                        embed and upsert to Qdrant' \
+    '  search <query> [--hyde-prompt] [--k N] [--repo R] [--type T]' \
+    '' \
+    '  -h, --help                           print this help' \
+    '' \
+    'chunk, embed and search are Tier B: each needs an `index` block in okf.json.' \
+    '' \
+    'Exit codes:' \
+    '  0  success' \
+    '  1  error, or a missing prerequisite' \
+    '  2  a Tier B subcommand was invoked without an `index` block in okf.json' \
+    '  3  `check --strict` found drift'
 }
 
 die() { # $1.. = message lines
@@ -86,6 +89,130 @@ die() { # $1.. = message lines
 # would let a caller mistake doing nothing for having done the work.
 not_implemented() { # $1 = subcommand name
   die "$1 is not implemented yet"
+}
+
+# ---------------------------------------------------------------------------
+# Preflight (SPEC.md §3)
+# ---------------------------------------------------------------------------
+
+# Everything bin/okf shells out to, in SPEC.md §3's order. jq and rg are on
+# this list as hard requirements and not as niceties: install.sh can fall back
+# to a jq-less permission merge, but nothing okf does — reading okf.json,
+# counting fan-in — has a fallback, and a half-finished run is worse than a
+# refusal. bash is listed because §3 lists it; see have_tool for how it is
+# checked.
+OKF_REQUIRED_TOOLS=(bash git sha256sum awk sed rg jq)
+
+# Needed by Tier B alone, which is the only part of okf that speaks HTTP. Its
+# absence degrades okf to Tier A rather than breaking it, so it is required
+# only of the invocations that would use it — `okf list` on a machine without
+# curl is a perfectly good okf.
+#
+# Deliberately not announced on the runs it does not affect: a warning printed
+# by every `okf list` and every `okf --help` is noise on the many invocations
+# that are working perfectly, and stderr is where a caller's pipeline reads its
+# errors. What SPEC.md §3 asks be said about degradation is said on the one run
+# that is degraded, by the subcommand that cannot proceed without it.
+OKF_TIER_B_TOOLS=(curl)
+
+# The subcommands that actually reach for those tools. Not the same thing as
+# the Tier B subcommands, and the difference matters: SPEC.md §9 has `chunk`
+# split a concept body into JSON locally, and only Qdrant — which is to say
+# embed and search — go over REST. Demanding curl of `okf chunk` would refuse
+# a command that was never going to need it.
+#
+# Every name here is also in OKF_SUBCOMMANDS, and tests/toolkit.sh checks that,
+# that the help still calls each of them Tier B, and that the Tier B
+# subcommands left out of this list are not asked for curl.
+OKF_HTTP_SUBCOMMANDS=(embed search)
+
+have_tool() { # $1 = command name
+  # bash is satisfied by the interpreter already running this script rather
+  # than by a PATH lookup: an environment that got as far as this function has
+  # bash, whether or not PATH happens to mention it, and reporting it missing
+  # there would be a lie the caller cannot act on.
+  if [ "$1" = bash ] && [ -n "${BASH_VERSION:-}" ]; then
+    return 0
+  fi
+  command -v -- "$1" > /dev/null 2>&1
+}
+
+# Exits 1 naming every one of the given tools that is not installed, all on one
+# line: someone who has to install three things wants all three now, not one
+# per re-run. Returns 0 when they are all there.
+require_tools() { # $1 = trailing clause for the message, may be empty; $2.. = tools
+  local why="$1"
+  shift
+
+  # The missing ones are accumulated as a string rather than an array: an empty
+  # array expanded under `set -u` is an unbound variable on bash 3.2, which is
+  # still what macOS ships, and empty is the case on every healthy run.
+  local missing="" count=0 tool
+  for tool in "$@"; do
+    if ! have_tool "$tool"; then
+      missing="${missing:+$missing, }$tool"
+      count=$((count + 1))
+    fi
+  done
+  [ -n "$missing" ] || return 0
+
+  local noun="tool"
+  if [ "$count" -gt 1 ]; then
+    noun="tools"
+  fi
+  die "missing required $noun: $missing$why"
+}
+
+# SPEC.md §3's preflight, run on every invocation ahead of both help and
+# dispatch — a subcommand that dies halfway through for want of rg has already
+# half-written the bundle, and there is no point printing help describing
+# subcommands that would every one of them fail.
+#
+# Takes no arguments on purpose. What it checks does not depend on what was
+# asked for, so it cannot be thrown off by the global flags SPEC.md §7 still
+# has to grow: `okf -C some/repo list` preflights exactly as `okf list` does.
+preflight() {
+  require_tools "" "${OKF_REQUIRED_TOOLS[@]}"
+}
+
+# The Tier B half of the same check, for the tools SPEC.md §3 needs only there.
+# Called from dispatch rather than from main, because that is where the
+# subcommand is a name that was matched against OKF_SUBCOMMANDS rather than
+# whatever happened to be the first argument — which, once -C DIR and --config
+# PATH exist, is as likely to be a flag as a subcommand.
+http_preflight() { # $1 = the subcommand being dispatched, $2.. = its arguments
+  local sub="$1" name arg
+  shift
+  for name in "${OKF_HTTP_SUBCOMMANDS[@]}"; do
+    [ "$sub" = "$name" ] || continue
+
+    # SPEC.md §9's one exception: `okf search --hyde-prompt` prints a prompt
+    # for the slash command to answer and exits, reaching neither Qdrant nor an
+    # embedding endpoint. Refusing that one for want of curl would be the same
+    # mistake as demanding it of `okf chunk`. The flag is looked for anywhere
+    # in the arguments, since it may as easily follow the query as precede it —
+    # but not past a `--`, after which the same word is a query that happens to
+    # look like a flag, and that query does have to reach Qdrant.
+    if [ "$sub" = search ]; then
+      for arg in ${1+"$@"}; do
+        if [ "$arg" = -- ]; then
+          break
+        fi
+        if [ "$arg" = --hyde-prompt ]; then
+          return 0
+        fi
+      done
+    fi
+    # Says why curl is being demanded of `okf search` when `okf list` never
+    # mentions it. Without that, the line reads as okf having grown a new
+    # requirement rather than as these two subcommands needing something the
+    # rest of okf does not.
+    local subs="${OKF_HTTP_SUBCOMMANDS[*]}"
+    require_tools " (needed only by ${subs// /, }, which reach Qdrant over HTTP)" \
+      "${OKF_TIER_B_TOOLS[@]}"
+    return 0
+  done
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -131,6 +258,11 @@ cmd_search() { not_implemented search; }
 # ---------------------------------------------------------------------------
 
 main() {
+  # SPEC.md §3: on every invocation, before anything else. The tools Tier B
+  # needs on top of these are checked at dispatch, where the subcommand asked
+  # for is known — a caller who typed `okf list` is not told to install curl.
+  preflight
+
   # No subcommand at all: the same help, but on stderr and exiting 1. A caller
   # that reached here with an empty argument asked for nothing and got nothing
   # done, and exiting 0 would let it mistake that for success.
@@ -159,6 +291,7 @@ main() {
       # in the caller's command line, so say which of the two it is.
       die "$sub is listed as a subcommand but has no cmd_$sub function"
     fi
+    http_preflight "$sub" ${1+"$@"}
     # ${1+"$@"} rather than "$@": under `set -u` an empty "$@" is an unbound
     # variable on bash 3.2, which is still what macOS ships.
     "cmd_$sub" ${1+"$@"}

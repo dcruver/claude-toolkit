@@ -548,10 +548,17 @@ _okf_help_subcommands() { # help text on stdin
   ' | sort -u
 }
 
+# The entries of one of bin/okf's top-level array literals, one per line and in
+# the order the script writes them: what the script itself claims, as against
+# what SPEC.md says. Prints nothing if there is no such array, which every
+# caller has to treat as a failure rather than as an empty list.
+_okf_bin_array() { # $1 = array name
+  sed -n "s/^$1=(\(.*\))\$/\1/p" "$TOOLKIT_ROOT/bin/okf" | tr ' ' '\n' | sed '/^$/d'
+}
+
 # The names bin/okf's dispatch accepts, read out of its OKF_SUBCOMMANDS array.
 _okf_dispatch_subcommands() {
-  sed -n 's/^OKF_SUBCOMMANDS=(\(.*\))$/\1/p' "$TOOLKIT_ROOT/bin/okf" \
-    | tr ' ' '\n' | sort -u
+  _okf_bin_array OKF_SUBCOMMANDS | sort -u
 }
 
 # The usage portion of a subcommand's SPEC.md §7 line — the name and its flags,
@@ -589,8 +596,10 @@ _okf_probe_dispatch() { # $1.. = subcommand names
 
   # `embed` and `search` are Tier B and reach for HTTP once implemented, and
   # this fixture has no okf.json to point them somewhere harmless. SPEC.md §10
-  # forbids the suite touching the network at all, so shadow curl with a stub
-  # that records the attempt and fails — the guard stays even if some later
+  # forbids the suite touching the network at all, so shadow every tool okf
+  # would speak HTTP with — bin/okf's own OKF_TIER_B_TOOLS, so a second one
+  # added there is stubbed too rather than left to dial out unobserved — with a
+  # stub that records the attempt and fails. The guard stays even if some later
   # config-resolution change stops those two exiting early.
   local fakebin marker
   fakebin="$(mktemp -d "${TMPDIR:-/tmp}/toolkit-fakebin.XXXXXX")" || {
@@ -600,13 +609,27 @@ _okf_probe_dispatch() { # $1.. = subcommand names
   # Registered the way with_fixture_repo registers its copies, so an interrupted
   # run takes it with everything else rather than leaving it in TMPDIR.
   printf '%s\n' "$fakebin" >> "$HARNESS_STATE/fixture_dirs"
-  marker="$fakebin/curl-was-called"
-  cat > "$fakebin/curl" <<FAKE_CURL
+  marker="$fakebin/tier-b-tool-was-called"
+  local -a tier_b_tools=()
+  local tb_tool
+  while IFS= read -r tb_tool; do
+    [ -n "$tb_tool" ] && tier_b_tools+=("$tb_tool")
+  done < <(_okf_bin_array OKF_TIER_B_TOOLS)
+  if [ "${#tier_b_tools[@]}" -eq 0 ]; then
+    _fail "bin/okf lists the tools its Tier B subcommands speak HTTP with" \
+      "no OKF_TIER_B_TOOLS array in bin/okf, or it is empty, so this probe" \
+      "cannot stub what it has to keep off the network"
+    rm -rf "$fakebin"
+    return 1
+  fi
+  for tb_tool in "${tier_b_tools[@]}"; do
+    cat > "$fakebin/$tb_tool" <<FAKE_TOOL
 #!/usr/bin/env bash
-printf '%s\n' "\$*" >> "$marker"
+printf '%s %s\n' "$tb_tool" "\$*" >> "$marker"
 exit 1
-FAKE_CURL
-  chmod +x "$fakebin/curl"
+FAKE_TOOL
+    chmod +x "$fakebin/$tb_tool"
+  done
   local saved_path="$PATH"
   PATH="$fakebin:$PATH"
 
@@ -640,7 +663,7 @@ FAKE_CURL
 
   if [ -s "$marker" ]; then
     _fail "no okf invocation in the probe tries to reach the network" \
-      "curl was called, with:" "$(cat "$marker")"
+      "a Tier B tool was called, with:" "$(cat "$marker")"
   else
     _pass "no okf invocation in the probe tries to reach the network"
   fi
@@ -723,11 +746,12 @@ test_okf_help_lists_every_spec_subcommand() {
     return 1
   fi
 
-  # Help needs nothing but bash and cat today, so its exit status is asserted
-  # outright. SPEC.md §3's preflight does not exist yet; the PLAN.md item that
-  # adds it owns the interaction, and has two honest ways to keep this passing:
-  # exempt -h/--help from the preflight, or narrow this to the case where the
-  # required tools are present.
+  # SPEC.md §3's preflight runs ahead of help and does not exempt it, so this
+  # asserts 0 on the strength of every required tool being installed here. On a
+  # machine missing one it fails by design, alongside every other okf test —
+  # which is the whole point of a preflight. The preflight's own behaviour with
+  # a tool missing is exercised by test_okf_preflight_names_every_missing_tool,
+  # against a PATH built for the purpose.
   assert_exit 0 "$okf" --help
 
   # Captured again with the two streams kept apart, because assert_exit merges
@@ -811,6 +835,528 @@ test_okf_help_lists_every_spec_subcommand() {
   # -h is the same help on stdout, exiting 0: asking for help is not an error.
   assert_exit 0 "$okf" -h
   assert_eq "$help" "$(last_output)" "okf -h prints the same help as --help"
+}
+
+# The tools SPEC.md §3 says bin/okf needs, one per line as "<tier> <name>":
+# tier A for the ones every invocation needs, tier B for the ones §3 qualifies
+# with "for Tier B only". Read back out of the prose rather than restated here,
+# so a tool added to the spec and not to bin/okf fails as a missing tool
+# instead of quietly never being checked.
+_okf_spec_tools() {
+  awk '
+    /^## 3\./ { in_section = 1; next }
+    in_section && /^## / { exit }
+    in_section { text = text " " $0 }
+    END {
+      # The requirements sentence, from "requires" to the first full stop.
+      # Nothing between the two is a period, so [^.]* cannot overshoot the end
+      # of the sentence and swallow the paragraphs after it.
+      if (!match(text, /requires[^.]*\./)) exit
+      n = split(substr(text, RSTART, RLENGTH), part, "`")
+      # Splitting on backticks puts the quoted tool names at the even indices
+      # and the prose between them at the odd ones — and it is that prose which
+      # says whether the name it introduces is Tier B only. The qualifier is
+      # sticky: it comes last in the sentence and governs everything after it,
+      # so "for Tier B only — `curl` and `wget`" is two Tier B tools and not
+      # one of each. Classifying a tool as hard is the costly direction — it
+      # would have bin/okf refuse to run without something Tier A never needs.
+      tier = "A"
+      for (i = 2; i <= n; i += 2) {
+        if (part[i - 1] ~ /Tier B only/) tier = "B"
+        print tier " " part[i]
+      }
+    }
+  ' "$TOOLKIT_ROOT/SPEC.md"
+}
+
+_okf_spec_tools_in_tier() { # $1 = A or B
+  _okf_spec_tools | awk -v tier="$1" '$1 == tier { print $2 }' | sort -u
+}
+
+# The subcommands bin/okf's help calls Tier B: every SPEC.md §7 subcommand name
+# that appears in the help's Tier B line. Tier B is a wider set than the
+# subcommands that speak HTTP — SPEC.md §9 has `okf chunk` split a concept body
+# locally — and the tests below need both to tell one from the other.
+_okf_help_tier_b_subcommands() {
+  local line name
+  line="$("$TOOLKIT_ROOT/bin/okf" --help | grep 'are Tier B')"
+  # Only the subjects of the sentence: what follows "are Tier B" is what they
+  # need, and that mentions an `index` block — which would otherwise be read as
+  # the `index` subcommand being Tier B, and it is not.
+  line="${line%%are Tier B*}"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    if printf '%s\n' "$line" | grep -Fqw -- "$name"; then
+      printf '%s\n' "$name"
+    fi
+  done < <(_okf_spec_subcommands)
+}
+
+# bin/okf run with PATH replaced by a probe directory. Restricting PATH is the
+# only honest way to make a tool missing: bin/okf finds its tools with
+# `command -v`, and nothing can hide one that is still on PATH.
+_okf_with_path() { # $1 = PATH to run under, $2.. = okf arguments
+  local path="$1"
+  shift
+  PATH="$path" "$TOOLKIT_ROOT/bin/okf" ${1+"$@"}
+}
+
+# Fills a directory with symlinks to exactly the named commands, resolved on the
+# real PATH, and returns non-zero if any of them is not installed here.
+#
+# bash comes along whatever the caller asks for, and it is the only thing that
+# does: the shebang resolves bash on PATH, so a probe directory without it
+# would fail the run before the script started, for a reason that has nothing
+# to do with the preflight. Nothing else is smuggled in — a probe PATH holding
+# more than SPEC.md §3's tools would hide bin/okf reaching for one that is not
+# on that list.
+_okf_probe_path() { # $1 = directory, $2.. = command names
+  local dir="$1" tool path
+  shift
+  mkdir -p "$dir" || return 1
+  for tool in bash "$@"; do
+    path="$(command -v -- "$tool" 2> /dev/null)" || return 1
+    [ -n "$path" ] || return 1
+    ln -sf "$path" "$dir/$tool" || return 1
+  done
+  return 0
+}
+
+# Whether a message names a tool, as a word. Substring matching would read
+# "gawk" as a mention of "awk", and telling a tool that is missing from one
+# that is merely a suffix of it is the entire job of the checks below.
+_okf_names_tool() { # $1 = text, $2 = tool name
+  printf '%s\n' "$1" | grep -Fqw -- "$2"
+}
+
+_okf_assert_names_tool() { # $1 = text, $2 = tool name, $3 = description
+  if _okf_names_tool "$1" "$2"; then
+    _pass "$3"
+    return 0
+  fi
+  local -a detail=("looked for the word: $2" "in:")
+  local line
+  while IFS= read -r line; do detail+=("$line"); done < <(_detail_lines "$1")
+  _fail "$3" "${detail[@]}"
+}
+
+# The number of non-empty lines in a blob — "a single line" is the whole point
+# of SPEC.md §3's preflight message, so it gets counted rather than eyeballed.
+_okf_line_count() { # $1 = text
+  printf '%s\n' "$1" | grep -c . || true
+}
+
+# SPEC.md §3 is the list of prerequisites, so bin/okf's own list is compared
+# against it rather than against a copy written out here.
+test_okf_preflight_requires_exactly_the_spec_tools() {
+  local okf="$TOOLKIT_ROOT/bin/okf"
+  if [ ! -x "$okf" ]; then
+    _fail "bin/okf is an executable script" "missing or not executable: $okf"
+    return 1
+  fi
+
+  local spec_hard spec_tier_b
+  spec_hard="$(_okf_spec_tools_in_tier A)"
+  spec_tier_b="$(_okf_spec_tools_in_tier B)"
+
+  # Guards the extraction: were §3's sentence reworded past it, the comparisons
+  # below would compare two empty lists and pass without checking anything.
+  if [ -z "$spec_hard" ]; then
+    _fail "SPEC.md §3 names the tools bin/okf requires" \
+      "extracted no tool names from the runtime prerequisites section"
+    return 1
+  fi
+  if [ -z "$spec_tier_b" ]; then
+    _fail "SPEC.md §3 names a tool as needed for Tier B only" \
+      "extracted no Tier B tool names from the runtime prerequisites section"
+    return 1
+  fi
+  # The two SPEC.md §3 calls hard, and the two this item exists to pin.
+  _okf_assert_names_tool "$spec_hard" jq "SPEC.md §3 requires jq of every invocation"
+  _okf_assert_names_tool "$spec_hard" rg "SPEC.md §3 requires rg of every invocation"
+
+  assert_eq "$spec_hard" "$(_okf_bin_array OKF_REQUIRED_TOOLS | sort -u)" \
+    "bin/okf requires exactly the tools SPEC.md §3 lists, and no others"
+  assert_eq "$spec_tier_b" "$(_okf_bin_array OKF_TIER_B_TOOLS | sort -u)" \
+    "bin/okf holds back exactly SPEC.md §3's Tier B tools for Tier B"
+
+  # Which subcommands reach for those tools is load-bearing for the preflight:
+  # a name missing from that list is a subcommand that would sail past the
+  # check and fail mid-HTTP for want of curl instead.
+  local -a http_subs=()
+  local name
+  while IFS= read -r name; do
+    [ -n "$name" ] && http_subs+=("$name")
+  done < <(_okf_bin_array OKF_HTTP_SUBCOMMANDS)
+  if [ "${#http_subs[@]}" -eq 0 ]; then
+    _fail "bin/okf lists the subcommands that speak HTTP" \
+      "no OKF_HTTP_SUBCOMMANDS array in bin/okf, or it is empty"
+    return 1
+  fi
+
+  # Pinned literally, and the one thing here that is: every other check in this
+  # test reads the same array the preflight does, so on this question it could
+  # only ever agree with itself — the two mutations that matter, chunk added
+  # and search dropped, both pass otherwise. The authority is SPEC.md §9, which
+  # is prose and not a list a test can parse: Qdrant over REST is embed and
+  # search, and chunk splits a concept body locally.
+  assert_eq "$(printf '%s\n' embed search)" \
+    "$(_okf_bin_array OKF_HTTP_SUBCOMMANDS | sort -u)" \
+    "bin/okf demands its HTTP tools of exactly embed and search"
+
+  # Cross-checked against the two places that already had to know: dispatch,
+  # which must recognise the name at all, and the help, which tells the user
+  # which subcommands are Tier B. Speaking HTTP is a narrower thing than being
+  # Tier B — SPEC.md §9 has `okf chunk` split a concept body locally — so this
+  # is containment, not equality.
+  local dispatch help_tier_b
+  dispatch="$(_okf_dispatch_subcommands)"
+  help_tier_b="$(_okf_help_tier_b_subcommands)"
+  if [ -z "$help_tier_b" ]; then
+    _fail "okf --help says which subcommands are Tier B" \
+      "no SPEC.md §7 subcommand name appears in the help's Tier B line"
+    return 1
+  fi
+  for name in "${http_subs[@]}"; do
+    assert_contains "$dispatch" "$name" \
+      "bin/okf's HTTP subcommand $name is a subcommand at all"
+    _okf_assert_names_tool "$help_tier_b" "$name" "okf --help calls $name Tier B"
+  done
+  return 0
+}
+
+# SPEC.md §3: a preflight on every invocation, exiting 1 with a single line
+# naming exactly which required tools are missing.
+test_okf_preflight_names_every_missing_tool() {
+  local okf="$TOOLKIT_ROOT/bin/okf"
+  if [ ! -x "$okf" ]; then
+    _fail "bin/okf is an executable script" "missing or not executable: $okf"
+    return 1
+  fi
+
+  local -a hard=() tier_b=()
+  local name
+  while IFS= read -r name; do
+    [ -n "$name" ] && hard+=("$name")
+  done < <(_okf_spec_tools_in_tier A)
+  while IFS= read -r name; do
+    [ -n "$name" ] && tier_b+=("$name")
+  done < <(_okf_spec_tools_in_tier B)
+  # Same guard as the test above, and for the same reason: an empty list here
+  # would turn every loop below into one that runs no checks at all. Bailing
+  # rather than continuing, because "${hard[@]}" on an empty array aborts the
+  # whole run under `set -u` on bash 3.2.
+  if [ "${#hard[@]}" -eq 0 ] || [ "${#tier_b[@]}" -eq 0 ]; then
+    _fail "SPEC.md §3 names the tools bin/okf requires" \
+      "extracted no tool names from the runtime prerequisites section"
+    return 1
+  fi
+
+  local root
+  root="$(mktemp -d "${TMPDIR:-/tmp}/toolkit-preflight.XXXXXX")" || {
+    _fail "okf preflight probe" "mktemp -d failed"
+    return 1
+  }
+  # Registered the way with_fixture_repo registers its copies, so an interrupted
+  # run takes it with everything else rather than leaving it in TMPDIR.
+  printf '%s\n' "$root" >> "$HARNESS_STATE/fixture_dirs"
+
+  # The control. $root/all holds every tool §3 requires of every invocation and
+  # nothing else — no curl, because that one is Tier B's. Without this, each
+  # check below would pass just as happily against a probe PATH so broken that
+  # okf could never have run at all.
+  if ! _okf_probe_path "$root/all" "${hard[@]}"; then
+    _fail "a probe PATH holding every required tool can be built" \
+      "a tool SPEC.md §3 requires is not installed here, so a tool this test" \
+      "removes cannot be told from one that was never there"
+    return 1
+  fi
+  assert_exit 0 _okf_with_path "$root/all" --help
+  assert_contains "$(last_output)" "Subcommands:" \
+    "okf runs on a PATH holding nothing but the tools SPEC.md §3 requires"
+
+  local tool other out dir
+  for tool in "${hard[@]}"; do
+    if [ "$tool" = bash ]; then
+      # Not provable by removal: the shebang resolves bash on PATH, so a probe
+      # PATH without it never starts the script and never reaches the
+      # preflight. bin/okf takes the interpreter it is running under as proof
+      # enough, which is the same argument from the other side.
+      _skip "okf names bash when it is missing" "the script cannot start without bash"
+      continue
+    fi
+
+    dir="$root/without-$tool"
+    local -a present=()
+    for other in "${hard[@]}"; do
+      [ "$other" = "$tool" ] || present+=("$other")
+    done
+    # Guarded like every other array expansion here: an empty one under `set -u`
+    # aborts the whole run on bash 3.2 rather than failing a single check.
+    if [ "${#present[@]}" -eq 0 ]; then
+      _fail "a probe PATH without $tool can be built" \
+        "removing $tool left no tools to put on it"
+      continue
+    fi
+    if ! _okf_probe_path "$dir" "${present[@]}"; then
+      _fail "a probe PATH without $tool can be built" "could not populate $dir"
+      continue
+    fi
+
+    assert_exit 1 _okf_with_path "$dir" list
+    out="$(last_output)"
+    assert_eq 1 "$(_okf_line_count "$out")" \
+      "okf says so in a single line when $tool is missing"
+    _okf_assert_names_tool "$out" "$tool" "that line names the missing tool $tool"
+
+    # The preflight got there first, so nothing had the chance to half-do its
+    # work and only then discover the tool it needed was not there. Probed with
+    # a name dispatch is bound to reject: "unknown subcommand" is what bin/okf
+    # says whenever dispatch is reached at all, which will still be true long
+    # after the subcommands stop being stubs — as a check for a stub's own
+    # "not implemented" would not.
+    local probe
+    probe="$(_okf_with_path "$dir" definitely-not-a-subcommand 2>&1)" || true
+    case "$probe" in
+      *"unknown subcommand"*)
+        _fail "okf runs its preflight ahead of dispatch" \
+          "with $tool missing, dispatch ran anyway:" "$probe"
+        ;;
+      *) _pass "okf runs its preflight ahead of dispatch" ;;
+    esac
+
+    # "exactly which tools are missing" — naming an installed one sends someone
+    # off to install what they already have.
+    local named_others=""
+    for other in "${hard[@]}"; do
+      [ "$other" = "$tool" ] && continue
+      if _okf_names_tool "$out" "$other"; then
+        named_others="${named_others:+$named_others }$other"
+      fi
+    done
+    if [ -n "$named_others" ]; then
+      _fail "that line names only the tool that is missing" \
+        "with only $tool removed, the line also named: $named_others" "$out"
+    else
+      _pass "that line names only the tool that is missing"
+    fi
+  done
+
+  # Two at once, on one line. SPEC.md §3 singles out jq and rg as the hard
+  # requirements, and being told to install jq, installing it, and only then
+  # being told about rg is the failure mode a single line replaces.
+  local -a without_jq_rg=()
+  for other in "${hard[@]}"; do
+    case "$other" in
+      jq | rg) ;;
+      *) without_jq_rg+=("$other") ;;
+    esac
+  done
+  if [ "${#without_jq_rg[@]}" -eq 0 ]; then
+    _fail "a probe PATH without jq and rg can be built" \
+      "removing jq and rg left no tools to put on it"
+  elif _okf_probe_path "$root/without-jq-rg" "${without_jq_rg[@]}"; then
+    assert_exit 1 _okf_with_path "$root/without-jq-rg" list
+    out="$(last_output)"
+    assert_eq 1 "$(_okf_line_count "$out")" "two missing tools are named on one line"
+    _okf_assert_names_tool "$out" jq "that line names jq"
+    _okf_assert_names_tool "$out" rg "that line names rg"
+  else
+    _fail "a probe PATH without jq and rg can be built" \
+      "could not populate $root/without-jq-rg"
+  fi
+
+  # "on every invocation": --help is not exempt, and neither is a bare `okf`.
+  # Someone whose okf cannot run is better served by the name of the tool to
+  # install than by a page describing subcommands that would every one of them
+  # fail on the way to doing anything.
+  local help_out help_err="$HARNESS_STATE/okf_preflight_stderr"
+  if [ "${#without_jq_rg[@]}" -eq 0 ]; then
+    _fail "a probe PATH without jq can be built" \
+      "removing jq and rg left no tools to put on it"
+  elif _okf_probe_path "$root/help-without-jq" "${without_jq_rg[@]}" rg; then
+    help_out="$(_okf_with_path "$root/help-without-jq" --help 2> "$help_err")"
+    local help_rc=$?
+    assert_eq 1 "$help_rc" "okf --help exits 1 when a required tool is missing"
+    out="$(cat "$help_err")"
+    _okf_assert_names_tool "$out" jq "okf --help names the missing tool, on stderr"
+    assert_eq 1 "$(_okf_line_count "$out")" "okf --help says it in a single line"
+    assert_eq "" "$help_out" "okf --help prints no help on stdout when a tool is missing"
+
+    assert_exit 1 _okf_with_path "$root/help-without-jq"
+    out="$(last_output)"
+    _okf_assert_names_tool "$out" jq "a bare invocation names the missing tool too"
+    case "$out" in
+      *"Subcommands:"*)
+        _fail "a bare invocation prints no help when a tool is missing" "$out"
+        ;;
+      *) _pass "a bare invocation prints no help when a tool is missing" ;;
+    esac
+  else
+    _fail "a probe PATH without jq can be built" "could not populate $root/help-without-jq"
+  fi
+  rm -f "$help_err"
+
+  # SPEC.md §3 needs curl for Tier B only, so its absence has to degrade okf to
+  # Tier A rather than stop it. `okf --help` on $root/all — which has no curl —
+  # already exited 0 above; what is left is that a Tier A subcommand does not
+  # send its caller off to install curl either.
+  # The status is deliberately not asserted: `okf list` exits 1 only while it
+  # is a stub, and what is being checked here is what it says, not that it
+  # failed. It must get past the preflight — which the control above, `okf
+  # --help` exiting 0 on this same curl-less PATH, has already shown.
+  out="$(_okf_with_path "$root/all" list 2>&1)" || true
+  local tb_tool named_tier_b=""
+  for tb_tool in "${tier_b[@]}"; do
+    if _okf_names_tool "$out" "$tb_tool"; then
+      named_tier_b="${named_tier_b:+$named_tier_b }$tb_tool"
+    fi
+  done
+  if [ -n "$named_tier_b" ]; then
+    _fail "a Tier A subcommand asks for no Tier B tool" \
+      "okf list, with no curl on PATH, named: $named_tier_b" "$out"
+  else
+    _pass "a Tier A subcommand asks for no Tier B tool"
+  fi
+
+  # ...and that the subcommands which cannot work without it say so.
+  local -a http_subs=()
+  while IFS= read -r name; do
+    [ -n "$name" ] && http_subs+=("$name")
+  done < <(_okf_bin_array OKF_HTTP_SUBCOMMANDS)
+  if [ "${#http_subs[@]}" -eq 0 ]; then
+    _fail "bin/okf lists the subcommands that speak HTTP" \
+      "no OKF_HTTP_SUBCOMMANDS array in bin/okf, or it is empty"
+    return 1
+  fi
+
+  local sub
+  for sub in "${http_subs[@]}"; do
+    assert_exit 1 _okf_with_path "$root/all" "$sub"
+    out="$(last_output)"
+    assert_eq 1 "$(_okf_line_count "$out")" \
+      "okf $sub says what it is missing in a single line"
+    for tb_tool in "${tier_b[@]}"; do
+      _okf_assert_names_tool "$out" "$tb_tool" "okf $sub names the missing $tb_tool"
+    done
+  done
+
+  # A Tier B subcommand that speaks no HTTP is not asked for curl either:
+  # SPEC.md §9 has `okf chunk` split a concept body into JSON locally, and
+  # nothing about that needs a network tool. The status is not asserted —
+  # SPEC.md §7 has Tier B exit 2 without an `index` block, which this
+  # okf.json-less directory has not got.
+  # Pinned literally, for the same reason the HTTP set is: the Tier B
+  # subcommands come out of bin/okf's own help, so dropping chunk from that
+  # sentence would leave this loop iterating over the HTTP subcommands alone
+  # and skipping every check below in silence. SPEC.md §7 marks chunk and embed
+  # Tier B and §9 puts search's Qdrant query there too.
+  assert_eq "$(printf '%s\n' chunk embed search)" "$(_okf_help_tier_b_subcommands)" \
+    "okf --help calls exactly chunk, embed and search Tier B"
+
+  # The Tier B subcommands that are not HTTP ones — which is the whole point of
+  # keeping the two lists apart, so there had better be one.
+  local -a local_only=()
+  local tier_b_sub
+  while IFS= read -r tier_b_sub; do
+    [ -n "$tier_b_sub" ] || continue
+    case " ${http_subs[*]} " in
+      *" $tier_b_sub "*) continue ;;
+    esac
+    local_only+=("$tier_b_sub")
+  done < <(_okf_help_tier_b_subcommands)
+  if [ "${#local_only[@]}" -eq 0 ]; then
+    _fail "a Tier B subcommand speaks no HTTP" \
+      "every subcommand okf --help calls Tier B is also in OKF_HTTP_SUBCOMMANDS," \
+      "so nothing is left to show that being Tier B is not what demands curl"
+    return 1
+  fi
+
+  for tier_b_sub in "${local_only[@]}"; do
+    out="$(_okf_with_path "$root/all" "$tier_b_sub" 2>&1)" || true
+    named_tier_b=""
+    for tb_tool in "${tier_b[@]}"; do
+      if _okf_names_tool "$out" "$tb_tool"; then
+        named_tier_b="${named_tier_b:+$named_tier_b }$tb_tool"
+      fi
+    done
+    if [ -n "$named_tier_b" ]; then
+      _fail "okf $tier_b_sub asks for no HTTP tool it never uses" \
+        "with no curl on PATH, okf $tier_b_sub named: $named_tier_b" "$out"
+    else
+      _pass "okf $tier_b_sub asks for no HTTP tool it never uses"
+    fi
+  done
+
+  # SPEC.md §9's exception, which the same reasoning reaches from the other
+  # side: `okf search --hyde-prompt` prints a prompt for the slash command to
+  # answer and exits without reaching Qdrant, so curl is not its to demand
+  # either. The status is not asserted — today it is a stub that exits 1, and
+  # once implemented it prints its prompt and exits 0.
+  out="$(_okf_with_path "$root/all" search --hyde-prompt 2>&1)" || true
+  named_tier_b=""
+  for tb_tool in "${tier_b[@]}"; do
+    if _okf_names_tool "$out" "$tb_tool"; then
+      named_tier_b="${named_tier_b:+$named_tier_b }$tb_tool"
+    fi
+  done
+  if [ -n "$named_tier_b" ]; then
+    _fail "okf search --hyde-prompt asks for no HTTP tool it never uses" \
+      "with no curl on PATH, it named: $named_tier_b" "$out"
+  else
+    _pass "okf search --hyde-prompt asks for no HTTP tool it never uses"
+  fi
+
+  # Past a `--` the same word is the query text, and a query does have to reach
+  # Qdrant — so this one is held to curl like any other search.
+  assert_exit 1 _okf_with_path "$root/all" search -- --hyde-prompt
+  out="$(last_output)"
+  for tb_tool in "${tier_b[@]}"; do
+    _okf_assert_names_tool "$out" "$tb_tool" \
+      "okf search -- --hyde-prompt is a query, and still needs $tb_tool"
+  done
+
+  # And with the Tier B tools present they get past the preflight. Their curl
+  # is a stub that records the call and fails: SPEC.md §10 forbids this suite
+  # touching the network, and a real curl here would be one implemented Tier B
+  # subcommand away from doing exactly that.
+  local marker="$root/curl-was-called"
+  if ! _okf_probe_path "$root/tier-b" "${hard[@]}"; then
+    _fail "a probe PATH for Tier B can be built" "could not populate $root/tier-b"
+    return 1
+  fi
+  for tb_tool in "${tier_b[@]}"; do
+    # Removed first, not overwritten: _okf_probe_path may have just symlinked
+    # this name to the real binary, and a redirection would write straight
+    # through the symlink and truncate whatever it points at on the real PATH.
+    rm -f "$root/tier-b/$tb_tool"
+    cat > "$root/tier-b/$tb_tool" <<FAKE_TOOL
+#!/usr/bin/env bash
+printf '%s %s\n' "$tb_tool" "\$*" >> "$marker"
+exit 1
+FAKE_TOOL
+    chmod +x "$root/tier-b/$tb_tool"
+  done
+  for sub in "${http_subs[@]}"; do
+    # The exit status is deliberately not asserted: SPEC.md §7 has Tier B exit
+    # 2 without an `index` block in okf.json, and this fixture-less directory
+    # has no okf.json at all. What is asserted is that whatever it says, it is
+    # no longer the preflight talking.
+    out="$(_okf_with_path "$root/tier-b" "$sub" 2>&1)" || true
+    case "$out" in
+      *"missing required"*)
+        _fail "okf $sub gets past the preflight once its tools are installed" "$out"
+        ;;
+      *) _pass "okf $sub gets past the preflight once its tools are installed" ;;
+    esac
+  done
+  if [ -s "$marker" ]; then
+    _fail "no okf invocation in this test tries to reach the network" \
+      "a Tier B tool was called, with:" "$(cat "$marker")"
+  else
+    _pass "no okf invocation in this test tries to reach the network"
+  fi
+  return 0
 }
 
 # --- add new test_* functions above this line ------------------------------
