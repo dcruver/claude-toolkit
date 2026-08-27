@@ -7550,8 +7550,18 @@ _okf_verify_appends_probe() {
   at="$(_okf_last_verified_at "$concept")"
   _okf_assert_stamped_now "$before" "$after" "$at" \
     "the appended entry carries the instant the run was made at"
-  assert_eq "verified $concept by human:reviewer at $at" "$OKF_VERIFY_OUT" \
+  assert_eq "verified $concept by human:reviewer at $at" "${OKF_VERIFY_OUT%%$'\n'*}" \
     "and stdout names the concept, the actor and that same instant"
+
+  # SPEC.md §8's tier on the line below it, which is the other half of what this
+  # run decided. Only that there is one, and that stdout is those two lines and
+  # nothing else: which tier, and why, is
+  # test_okf_verify_reports_the_trust_tier's, where the instants being compared
+  # are ones the test wrote rather than ones the clock supplied.
+  assert_eq "2" "$(printf '%s\n' "$OKF_VERIFY_OUT" | grep -c .)" \
+    "and stdout is that line and one more, and nothing else"
+  assert_contains "$OKF_VERIFY_OUT" "trust: " \
+    "the second naming the trust tier the entry leaves the concept at"
 
   # SPEC.md §8's sentence, asserted as the whole list rather than as a count:
   # the two entries the fixture came with are still there, still in order, and
@@ -8005,6 +8015,240 @@ _okf_verify_clock_probe() {
 test_okf_verify_names_the_clock_it_needs() {
   _okf_preconditions || return 1
   with_fixture_repo concepts _okf_verify_clock_probe
+}
+
+# SPEC.md §8's trust tier, printed by the run that has just changed it.
+#
+# Every rule in §8 turns on comparing two instants, so almost nothing here uses
+# the fixture's own: a concept written by this test carries the `generated.at`
+# the case needs, and the review being compared against it is the one `okf
+# verify` stamps with the real clock. That way a machine whose clock says 2019,
+# or 2031, gets the same answers as this one.
+
+# The tier off one verify's stdout, and nothing else that was printed on it.
+_okf_trust_line() { # $1 = an okf verify stdout
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      "trust: "*) printf '%s\n' "${line#"trust: "}" ;;
+    esac
+  done <<< "$1"
+}
+
+# One verify, and the tier it reported for the concept afterwards.
+#
+# The status is asserted first and separately: a refused run prints no tier at
+# all, and comparing an empty string against `Human-reviewed` would report the
+# tier as wrong when what happened is that the run never got there.
+_okf_assert_trust() { # $1 = expected tier, $2 = description, $3.. = arguments after `verify`
+  local want="$1" what="$2"
+  shift 2
+  _okf_verify "$@"
+  if [ "$OKF_VERIFY_RC" -ne 0 ]; then
+    _fail "$what" "okf verify exited $OKF_VERIFY_RC rather than 0" \
+      "stderr: $OKF_VERIFY_ERR"
+    return 1
+  fi
+  assert_eq "$want" "$(_okf_trust_line "$OKF_VERIFY_OUT")" "$what"
+}
+
+# A concept carrying exactly the fields SPEC.md §8's rules read, with the
+# instant and the digest this case wants in them. Written rather than edited
+# into a fixture because the whole point is that the values being compared are
+# the test's own.
+_okf_trust_concept() { # $1 = path, $2 = resource, $3 = generated.at or "", $4 = code.content_hash or ""
+  local path="$1" resource="$2" generated="$3" hash="$4"
+  {
+    printf -- '---\n'
+    printf 'type: Class\n'
+    printf 'title: %s\n' "${path##*/}"
+    printf 'resource: %s\n' "$resource"
+    printf 'status: stable\n'
+    if [ -n "$generated" ]; then
+      printf 'generated:\n'
+      printf '  by: claude-code/opus-5\n'
+      printf '  at: %s\n' "$generated"
+    fi
+    if [ -n "$hash" ]; then
+      printf 'code:\n'
+      printf '  language: java\n'
+      printf '  content_hash: "%s"\n' "$hash"
+    fi
+    printf -- '---\n'
+    printf '\n# Responsibilities\n\nWritten by tests/toolkit.sh.\n'
+  } > "$path"
+}
+
+_okf_verify_trust_probe() {
+  local source="src/route/RouteSource.java"
+  local clean zeros="sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+  clean="sha256:$(sha256sum < "$source" | awk '{print $1}')"
+
+  # §8's third tier, earned: a `human:` entry stamped now, on a concept
+  # generated long before it, whose source still hashes to what it stored.
+  _okf_trust_concept src/route/Fresh.md "/$source" 1970-01-01T00:00:00Z "$clean"
+  _okf_assert_trust "Human-reviewed" \
+    "a human review of an undrifted concept generated before it is Human-reviewed" \
+    src/route/Fresh.md --by human:reviewer
+  assert_eq "" "$OKF_VERIFY_ERR" \
+    "and nothing is said on stderr, because there is nothing about it to explain"
+
+  # The tier is the concept's and not the entry's: a machine confirming a
+  # concept a human has already reviewed does not take that review away. This is
+  # the case a run that graded only the entry it just appended would get wrong.
+  _okf_assert_trust "Human-reviewed" \
+    "a machine entry on a concept a human has reviewed leaves it Human-reviewed" \
+    src/route/Fresh.md --by process:okf/0.2
+
+  # §8's second tier: verified, and by nobody whose actor begins `human:`.
+  _okf_trust_concept src/route/Machine.md "/$source" 1970-01-01T00:00:00Z "$clean"
+  _okf_assert_trust "Machine-confirmed" \
+    "a concept verified only by a non-human actor is Machine-confirmed" \
+    src/route/Machine.md --by process:okf/0.2
+  assert_eq "" "$OKF_VERIFY_ERR" \
+    "with no note either, because that is the ordinary outcome and not a degradation"
+
+  # PLAN.md's first degradation: the concept has drifted, so the review is of
+  # prose describing a source that has since changed.
+  _okf_trust_concept src/route/Drifted.md "/$source" 1970-01-01T00:00:00Z "$zeros"
+  _okf_assert_trust "Machine-confirmed" \
+    "a human review of a drifted concept degrades to Machine-confirmed" \
+    src/route/Drifted.md --by human:reviewer
+  assert_contains "$OKF_VERIFY_ERR" "drifted" \
+    "and stderr says drift is why, so the degradation is not silent"
+
+  # PLAN.md's second: the entry predates `generated.at`, which is what a
+  # regeneration since the review looks like. Written as an instant no clock
+  # will reach rather than by moving the review, because the review's instant is
+  # the one thing here that okf supplies.
+  _okf_trust_concept src/route/Regenerated.md "/$source" 9999-12-31T23:59:59Z "$clean"
+  _okf_assert_trust "Machine-confirmed" \
+    "a human review predating generated.at degrades to Machine-confirmed" \
+    src/route/Regenerated.md --by human:reviewer
+  assert_contains "$OKF_VERIFY_ERR" "predates generated.at" \
+    "and stderr says which of the two instants came first"
+
+  # No `generated.at` at all: there is no instant for the review to predate, so
+  # the half of the rule that would degrade it has nothing to say.
+  _okf_trust_concept src/route/Undated.md "/$source" "" "$clean"
+  _okf_assert_trust "Human-reviewed" \
+    "a concept that records no generated.at has nothing for a review to predate" \
+    src/route/Undated.md --by human:reviewer
+
+  # A `generated.at` of some other shape. Nothing in okf parses a date, so this
+  # is a claim that exists and cannot be checked — and an unearned
+  # Human-reviewed is the one answer worth avoiding.
+  _okf_trust_concept src/route/Vague.md "/$source" "yesterday" "$clean"
+  _okf_assert_trust "Machine-confirmed" \
+    "a generated.at okf cannot compare against costs the review its Human-reviewed" \
+    src/route/Vague.md --by human:reviewer
+  assert_contains "$OKF_VERIFY_ERR" "ISO 8601" "saying what it could not read"
+
+  # A drift comparison that could not be made is not drift — `okf check`'s own
+  # rule, which reports these as warnings and never as findings. The tier stands
+  # and stderr says what was not checked, rather than the tier quietly standing
+  # for a check that never happened.
+  _okf_trust_concept src/route/Gone.md "/src/route/Vanished.java" \
+    1970-01-01T00:00:00Z "$zeros"
+  _okf_assert_trust "Human-reviewed" \
+    "a drift check that could not be made does not itself degrade the tier" \
+    src/route/Gone.md --by human:reviewer
+  assert_contains "$OKF_VERIFY_ERR" "could not rule out drift" \
+    "and stderr says the check was not made"
+
+  # The two fixtures written to be hard to read, each carrying a `human:` entry
+  # that is newer than its own `generated.at` and a source that still matches.
+  # Both are verified by a machine here, so the Human-reviewed that comes back
+  # can only have come from the entry already in the file — which is a reader
+  # that paired each actor with its own instant. src/route/Legacy.md is CRLF
+  # with a BOM and quotes every value; src/route/Boundaries.md nests `at:` keys
+  # one level deeper inside its entries, writes its list flush left, and carries
+  # one entry with no `at:` at all.
+  _okf_assert_trust "Human-reviewed" \
+    "a CRLF concept quoting every value is graded on the entry it already carried" \
+    src/route/Legacy.md --by process:okf/0.2
+  _okf_assert_trust "Human-reviewed" \
+    "and so is one whose entries nest instants that belong to nobody" \
+    src/route/Boundaries.md --by process:okf/0.2
+  return 0
+}
+
+test_okf_verify_reports_the_trust_tier() {
+  _okf_preconditions || return 1
+  if ! command -v date > /dev/null 2>&1; then
+    _skip "okf verify reports the trust tier" \
+      "date is not installed here, so there is no clock to record an instant with"
+    return 0
+  fi
+  with_fixture_repo concepts _okf_verify_trust_probe
+}
+
+# §8's first tier, which `okf verify` cannot print: a run that appended an entry
+# has left the concept with one, so `Unverified` is only ever the answer to a
+# question asked of a concept nobody has verified. Asked of concept_trust_tier
+# directly, the way _okf_frontmatter_probe asks read_frontmatter — SPEC.md §7
+# defines no subcommand that prints a tier on its own, and a flag invented to
+# test with would be CLI surface the spec has not got.
+_okf_trust_probe() { # $1 = a concept
+  local probe="$HARNESS_STATE/okf-trust-probe.sh"
+  if [ ! -f "$probe" ]; then
+    cat > "$probe" <<'PROBE'
+#!/usr/bin/env bash
+okf_script="$1"
+concept="$2"
+# shellcheck source=/dev/null
+. "$okf_script"
+
+rc=0
+concept_trust_tier "$concept" || rc=$?
+printf 'status=%s\n' "$rc"
+printf 'tier=%s\n' "$OKF_TRUST_TIER"
+printf 'note=%s\n' "$OKF_TRUST_NOTE"
+PROBE
+    chmod +x "$probe" || return 1
+  fi
+  "$probe" "$TOOLKIT_ROOT/bin/okf" "$1" 2>&1
+}
+
+_okf_trust_field() { # $1 = probe output, $2 = field
+  printf '%s\n' "$1" | sed -n "s/^$2=//p"
+}
+
+_okf_trust_unverified_probe() {
+  local out
+
+  # src/route/RouteSource.md declares almost nothing: no `verified` block, and
+  # so nothing anybody has confirmed.
+  out="$(_okf_trust_probe src/route/RouteSource.md)"
+  assert_eq "0" "$(_okf_trust_field "$out" status)" \
+    "a concept nobody has verified is still one okf can grade"
+  assert_eq "Unverified" "$(_okf_trust_field "$out" tier)" \
+    "and SPEC.md §8's answer for it is Unverified"
+  assert_eq "" "$(_okf_trust_field "$out" note)" \
+    "with no note, because nothing about it needs explaining"
+
+  # An entry with no instant in it is still an entry, and §8's first question is
+  # whether the concept has been verified at all rather than when.
+  printf -- '---\ntype: Class\nresource: /src/route/RouteSource.java\nverified:\n  - by: process:okf/0.2\n---\n' \
+    > src/route/Instantless.md
+  out="$(_okf_trust_probe src/route/Instantless.md)"
+  assert_eq "Machine-confirmed" "$(_okf_trust_field "$out" tier)" \
+    "a verified entry carrying no instant still takes a concept past Unverified"
+
+  # Not a concept at all: a file with no frontmatter has no tier, and 1 rather
+  # than a tier is what says so.
+  out="$(_okf_trust_probe src/route/README.md)"
+  assert_eq "1" "$(_okf_trust_field "$out" status)" \
+    "a file that is not a concept is refused rather than graded"
+  assert_eq "" "$(_okf_trust_field "$out" tier)" \
+    "and no tier is left behind for a caller to read"
+  return 0
+}
+
+test_okf_trust_tier_answers_for_an_unverified_concept() {
+  _okf_preconditions || return 1
+  with_fixture_repo concepts _okf_trust_unverified_probe
 }
 
 # --- add new test_* functions above this line ------------------------------

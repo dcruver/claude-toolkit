@@ -1563,6 +1563,19 @@ clear_frontmatter() {
   # entries are never stripped: a concept accumulates them, and the last one is
   # not the only one that matters. Document order.
   OKF_FM_VERIFIED_AT=()
+  # The actor each of those instants was recorded by, at the same index — and
+  # the number of `verified` entries the block held, which is not the same
+  # number: an entry written with no `at:` leaves nothing in either array.
+  #
+  # `verified[].by` is not on SPEC.md §4's list of fields the shell reads, and
+  # is read all the same because §8's trust rule cannot be computed without it:
+  # "verified only by non-`human:` actors → Machine-confirmed" is a question
+  # about the actor, and an instant on its own cannot answer it. Kept beside
+  # `verified[].at` rather than in a shape of its own so that the pair is one
+  # entry read two ways: OKF_FM_VERIFIED_BY[i] is who recorded
+  # OKF_FM_VERIFIED_AT[i].
+  OKF_FM_VERIFIED_BY=()
+  OKF_FM_VERIFIED_COUNT=0
 }
 clear_frontmatter
 
@@ -1693,10 +1706,16 @@ read_frontmatter() { # $1 = a path to a concept file
   # Where the open `verified` entry's `-` sits, and the column its keys line up
   # in; -1 for "no entry open" and "not established yet" respectively.
   local v_dash=-1 v_key=-1
+  # The open entry's own `by:`: whether one is still awaited, the actor read
+  # before that entry's instant arrived, and the index its instant went to once
+  # it did — see OKF_FM_VERIFIED_BY, and note that `by:` and `at:` come in
+  # either order.
+  local by_pending=0 v_by="" v_at=-1
   local f_type="" f_resource="" f_status="" f_stale_after=""
   local f_generated_at="" f_generated_by=""
   local f_content_hash="" f_tier="" f_symbol="" f_language=""
-  local -a f_verified_at=()
+  local f_verified_count=0
+  local -a f_verified_at=() f_verified_by=()
 
   clear_frontmatter
 
@@ -1741,6 +1760,9 @@ read_frontmatter() { # $1 = a path to a concept file
         # tell has drifted.
         block=""
         pending=0
+        by_pending=0
+        v_by=""
+        v_at=-1
         v_dash=-1
         v_key=-1
         case "$line" in
@@ -1885,6 +1907,17 @@ read_frontmatter() { # $1 = a path to a concept file
                     v_key=-1
                   fi
                   pending=1
+                  by_pending=1
+                  v_by=""
+                  v_at=-1
+                  # Counted here and nowhere else: this is the one place a
+                  # `verified` entry is known to have begun, and SPEC.md §8's
+                  # first question — is there a verified entry at all — is asked
+                  # of entries and not of the instants they carry. An entry
+                  # written with no `at:` leaves no instant behind, and a
+                  # concept whose only entry is that one has still been
+                  # verified by somebody.
+                  f_verified_count=$((f_verified_count + 1))
                 else
                   # Deeper than this entry's own `-`: a list nested inside it.
                   rest=""
@@ -1914,11 +1947,32 @@ read_frontmatter() { # $1 = a path to a concept file
                   frontmatter_scalar "${rest#"at:"}"
                   if [ -n "$OKF_FRONTMATTER_SCALAR" ]; then
                     f_verified_at+=("$OKF_FRONTMATTER_SCALAR")
+                    # The slot this entry's instant landed in, so a `by:` on a
+                    # later line of the same entry knows where to put itself —
+                    # and filled now with whatever `by:` came before it, so the
+                    # two arrays stay the same length whichever order the entry
+                    # writes its keys in.
+                    v_at=$((${#f_verified_at[@]} - 1))
+                    f_verified_by[v_at]="$v_by"
                   fi
                   # Cleared whether or not the value was usable: this entry has
                   # had its say, and a deeper `at:` nested under it belongs to
                   # something else.
                   pending=0
+                fi
+                ;;
+              "by: "*)
+                if [ "$by_pending" -eq 1 ]; then
+                  frontmatter_scalar "${rest#"by:"}"
+                  if [ "$v_at" -ge 0 ]; then
+                    f_verified_by[v_at]="$OKF_FRONTMATTER_SCALAR"
+                  else
+                    # This entry's instant has not been read yet — `- by:` then
+                    # `at:` is SPEC.md §4's own order — so the actor waits for
+                    # the slot the `at:` above will make for it.
+                    v_by="$OKF_FRONTMATTER_SCALAR"
+                  fi
+                  by_pending=0
                 fi
                 ;;
             esac
@@ -1952,6 +2006,8 @@ read_frontmatter() { # $1 = a path to a concept file
   OKF_FM_CODE_SYMBOL="$f_symbol"
   OKF_FM_CODE_LANGUAGE="$f_language"
   OKF_FM_VERIFIED_AT=(${f_verified_at[@]+"${f_verified_at[@]}"})
+  OKF_FM_VERIFIED_BY=(${f_verified_by[@]+"${f_verified_by[@]}"})
+  OKF_FM_VERIFIED_COUNT="$f_verified_count"
   return 0
 }
 
@@ -5155,6 +5211,248 @@ cmd_index() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# Trust (SPEC.md §8)
+# ---------------------------------------------------------------------------
+
+# Whether one concept has drifted, as SPEC.md §8 defines it: 0 for drifted, 1
+# for not, 2 for a comparison this run could not make — with the reason for
+# that third answer left in OKF_DRIFT_REASON.
+#
+# Three answers and not two, because the caller has to be able to tell "the
+# stored digest and the source's disagree" from "there is no digest to
+# disagree with". `okf check` makes the same distinction and spends it on
+# whether to print a `drifted:` line or a warning; the trust tier below spends
+# it on whether it may say Human-reviewed, which is a claim that has to be
+# earned rather than defaulted into.
+#
+# What is *not* drift is drawn exactly where cmd_check draws it, so the two
+# cannot come apart: a concept with no stored hash has never claimed to
+# describe a particular version of its source, and a resource that is gone is
+# an orphan, whose repair is a different one.
+#
+# The resource is located from the concept rather than from the bundle root.
+# SPEC.md §4 spells `resource` bundle-absolute and §5 puts a concept beside the
+# source it documents, so between them the file is the resource's own name in
+# the concept's own directory — which is the file cmd_check resolves from the
+# root, and is still the right file when the concept was named by an absolute
+# path or from outside the root. `okf verify` accepts both, and `okf check`,
+# which walks a bundle it has already entered, never has to.
+OKF_DRIFT_REASON=""
+concept_drift() { # $1 = a concept path, $2 = its `resource`, $3 = its `code.content_hash`
+  local concept="$1" resource="$2" stored="$3"
+  local res="" res_dir="" base="" dir="" path=""
+  OKF_DRIFT_REASON=""
+
+  # cmd_check's "no stored hash is not drift", and its reason: §8's rule is a
+  # comparison between two values rather than a demand that both exist.
+  [ -n "$stored" ] || return 1
+
+  if [ -z "$resource" ]; then
+    OKF_DRIFT_REASON="it stores a code.content_hash but names no resource to compare it against"
+    return 2
+  fi
+
+  res="${resource#/}"
+  case "$res" in
+    "" | */)
+      OKF_DRIFT_REASON="its resource names a directory rather than a file: $resource"
+      return 2
+      ;;
+    */*)
+      res_dir="${res%/*}"
+      base="${res##*/}"
+      ;;
+    *) base="$res" ;;
+  esac
+
+  dir="${concept%/*}"
+  [ "$dir" != "$concept" ] || dir=""
+  # A concept directly under `/`, whose directory the strip above leaves empty
+  # when it is in fact the filesystem root.
+  case "$concept" in
+    /?*) [ -n "$dir" ] || dir="/" ;;
+  esac
+
+  # §5's co-location, asked of the two paths as they are spelled: the resource's
+  # directory has to be the tail of the concept's. `src/route` satisfies it for
+  # a concept named `src/route/X.md`, for `./src/route/X.md` and for
+  # `/tmp/bundle/src/route/X.md` alike, and nothing else does — a `resource`
+  # pointing into another directory is a concept this cannot pick a file for,
+  # and hashing the co-located file anyway would be reporting on a source the
+  # concept never named.
+  #
+  # Compared with `=` and a quoted suffix strip rather than with a `case`
+  # pattern, because a directory name carrying a `*` or a `[` would be a glob
+  # there and would match directories it does not name.
+  if [ -z "$res_dir" ]; then
+    # At the bundle root, so the concept must be too: `` and `.` are how a
+    # root-level concept is spelled relative to the root okf entered, and
+    # OKF_ROOT is how the same file is spelled absolutely.
+    if [ -n "$dir" ] && [ "$dir" != "." ] && [ "$dir" != "$OKF_ROOT" ]; then
+      OKF_DRIFT_REASON="its resource does not sit beside it, so okf cannot tell which file to hash: $resource"
+      return 2
+    fi
+  elif [ "$dir" != "$res_dir" ] && [ "${dir%"/$res_dir"}" = "$dir" ]; then
+    OKF_DRIFT_REASON="its resource does not sit beside it, so okf cannot tell which file to hash: $resource"
+    return 2
+  fi
+
+  case "$dir" in
+    "") path="$base" ;;
+    /) path="/$base" ;;
+    *) path="$dir/$base" ;;
+  esac
+
+  # `-e` and not `-f`, so this and `okf list --orphans` agree on what "gone"
+  # means: a dangling symlink is gone to both.
+  if [ ! -e "$path" ]; then
+    OKF_DRIFT_REASON="its resource is gone: $resource"
+    return 2
+  fi
+  if [ ! -f "$path" ]; then
+    OKF_DRIFT_REASON="its resource is not a regular file, so it cannot be hashed: $resource"
+    return 2
+  fi
+  # Shape before comparison, cmd_check's order and its reason: a comparison
+  # cannot tell a digest that differs from a value that was never a digest.
+  if ! is_content_hash "$stored"; then
+    OKF_DRIFT_REASON="its code.content_hash is not \`sha256:\` and 64 lower-case hex characters, so there is nothing to compare it with: $stored"
+    return 2
+  fi
+  if [ ! -r "$path" ]; then
+    OKF_DRIFT_REASON="its resource cannot be read, so it cannot be hashed: $resource"
+    return 2
+  fi
+  if ! file_digest "$path"; then
+    OKF_DRIFT_REASON="$OKF_FILE_DIGEST_ERROR"
+    return 2
+  fi
+
+  [ "$OKF_FILE_DIGEST" != "$stored" ] || return 1
+  return 0
+}
+
+# SPEC.md §8's trust tier for one concept, left in OKF_TRUST_TIER: `Unverified`,
+# `Machine-confirmed` or `Human-reviewed`, spelled as §8 spells them. Returns 1
+# — with the tier empty — when the concept could not be read at all, because a
+# file okf cannot read is not a concept it can grade.
+#
+# §8's rule, in its own words: "no `verified` → Unverified; verified only by
+# non-`human:` actors → Machine-confirmed; a `human:<id>` entry →
+# Human-reviewed, but only if that entry's `at >= generated.at` and the concept
+# is not drifted. Otherwise it degrades to Machine-confirmed."
+#
+# Read as: Human-reviewed is a claim that one particular entry earns, so it is
+# asked of each `human:` entry in turn and granted if any one of them earns it.
+# A concept whose most recent human review predates a regeneration is not
+# rescued by that — but nor is it condemned by it when an earlier human entry
+# does not, which is why this is a question about entries rather than about the
+# newest one.
+#
+# Two readings §8 does not spell out, both decided towards saying less rather
+# than more:
+#
+#   * **No `generated.at` at all.** There is no instant for the entry to
+#     predate, so the timestamp half of the rule has nothing to say and the
+#     entry is not degraded by it. A concept that never recorded when it was
+#     written is not thereby evidence that the review came first.
+#   * **A `generated.at` or an `at` that is not an instant okf can compare.**
+#     A claim exists and cannot be checked, so the entry does not earn
+#     Human-reviewed and OKF_TRUST_NOTE says why. Nothing here parses a date —
+#     see is_stamp_instant — so "cannot compare" is a shape and not a failure.
+#
+# OKF_TRUST_NOTE is set only when the answer is worth explaining: a human review
+# that did not count, or a Human-reviewed granted without drift having been
+# ruled out. A concept with no human entry at all is Machine-confirmed for the
+# plainest of reasons and gets no note, because a line explaining every ordinary
+# outcome is one nobody reads.
+OKF_TRUST_TIER=""
+OKF_TRUST_NOTE=""
+concept_trust_tier() { # $1 = a concept path
+  local concept="$1"
+  local generated_at="" at="" by="" i=0 human=0 earned=0 rc=0 note=""
+
+  OKF_TRUST_TIER=""
+  OKF_TRUST_NOTE=""
+
+  read_frontmatter "$concept" || return 1
+
+  # Entries and not instants: an entry written with no `at:` leaves nothing in
+  # OKF_FM_VERIFIED_AT, and a concept whose only entry is that one has still
+  # been verified by somebody. It cannot earn Human-reviewed — there is no
+  # instant to compare — but §8's first question is answered, and the answer is
+  # not Unverified.
+  if [ "$OKF_FM_VERIFIED_COUNT" -eq 0 ]; then
+    OKF_TRUST_TIER="Unverified"
+    return 0
+  fi
+
+  generated_at="$OKF_FM_GENERATED_AT"
+  for ((i = 0; i < ${#OKF_FM_VERIFIED_AT[@]}; i++)); do
+    # `:-` so a reader that ever left the two arrays different lengths is a bug
+    # to find rather than an aborted run: under `set -u` an unset element ends
+    # the whole invocation, on a line that only wanted to know who signed.
+    by="${OKF_FM_VERIFIED_BY[i]:-}"
+    case "$by" in
+      "human:"?*) ;;
+      # §8's second tier exactly: `process:`, `claude-code/` and `ralph/` are
+      # confirmations by a machine, and SPEC.md §11 rules out one of them
+      # writing an entry here at all.
+      *) continue ;;
+    esac
+    human=1
+    at="${OKF_FM_VERIFIED_AT[i]}"
+
+    if [ -n "$generated_at" ]; then
+      if ! is_stamp_instant "$generated_at"; then
+        note="generated.at is not an ISO 8601 UTC instant, so okf cannot tell whether the review by $by came after it: $generated_at"
+        continue
+      fi
+      if ! is_stamp_instant "$at"; then
+        note="the verified entry by $by is not stamped with an ISO 8601 UTC instant, so okf cannot tell whether it came after generated.at: $at"
+        continue
+      fi
+      if [ "$at" \< "$generated_at" ]; then
+        note="the review by $by at $at predates generated.at $generated_at, so it is not a review of the prose this concept now carries"
+        continue
+      fi
+    fi
+
+    earned=1
+    break
+  done
+
+  if [ "$human" -eq 0 ] || [ "$earned" -eq 0 ]; then
+    OKF_TRUST_TIER="Machine-confirmed"
+    OKF_TRUST_NOTE="$note"
+    return 0
+  fi
+
+  # A human review no older than the prose it reviewed. Drift is the last thing
+  # standing between it and Human-reviewed — and the only one that reads a file
+  # off the disk, which is why it is asked here rather than above: a concept
+  # nobody has humanly reviewed is Machine-confirmed whatever its source says.
+  rc=0
+  concept_drift "$concept" "$OKF_FM_RESOURCE" "$OKF_FM_CODE_CONTENT_HASH" || rc=$?
+  case "$rc" in
+    0)
+      OKF_TRUST_TIER="Machine-confirmed"
+      OKF_TRUST_NOTE="the concept has drifted: $OKF_FM_RESOURCE no longer hashes to the code.content_hash it stores"
+      ;;
+    2)
+      # Drift is a comparison that was made and came out unequal — cmd_check's
+      # rule, and the reason `okf check` reports these as warnings rather than
+      # as findings. So a comparison that could not be made is not drift, and
+      # the tier stands; the note is what stops that from being a silent claim.
+      OKF_TRUST_TIER="Human-reviewed"
+      OKF_TRUST_NOTE="$OKF_DRIFT_REASON, so this run could not rule out drift"
+      ;;
+    *) OKF_TRUST_TIER="Human-reviewed" ;;
+  esac
+  return 0
+}
+
 # okf verify <concept> [--by ACTOR] — append a verified entry
 #
 # SPEC.md §8's trust half, written the only way a shell script honestly can: okf
@@ -5307,6 +5605,31 @@ cmd_verify() {
   # went unprinted is a caller finding out whose name is in their bundle by
   # opening the file.
   printf 'verified %s by %s at %s\n' "$concept" "$by" "$now"
+
+  # And what the entry was worth: SPEC.md §8's trust tier, which is the answer
+  # to the question somebody typing `okf verify` is actually asking. A run that
+  # printed only "verified" would let a review land on a drifted concept, or one
+  # regenerated since, and read as having settled something it has not.
+  #
+  # Read back out of the concept rather than worked out from the entry just
+  # written, because the tier is a property of the concept and not of one entry:
+  # a `--by process:okf/0.2` on a concept a human reviewed yesterday leaves it
+  # Human-reviewed, and no amount of looking at the entry this run appended
+  # would show that.
+  #
+  # The entry is written whatever the tier turns out to be, and this run still
+  # exits 0. What was asked for was a record of a review, and the record is
+  # there; the tier is what it is worth, which is a thing to be told rather than
+  # a thing to fail over. The line explaining a degradation goes to stderr with
+  # okf's other explanations, so the tier stays the one parseable answer on
+  # stdout.
+  if concept_trust_tier "$concept"; then
+    printf 'trust: %s\n' "$OKF_TRUST_TIER"
+    [ -z "$OKF_TRUST_NOTE" ] || warn "$OKF_TRUST_NOTE"
+  else
+    warn "the entry was written, but $concept could not be read back afterwards" \
+      "  so SPEC.md §8's trust tier is not reported for this run"
+  fi
 }
 
 # okf chunk <concept> — Tier B: emit JSON chunks for one concept
