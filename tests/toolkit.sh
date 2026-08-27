@@ -791,6 +791,18 @@ test_okf_help_lists_every_spec_subcommand() {
     fi
     _pass "okf --help lists $sub"
 
+    # The §7 usage line itself, guarded before its tokens are read out of it.
+    # An empty token list is not on its own a sign of trouble — `okf index`
+    # takes neither a flag nor an argument — but a §7 whose fence or
+    # indentation has moved past _okf_spec_usage yields an empty line for every
+    # subcommand, and then every per-flag check below silently stops existing
+    # while the suite still reports all-pass.
+    if [ -z "$(_okf_spec_usage "$sub")" ]; then
+      _fail "SPEC.md §7 gives a usage line for $sub" \
+        "extracted none from the CLI surface section"
+      continue
+    fi
+
     # Its flags and arguments, read back out of SPEC.md rather than restated
     # here, so a flag added to the spec and not to the help fails as a missing
     # flag instead of quietly never being checked.
@@ -1977,13 +1989,21 @@ _okf_init_defaults_probe() {
     "okf init writes no index block, so Tier B stays something to opt into"
 
   # SPEC.md §7 gives every subcommand --config PATH, init included: it writes
-  # where it was told the settings live rather than to a hard-coded okf.json.
-  assert_exit 0 "$okf" --config okf.ci.json init
-  if [ ! -f okf.ci.json ]; then
-    _fail "okf --config PATH init writes PATH" "no okf.ci.json under $PWD"
+  # where it was told the settings live rather than to a hard-coded okf.json,
+  # and that path is resolved against the root rather than against the caller's
+  # directory. Run against a root of its own, because init also writes a
+  # bundle-root index.md and refuses as a whole when any of its targets is
+  # already there — the repo above has had one since the plain init.
+  if ! mkdir -p ci; then
+    _fail "a subdirectory can be made in the fixture" "mkdir failed: $PWD/ci"
   else
-    assert_eq "$expected" "$(jq -S 'del(.index)' okf.ci.json)" \
-      "okf --config PATH init writes the same defaults to PATH"
+    assert_exit 0 "$okf" -C ci --config okf.ci.json init
+    if [ ! -f ci/okf.ci.json ]; then
+      _fail "okf --config PATH init writes PATH" "no ci/okf.ci.json under $PWD"
+    else
+      assert_eq "$expected" "$(jq -S 'del(.index)' ci/okf.ci.json)" \
+        "okf --config PATH init writes the same defaults to PATH"
+    fi
   fi
 
   # ...and -C DIR, which has already moved the default okf.json to that root.
@@ -2003,7 +2023,11 @@ _okf_init_defaults_probe() {
   # these would exit 1 anyway on this now-initialised repo, so it is the named
   # offender and not the status that tells the two refusals apart.
   assert_exit 1 "$okf" init --fore
-  assert_contains "$(last_output)" "--fore" "okf init names a flag it does not know"
+  # "unknown flag: --fore" and not "--fore" on its own: the usage line the
+  # refusal prints alongside it contains "[--force]", which any check for the
+  # bare typo matches whether or not the message ever names it.
+  assert_contains "$(last_output)" "unknown flag: --fore" \
+    "okf init names a flag it does not know"
   assert_exit 1 "$okf" init extra
   assert_contains "$(last_output)" "extra" "okf init names an argument it does not take"
   return 0
@@ -2103,6 +2127,350 @@ test_okf_init_writes_the_spec_defaults() {
 test_okf_init_refuses_to_overwrite_without_force() {
   _okf_init_preconditions || return 1
   with_fixture_repo tiny _okf_init_force_probe
+}
+
+# A file's YAML frontmatter, without its `---` delimiters, read exactly the way
+# SPEC.md §4's formatting contract says the shell reads it: `---` on line 1,
+# closing on the next line that is exactly `---`. Prints nothing when the file
+# does not open that way — which is the failure its callers report, so nothing
+# here has to guess at a diagnosis.
+_okf_frontmatter() { # $1 = path
+  awk '
+    NR == 1 { if ($0 != "---") exit; next }
+    $0 == "---" { exit }
+    { print }
+  ' "$1"
+}
+
+# Whether that block is closed. Separate from _okf_frontmatter because an
+# unterminated block and a file that never opened one both read back as no
+# frontmatter at all, and only one of them is "the delimiter is missing".
+_okf_frontmatter_closed() { # $1 = path
+  awk '
+    NR == 1 { if ($0 != "---") exit 1; next }
+    $0 == "---" { closed = 1; exit }
+    END { exit closed ? 0 : 1 }
+  ' "$1"
+}
+
+# One top-level scalar out of a frontmatter block. The §4 extraction rule for
+# an unindented key, which is all the root index.md has.
+_okf_frontmatter_value() { # $1 = frontmatter text, $2 = key
+  printf '%s\n' "$1" | sed -n "s/^$2: //p" | sed -n 1p
+}
+
+# SPEC.md §4's formatting contract, checked against a file okf wrote whose
+# frontmatter is flat — every key top-level, no `code:` block. It is
+# load-bearing rather than cosmetic (the shell reads frontmatter with awk), so a
+# writer that drifts off it breaks every reader at once, silently.
+#
+# Flat is a precondition, not an oversight: §4 also spells out how a nested
+# `code:` block must be indented, and a checker that accepted one would have to
+# have an opinion about indentation this file's only caller cannot exercise.
+# Whatever writes a `code:` block brings its own check for that half.
+_okf_assert_flat_frontmatter_contract() { # $1 = path, $2 = what to call it
+  local path="$1" what="$2" front line
+  local -a bad=()
+
+  if [ ! -f "$path" ]; then
+    _fail "$what obeys the SPEC.md §4 formatting contract" "no such file: $path"
+    return 1
+  fi
+
+  front="$(_okf_frontmatter "$path")"
+  if [ -z "$front" ]; then
+    _fail "$what obeys the SPEC.md §4 formatting contract" \
+      "no --- delimited frontmatter at the top of $path"
+    return 1
+  fi
+  if ! _okf_frontmatter_closed "$path"; then
+    bad+=("the frontmatter block is never closed by a line that is exactly ---")
+  fi
+  case "$(cat "$path")" in
+    *$'\t'*) bad+=("the file contains a tab") ;;
+  esac
+
+  while IFS= read -r line; do
+    case "$line" in
+      # A folded or literal scalar, which §4 rules out in any field the shell
+      # reads.
+      [A-Za-z]*": |" | [A-Za-z]*": >") bad+=("folded scalar: $line") ;;
+      [A-Za-z]*": "*) ;;
+      *) bad+=("not an unindented \`key: value\` line: $line") ;;
+    esac
+  done <<< "$front"
+
+  if [ "${#bad[@]}" -eq 0 ]; then
+    _pass "$what obeys the SPEC.md §4 formatting contract"
+    return 0
+  fi
+  _fail "$what obeys the SPEC.md §4 formatting contract" "${bad[@]}"
+  return 1
+}
+
+_okf_init_index_probe() {
+  local okf="$TOOLKIT_ROOT/bin/okf" spec_version front out
+
+  # The version is read back out of SPEC.md §6's own block for the same reason
+  # the defaults are: §4 makes the bundle root the only file allowed to declare
+  # one, so the number it declares had better be the number §6 settled on.
+  spec_version="$(_okf_spec_config_json | jq -r '.okf_version // empty' 2> /dev/null)"
+  if [ -z "$spec_version" ]; then
+    _fail "SPEC.md §6 declares an okf_version" \
+      "extracted none from the okf.json block in the okf.json section"
+    return 1
+  fi
+
+  if [ -e index.md ]; then
+    _fail "the fixture repo starts without a bundle-root index.md" \
+      "already present under $PWD"
+    return 1
+  fi
+
+  assert_exit 0 "$okf" init
+  assert_contains "$(last_output)" "index.md" \
+    "okf init says it wrote the bundle-root index.md"
+
+  if [ ! -f index.md ]; then
+    _fail "okf init writes index.md in the bundle root" "no index.md under $PWD"
+    return 1
+  fi
+  _pass "okf init writes index.md in the bundle root"
+
+  _okf_assert_flat_frontmatter_contract index.md "the bundle-root index.md"
+
+  front="$(_okf_frontmatter index.md)"
+  # SPEC.md §4's reserved filenames: the repo-root index.md is the bundle root
+  # and is `type: Codebase`. Per-directory index.md files are `type: Package`,
+  # which is `okf index`'s business and not this file's.
+  assert_eq "Codebase" "$(_okf_frontmatter_value "$front" type)" \
+    "the bundle-root index.md is type: Codebase"
+  # Quoted, as SPEC.md §6 makes it a JSON string: unquoted, YAML reads 0.2 as a
+  # float, and the version after next — 0.10 — is read as 0.1 and stops
+  # matching the okf.json it was copied from.
+  assert_eq "\"$spec_version\"" "$(_okf_frontmatter_value "$front" okf_version)" \
+    "the bundle-root index.md declares SPEC.md §6's okf_version, as a string"
+  # ...and carries exactly one, counted over the whole file rather than the
+  # frontmatter alone: §4 calls this the only file where the key is legal, so a
+  # second one anywhere in it is a second answer to a question with one answer.
+  assert_eq "1" "$(grep -o 'okf_version' index.md | wc -l | tr -d ' ')" \
+    "the bundle-root index.md names okf_version exactly once"
+  # The bundle is named for its root, not for whatever repo okf was built in.
+  assert_eq "\"${PWD##*/}\"" "$(_okf_frontmatter_value "$front" title)" \
+    "the bundle-root index.md is titled after the bundle root"
+
+  # -C moves the bundle root, and the bundle root is where this file goes.
+  if ! mkdir -p sub; then
+    _fail "a subdirectory can be made in the fixture" "mkdir failed: $PWD/sub"
+  else
+    assert_exit 0 "$okf" -C sub init
+    if [ -f sub/index.md ]; then
+      _pass "okf -C DIR init writes DIR's bundle-root index.md"
+      assert_eq "Codebase" \
+        "$(_okf_frontmatter_value "$(_okf_frontmatter sub/index.md)" type)" \
+        "and it is type: Codebase too"
+    else
+      _fail "okf -C DIR init writes DIR's bundle-root index.md" \
+        "no sub/index.md under $PWD"
+    fi
+  fi
+
+  # ...and --config cannot be pointed at it: init writes two documents, and one
+  # file cannot be both. Refused rather than resolved, and refused before
+  # anything is written — with --force there would be nothing about the result
+  # to notice, both writes having succeeded into the same file.
+  #
+  # Checked in a root where neither file exists yet, and that is the point:
+  # against an initialised bundle the same-inode check inside init_guard would
+  # answer too, and this check — the only one that can speak for two files
+  # neither of which is there — would never be the reason for the refusal.
+  local alias
+  if ! mkdir -p alias; then
+    _fail "a subdirectory can be made in the fixture" "mkdir failed: $PWD/alias"
+  else
+    # `link` is a symlinked directory component: two paths that look nothing
+    # alike naming one file. It is made up front so a filesystem without
+    # symlinks skips only that spelling and not the plain one.
+    local -a aliases=(index.md ./index.md)
+    if ln -s . alias/link 2> /dev/null; then
+      aliases+=(link/index.md)
+    else
+      _skip "a --config alias through a symlinked directory is refused" \
+        "this filesystem has no symbolic links"
+    fi
+    for alias in "${aliases[@]}"; do
+      assert_exit 1 "$okf" -C alias --config "$alias" init
+      assert_contains "$(last_output)" "names the bundle-root index.md" \
+        "okf --config $alias init refuses to write both documents into one file"
+      if [ -e alias/index.md ] || [ -e alias/okf.json ]; then
+        _fail "and that refusal writes nothing at all" \
+          "found $(ls -A alias) under $PWD/alias"
+        rm -f alias/index.md alias/okf.json
+      else
+        _pass "and that refusal writes nothing at all"
+      fi
+    done
+  fi
+
+  # --config does not move it. That flag says where the *settings* live — CI's
+  # okf.ci.json is still this repo's settings — while SPEC.md §4 puts the
+  # bundle root index.md at the root of the bundle and nowhere else. Run in a
+  # root of its own so this is one plain init and not an --force overwriting
+  # the index.md written above.
+  if ! mkdir -p ci; then
+    _fail "a second subdirectory can be made in the fixture" "mkdir failed: $PWD/ci"
+  else
+    assert_exit 0 "$okf" -C ci --config okf.ci.json init
+    if [ -f ci/okf.ci.json ] && [ -f ci/index.md ] && [ ! -e ci/okf.json ]; then
+      _pass "okf --config PATH init still writes the bundle root's own index.md"
+    else
+      out="$(ls -A ci 2>&1)"
+      _fail "okf --config PATH init still writes the bundle root's own index.md" \
+        "expected ci/okf.ci.json and ci/index.md, and no ci/okf.json" \
+        "found: $out"
+    fi
+  fi
+  return 0
+}
+
+_okf_init_index_force_probe() {
+  local okf="$TOOLKIT_ROOT/bin/okf" was out
+
+  # A hand-written root index.md, of the kind a repo may well already have, and
+  # nothing else — so what init does about it is not confused with what it does
+  # about an okf.json.
+  was='# Notes I wrote myself'
+  printf '%s\n' "$was" > index.md
+
+  assert_exit 1 "$okf" init
+  out="$(last_output)"
+  assert_contains "$out" "index.md" "the refusal names the index.md in the way"
+  assert_contains "$out" "--force" "the refusal says how to overwrite it anyway"
+  assert_eq "$was" "$(cat index.md)" \
+    "a refused init leaves the bundle-root index.md exactly as it was"
+  # All-or-nothing: init writes two files, and a run that wrote the one that was
+  # missing and refused the one that was there would leave a half-initialised
+  # bundle behind an exit status meaning both.
+  if [ -e okf.json ]; then
+    _fail "a refused init writes nothing at all" \
+      "index.md was refused, but okf.json was written anyway"
+  else
+    _pass "a refused init writes nothing at all"
+  fi
+
+  # --force is the caller saying they know what is there.
+  assert_exit 0 "$okf" init --force
+  assert_eq "Codebase" "$(_okf_frontmatter_value "$(_okf_frontmatter index.md)" type)" \
+    "okf init --force overwrites the bundle-root index.md"
+  if [ -f okf.json ]; then
+    _pass "and writes the okf.json its refusal had been holding up"
+  else
+    _fail "and writes the okf.json its refusal had been holding up" "no okf.json under $PWD"
+  fi
+
+  # A symlinked index.md is refused both ways, exactly as a symlinked okf.json
+  # is: a redirection writes through the link, so --force would replace a file
+  # somewhere else entirely.
+  local shared="$FIXTURE_DIR/shared-index.md"
+  was='# Pointed at'
+  printf '%s\n' "$was" > "$shared"
+  rm -f index.md
+  if ! ln -s "$shared" index.md; then
+    _fail "a symlinked index.md can be made in the fixture" "ln -s failed"
+  else
+    assert_exit 1 "$okf" init --force
+    assert_contains "$(last_output)" "link" \
+      "okf init --force says a symlinked index.md is a link"
+    assert_eq "$was" "$(cat "$shared")" \
+      "okf init --force does not write through a symlinked index.md"
+    if [ -L index.md ]; then
+      _pass "and does not quietly replace that link either"
+    else
+      _fail "and does not quietly replace that link either" "the symlink is gone"
+    fi
+    rm -f index.md
+  fi
+  rm -f "$shared"
+
+  # A target that is not a regular file — a directory sitting where index.md
+  # goes — is refused before anything is written, --force or not: a redirection
+  # cannot replace a directory, and left to the write that failure would arrive
+  # only after okf.json had already gone in, which is the half-initialised
+  # bundle init refuses whole runs to avoid.
+  rm -f okf.json
+  if ! mkdir index.md; then
+    _fail "a directory can be made where index.md goes" "mkdir failed: $PWD/index.md"
+  else
+    assert_exit 1 "$okf" init --force
+    out="$(last_output)"
+    assert_eq 1 "$(_okf_line_count "$out")" \
+      "a target okf cannot write is reported in one line, not in two"
+    assert_contains "$out" "index.md" "and that line names it"
+    if [ -e okf.json ]; then
+      _fail "and nothing was written on the way to it" \
+        "okf.json went in before the refusal, leaving a half-initialised bundle"
+    else
+      _pass "and nothing was written on the way to it"
+    fi
+    rmdir index.md
+  fi
+
+  # And the same for a target that exists but cannot be written to. This one is
+  # a permission okf can ask about in advance, unlike a full disk, so asking is
+  # the difference between a refusal and a bundle half-written before the
+  # failure was discovered.
+  assert_exit 0 "$okf" init --force
+  printf '%s\n' '{"okf_version": "hand-edited"}' > okf.json
+  if ! chmod 444 index.md; then
+    _fail "index.md can be made read-only in the fixture" "chmod failed"
+  elif [ -w index.md ]; then
+    # Running as root, where the mode bits do not stop a write. Nothing here is
+    # a result then, so record a skip rather than a pass that proved nothing.
+    _skip "a read-only index.md is refused before okf.json is written" \
+      "this user can write it anyway"
+    chmod 644 index.md
+  else
+    assert_exit 1 "$okf" init --force
+    out="$(last_output)"
+    assert_eq 1 "$(_okf_line_count "$out")" \
+      "a read-only target is reported in one line, not in two"
+    assert_contains "$out" "index.md" "and that line names it"
+    assert_eq '{"okf_version": "hand-edited"}' "$(cat okf.json)" \
+      "and okf.json was not overwritten on the way to it"
+    chmod 644 index.md
+  fi
+
+  # Two names for one file, which no comparison of the paths themselves can
+  # see. Left alone, init writes okf.json's document and then the index
+  # document on top of it, reports both as written and exits 0, and the bundle
+  # ends up with no settings at all.
+  rm -f index.md
+  if ! ln okf.json index.md 2> /dev/null; then
+    _skip "a hard-linked index.md is refused" "this filesystem has no hard links"
+  else
+    assert_exit 1 "$okf" init --force
+    assert_contains "$(last_output)" "same file" \
+      "okf init refuses two targets that are one file"
+    assert_eq '{"okf_version": "hand-edited"}' "$(cat okf.json)" \
+      "and neither document was written over the other"
+    rm -f index.md
+  fi
+  return 0
+}
+
+# SPEC.md §4 reserves the repo-root index.md as the bundle root: type Codebase,
+# and the only file in a bundle where okf_version is legal. §7 makes writing it
+# `okf init`'s job, alongside okf.json.
+test_okf_init_writes_the_bundle_root_index() {
+  _okf_init_preconditions || return 1
+  with_fixture_repo tiny _okf_init_index_probe
+}
+
+# The other half of the same PLAN.md item: an existing bundle-root index.md is
+# not overwritten without --force.
+test_okf_init_refuses_to_overwrite_the_index_without_force() {
+  _okf_init_preconditions || return 1
+  with_fixture_repo tiny _okf_init_index_force_probe
 }
 
 # --- add new test_* functions above this line ------------------------------

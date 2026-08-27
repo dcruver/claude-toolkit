@@ -419,6 +419,40 @@ display_path() { # $1 = an absolute path
   esac
 }
 
+# The same file, spelled the same way: the directory part resolved, the final
+# component left exactly as given. What it is for is telling whether two paths
+# okf holds are one file — `--config index.md` and `--config ./index.md` both
+# name the bundle root's own index.md, and a plain string comparison sees three
+# different paths there.
+#
+# cd and `pwd -P` rather than realpath, which is not on SPEC.md §3's list, and
+# rather than `-ef`, which compares inodes and so can only answer for files
+# that already exist — the interesting case here is two paths okf is about to
+# create. `-P` and not a plain pwd: a symlinked directory component is exactly
+# how two paths that look nothing alike turn out to name one file, and the
+# logical pwd would hand back the path as typed and hide it. The final
+# component is deliberately left unresolved: a symlink named by it is the link
+# and not its target, which is what init_guard refuses.
+#
+# A directory that does not exist cannot be resolved, so the path is returned
+# as it came. That is the right answer for a comparison — an unresolvable path
+# is not demonstrably the same file as anything — and the write that follows
+# reports the missing directory itself.
+canonical_path() { # $1 = an absolute path
+  local dir="${1%/*}" base="${1##*/}" resolved
+
+  [ -n "$dir" ] || dir="/"
+  # CDPATH cleared and stderr silenced for the reasons every other cd here is.
+  resolved="$(CDPATH= cd -- "$dir" 2> /dev/null && pwd -P)" || {
+    printf '%s\n' "$1"
+    return 0
+  }
+  case "$resolved" in
+    */) printf '%s%s\n' "$resolved" "$base" ;;
+    *) printf '%s/%s\n' "$resolved" "$base" ;;
+  esac
+}
+
 # ---------------------------------------------------------------------------
 # Subcommands
 #
@@ -456,20 +490,208 @@ OKF_DEFAULT_CONFIG='{
   }
 }'
 
-# Writes one of the files `okf init` is responsible for, refusing to overwrite
-# what is already there unless --force was given.
+# The bundle-root index.md `okf init` writes, per SPEC.md §4: the repo-root
+# index.md is the bundle root, it is `type: Codebase`, and it is the **only**
+# file in a bundle where `okf_version` is legal. Both facts are the reason this
+# document exists at all — without it there is nowhere for the bundle to
+# declare which OKF version it is written to.
+#
+# Written to the §4 formatting contract, which is load-bearing rather than
+# cosmetic: `---` on line 1, a closing `---`, top-level keys unindented, no
+# tabs and no folded scalars, because the shell reads frontmatter with awk.
+#
+# There is deliberately no `generated:` stamp. SPEC.md §3's tool list has no
+# clock in it — no `date` — and the preflight's promise to name exactly what is
+# missing only stays true of init if init uses nothing outside that list.
+# `printf '%(...)T'` would need bash 4.2, and macOS still ships 3.2. A file with
+# no timestamp is worth more than one with a wrong or unportable one; the
+# subcommands that must stamp a time (`check --stamp`, `verify`) own that
+# problem, and this file is not where it has to be solved.
+root_index_document() { # $1 = the bundle's name, $2 = the okf_version it declares
+  local name="$1" version="$2" quoted
+
+  # Quoted, and escaped for quoting, because the name is a directory basename
+  # and so is whatever the filesystem allowed: a `#`, a `:` or a leading `%` in
+  # it turns an unquoted YAML scalar into a comment, a mapping or a parse
+  # error. A double-quoted scalar is valid YAML for every one of those, and is
+  # how SPEC.md §4's own example spells `signature`.
+  #
+  # `okf_version` is quoted for the same reason SPEC.md §6 makes it a JSON
+  # string: unquoted, YAML reads 0.2 as a float, and the next version but one
+  # — 0.10 — is read as 0.1 and stops matching the okf.json it was copied from.
+  # `type` and `status` are left bare: both are words out of a §4 vocabulary,
+  # and nothing in either can be mistaken for a number.
+  quoted="${name//\\/\\\\}"
+  quoted="${quoted//\"/\\\"}"
+
+  printf '%s\n' \
+    '---' \
+    'type: Codebase' \
+    "title: \"$quoted\"" \
+    "description: \"OKF bundle root for $quoted.\"" \
+    "okf_version: \"$version\"" \
+    'status: draft' \
+    '---' \
+    '' \
+    "# $name" \
+    '' \
+    'The OKF bundle root for this repository. Every concept lives beside the source' \
+    'it describes — `Greeter.py` is documented by `Greeter.md` in the same directory' \
+    "— and each directory's own \`index.md\` lists what that directory holds." \
+    '' \
+    '- `okf list --missing` — in-scope sources with no concept yet' \
+    '- `okf check` — concepts whose source has changed underneath them' \
+    '- `okf index` — regenerate the per-directory `index.md` files'
+}
+
+# Decides, for every file `okf init` is about to write, whether writing it is
+# allowed — before any of them is written.
+#
+# All-or-nothing on purpose. init writes two files, and a run that wrote the
+# one that was missing and refused the one that was there would leave a
+# half-initialised bundle behind an exit status that means both. Worse, the
+# obvious way out of such a refusal is --force, and --force is what destroys
+# the hand-written index.md that caused it. Refusing before anything is written
+# leaves every file exactly as it was, so the caller can move theirs aside or
+# merge it by hand and re-run.
+#
+# Every refusal init can foresee is decided here, over all of the targets and
+# before any of them is written, so that none can be the thing that fails after
+# another has already gone in. Only the plain "already exists" refusal
+# aggregates its offenders: that list is precisely what --force would
+# overwrite, and a caller deciding whether to type it needs to see all of it.
+# The others each stop at the first — a symlink and a directory in the way have
+# nothing to do with each other, and neither is answered by the other's remedy.
+#
+# What is left after this function returns is the write itself: a full disk, a
+# read-only mount, an I/O error partway through. Those can still leave the
+# first file written and the second not, which no check ahead of the write can
+# foresee and no shell can undo without the temp-file-and-rename that SPEC.md
+# §3's tool list rules out. The line printed then names the file that did not
+# get written, which is the one a caller has to do something about.
 #
 # Existence is what the refusal turns on, not content: an okf.json somebody
 # tuned by hand and one okf wrote itself a minute ago are the same file from
 # here, and guessing wrong destroys the tuning. --force is the caller saying
 # which of the two it is.
+init_guard() { # $1 = 1 if --force was given, $2.. = absolute paths
+  local force="$1" path
+  shift
+
+  # Symbolic links first, and refused whichever way --force went, because
+  # neither thing --force could mean here is what the caller asked for. A
+  # redirection writes *through* the link, so `okf init --force` would replace
+  # a file somewhere else entirely — outside the repo, if that is where the
+  # link points. Replacing the link instead would silently detach whoever put
+  # it there on purpose. Saying so and stopping leaves the choice with the one
+  # person who knows which they meant. Ahead of the existence check as well as
+  # ahead of --force, so a linked file is diagnosed as a link rather than
+  # buried in a list of things that are merely in the way.
+  for path in "$@"; do
+    if [ -L "$path" ]; then
+      die "$(display_path "$path") is a symbolic link" \
+        "okf init writes this repo's own file, not whatever the link points at" \
+        "remove the link and re-run"
+    fi
+  done
+
+  # Two names for one file, which the string comparison in cmd_init cannot see:
+  # a hard link makes okf.json and index.md one inode, and init would then
+  # write its two documents one on top of the other and report both as written.
+  # After the symlink loop, so a link is still diagnosed as a link — `-ef`
+  # follows one and would otherwise answer for its target.
+  local -a rest=("$@")
+  local other
+  while [ "${#rest[@]}" -gt 1 ]; do
+    path="${rest[0]}"
+    rest=("${rest[@]:1}")
+    for other in "${rest[@]}"; do
+      # `-ef` is false unless both paths stat, so a file that is not there yet
+      # needs no separate check.
+      if [ "$path" -ef "$other" ]; then
+        die "$(display_path "$path") and $(display_path "$other") are the same file" \
+          "okf init writes a different document to each, and one file cannot hold both" \
+          "they are two names for one inode — remove one and re-run"
+      fi
+    done
+  done
+
+  # A target that is not a regular file, refused whichever way --force went and
+  # before anything is written. --force means "replace the file that is there",
+  # and a directory, a fifo or a device is not a file a redirection can
+  # replace: writing to it fails however many times it is tried. Caught here
+  # rather than left to the redirection because that failure would arrive after
+  # the *other* file had already been written, which is exactly the
+  # half-initialised bundle this function exists to prevent. One line, because
+  # naming the path and what is wrong with it is the whole of what a caller
+  # needs to act.
+  for path in "$@"; do
+    if [ -e "$path" ] && [ ! -f "$path" ]; then
+      die "$(display_path "$path") is not a regular file"
+    fi
+  done
+
+  # Plain existence, which is the one refusal --force is allowed to overrule.
+  # Aggregated rather than reported one at a time, because this list is exactly
+  # what --force would overwrite, and a caller deciding whether to type it
+  # needs to see all of it.
+  if [ "$force" -eq 0 ]; then
+    local -a existing=()
+    for path in "$@"; do
+      if [ -e "$path" ]; then
+        existing+=("$(display_path "$path") already exists")
+      fi
+    done
+    if [ "${#existing[@]}" -gt 0 ]; then
+      if [ "${#existing[@]}" -eq 1 ]; then
+        existing+=("re-run with --force to overwrite it")
+      else
+        # Said explicitly, because --force is one flag over both files and the
+        # caller in front of this message usually wants only one of them: a
+        # second config for CI, say, in a bundle whose index.md they wrote by
+        # hand. Answering that with a bare "--force" would trade their index.md
+        # for an okf.ci.json without ever having said so.
+        existing+=("re-run with --force to overwrite them" \
+          "--force overwrites every file okf init writes, so move aside any you mean to keep")
+      fi
+      die "${existing[@]}"
+    fi
+  fi
+
+  # Permission, last, because it is the only one of these questions that is
+  # worth asking about a file init has already decided it is going to write.
+  # A read-only index.md is refused *here* and not by the redirection that
+  # would hit it, which would only fail after okf.json had gone in — the
+  # half-initialised bundle again, and this time from a cause that can be seen
+  # in advance.
+  #
+  # `-w` is a question about this process, so it answers for the ordinary cases
+  # — a read-only file, a directory nobody may write in — and not for a
+  # read-only mount or an ACL that only the write itself will discover. Those
+  # are why init_write still reports its own failures; this is why it rarely
+  # has to.
+  local dir
+  for path in "$@"; do
+    if [ -e "$path" ]; then
+      [ -w "$path" ] || die "$(display_path "$path") is not writable"
+      continue
+    fi
+    dir="${path%/*}"
+    [ -n "$dir" ] || dir="/"
+    [ -d "$dir" ] || die "cannot create $(display_path "$path"): no such directory: $dir"
+    [ -w "$dir" ] || die "cannot create $(display_path "$path"): $dir is not writable"
+  done
+}
+
+# Writes one of the files `okf init` is responsible for, init_guard having
+# already decided that writing it is allowed.
 #
 # Nothing outside SPEC.md §3's tool list is used to do it — no mktemp, no mv —
 # so that the preflight's promise to name exactly what is missing stays true of
 # init as well. That rules out the write-elsewhere-then-rename trick, and the
 # `set -C` below is what is left: it makes "is it already there?" and the
-# creation a single step the filesystem takes, so a file that appears between
-# the check above and the write cannot be silently clobbered by it.
+# creation a single step the filesystem takes, so a file that appeared between
+# init_guard's look and this write cannot be silently clobbered by it.
 init_write() { # $1 = absolute path, $2 = 1 if --force was given, $3 = content
   local path="$1" force="$2" content="$3" dir
 
@@ -479,22 +701,7 @@ init_write() { # $1 = absolute path, $2 = 1 if --force was given, $3 = content
   [ -n "$dir" ] || dir="/"
   [ -d "$dir" ] || die "cannot write $(display_path "$path"): no such directory: $dir"
 
-  # A symbolic link is refused whichever way, and ahead of --force rather than
-  # after it, because neither thing --force could mean here is what the caller
-  # asked for. A redirection writes *through* the link, so `okf init --force`
-  # would replace a file somewhere else entirely — outside the repo, if that is
-  # where the link points. Replacing the link instead would silently detach
-  # whoever put it there on purpose. Saying so and stopping leaves the choice
-  # with the one person who knows which they meant.
-  if [ -L "$path" ]; then
-    die "$(display_path "$path") is a symbolic link" \
-      "okf init writes this repo's own file, not whatever the link points at" \
-      "remove the link and re-run"
-  fi
-
-  if [ -e "$path" ]; then
-    [ "$force" -eq 1 ] || die "$(display_path "$path") already exists" \
-      "re-run with --force to overwrite it"
+  if [ "$force" -eq 1 ] && [ -e "$path" ]; then
     # This truncates at open, so a write that then fails — a full disk, a
     # quota — leaves neither the old file nor the new one. Accepted rather
     # than fixed: closing it needs the write-elsewhere-then-rename the
@@ -550,13 +757,59 @@ cmd_init() {
   printf '%s\n' "$OKF_DEFAULT_CONFIG" | jq empty > /dev/null 2>&1 \
     || die "the built-in default okf.json is not valid JSON — this is a bug in bin/okf"
 
+  # Read back out of the default config rather than written twice: SPEC.md §6
+  # settles the version in okf.json and §4 makes the bundle-root index.md the
+  # only other file allowed to name one. Two literals could disagree, and a
+  # bundle whose index.md and okf.json claim different OKF versions is a
+  # question with no answer.
+  local version
+  version="$(printf '%s\n' "$OKF_DEFAULT_CONFIG" | jq -r '.okf_version // empty')"
+  [ -n "$version" ] \
+    || die "the built-in default okf.json declares no okf_version — this is a bug in bin/okf"
+
+  # The bundle root is the repo root, which is what -C moves and --config does
+  # not: --config says where the *settings* live — CI's okf.ci.json is still
+  # this repo's settings — while SPEC.md §4 puts the bundle root index.md at
+  # the root of the bundle itself and nowhere else.
+  local index_path="$OKF_ROOT/index.md"
+
+  # The bundle is named for the directory it is in. Empty only when the root is
+  # `/`, which is then also its own best name.
+  local name="${OKF_ROOT##*/}"
+  [ -n "$name" ] || name="$OKF_ROOT"
+
+  # --config can be pointed at the bundle root's own index.md, and then the two
+  # documents init writes are two documents for one file: the second overwrites
+  # the first, and the repo ends up with an index.md and no settings at all.
+  # Caught before either is written, because with --force there is nothing
+  # about the result to notice — both writes succeed, and `wrote index.md`
+  # prints twice.
+  if [ "$(canonical_path "$OKF_CONFIG")" = "$(canonical_path "$index_path")" ]; then
+    die "--config names the bundle-root index.md: $(display_path "$index_path")" \
+      "okf init writes both, and one file cannot be both"
+  fi
+
   # $OKF_CONFIG, not the string okf.json: SPEC.md §7 gives every subcommand
   # --config PATH, and an init that wrote to a hard-coded name would be the one
   # subcommand that ignored where it was told the settings live. -C is honoured
   # for free, having already moved both the root and this path with it.
-  init_write "$OKF_CONFIG" "$force" "$OKF_DEFAULT_CONFIG"
+  init_guard "$force" "$OKF_CONFIG" "$index_path"
 
+  # Each write reported as it happens, so that a second write failing on what
+  # no check could foresee — a full disk, a read-only mount, an ACL — still
+  # leaves the caller knowing the first file is there. Told only about the
+  # failure, their obvious next move is to re-run, and the re-run refuses
+  # because of the okf.json this one wrote; the way out of that looks like
+  # --force, which is a much bigger hammer than the situation calls for.
+  #
+  # The refusals okf *can* foresee are all decided in init_guard above, before
+  # any of this runs, so nothing routine prints a `wrote` line ahead of an
+  # error.
+  init_write "$OKF_CONFIG" "$force" "$OKF_DEFAULT_CONFIG"
   printf 'wrote %s\n' "$(display_path "$OKF_CONFIG")"
+
+  init_write "$index_path" "$force" "$(root_index_document "$name" "$version")"
+  printf 'wrote %s\n' "$(display_path "$index_path")"
   # Said here because this is the run that decided it: the config just written
   # has no `index` block, so Tier B is off until someone adds one. Left unsaid,
   # the first `okf search` looks like a broken install rather than a feature
