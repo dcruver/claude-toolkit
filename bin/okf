@@ -1301,8 +1301,11 @@ OKF_RESERVED_CONCEPT_NAMES=(index.md log.md)
 # tell from a whole one.
 #
 # Whether the block *says* anything in particular is not asked. Which fields are
-# in there is the frontmatter reader a later PLAN.md item builds; what is being
-# asked here is only whether there is frontmatter at all.
+# in there is read_frontmatter's question; what is being asked here is only
+# whether there is frontmatter at all, and the two are kept apart because this
+# one is asked of every tracked `.md` in the repository — most of them prose
+# that stops at the first line — where read_frontmatter is asked only of the
+# files this has already said yes to.
 has_frontmatter() { # $1 = a path to a file
   local line opened=0
   # `|| [ -n "$line" ]` so a last line with no newline after it is still read.
@@ -1358,8 +1361,10 @@ has_frontmatter() { # $1 = a path to a file
 # One thing this cannot see, deliberately: two sources in one directory sharing
 # a stem — `helper.ts` beside `helper.py` — share `helper.md`, so documenting
 # either covers both. Telling them apart means reading the concept's `resource`
-# field, which is the frontmatter reader a later PLAN.md item builds; until then
-# the answer here is the mechanical one §5 describes.
+# field with read_frontmatter and deciding which source it names, which is a
+# change to what `--missing` means rather than to how a name is derived; it
+# belongs to whichever item needs that, and the answer here stays the mechanical
+# one §5 describes.
 has_concept() { # $1 = a bundle-relative source path
   local path="$1" dir base stem
   base="${path##*/}"
@@ -1427,71 +1432,432 @@ has_concept() { # $1 = a bundle-relative source path
   return 0
 }
 
-# Prints a concept's `resource` — the source file SPEC.md §4 says the concept
-# documents — or nothing at all when it declares none. Always exits 0: "this
-# file names no resource" is an answer, not a failure.
+# One concept's SPEC.md §4 frontmatter, as `read_frontmatter` last left it:
+# every field §4 lists as shell-read, and nothing else. The rest of what a
+# concept carries — `title`, `tags`, `sources`, `code.members` — is Claude's to
+# write and OKF's to define, and a variable here is this script claiming an
+# opinion about a field, so the list stays exactly §4's. SPEC.md §1's division
+# of labour is what that line is drawn from.
 #
-# Read to SPEC.md §4's formatting contract and no further: the block is `---` on
-# line 1 to the next line that is exactly `---`, and a top-level key is
-# unindented `key: value`. Anchoring on the unindented spelling is what keeps
-# the `  - resource: https://example.invalid/DON-86` inside a `sources:` list
-# out of the answer — §4 is explicit that `sources` is for external references
-# and never a restatement of `resource`, so reading one as the other would point
-# this at a URL that is not a path at all.
+# The names are §4's own field names, mechanically: `OKF_FM_` then the field
+# with its dots turned into underscores, its `[]` dropped and the whole thing
+# upper-cased. `generated.at` is OKF_FM_GENERATED_AT; `verified[].at` is
+# OKF_FM_VERIFIED_AT. tests/toolkit.sh derives those names from §4's own
+# sentence and checks each one exists, so a field added there with no variable
+# here fails rather than going quietly unread.
 #
-# The first such line wins. A block with two `resource:` lines is malformed
-# YAML with no defined meaning, and taking the first is both what §4's
-# extraction rule for `code.X` does and the only choice that does not depend on
-# how far past the mistake the reader kept going.
+# Empty means absent, for every one of them. A field that is not in the block,
+# one written with nothing after its colon, and one whose value is an empty
+# string are the same fact to every caller — okf was not told — and none of the
+# fields §4 lists has a meaningful empty value that would need telling apart.
 #
-# CRLF and a UTF-8 BOM are stripped for the reason has_frontmatter strips them:
+# This is called once at load, immediately below, so every variable exists from
+# the moment bin/okf is sourced: under `set -u` a caller reading one before any
+# concept has been read would otherwise abort where it should see "absent".
+clear_frontmatter() {
+  OKF_FM_TYPE=""
+  OKF_FM_RESOURCE=""
+  OKF_FM_STATUS=""
+  OKF_FM_STALE_AFTER=""
+  OKF_FM_GENERATED_AT=""
+  OKF_FM_GENERATED_BY=""
+  OKF_FM_CODE_CONTENT_HASH=""
+  OKF_FM_CODE_TIER=""
+  OKF_FM_CODE_SYMBOL=""
+  OKF_FM_CODE_LANGUAGE=""
+  # A list where the others are scalars, because SPEC.md §8 says verified
+  # entries are never stripped: a concept accumulates them, and the last one is
+  # not the only one that matters. Document order.
+  OKF_FM_VERIFIED_AT=()
+}
+clear_frontmatter
+
+# The value half of a frontmatter `key: value` line — everything after the
+# colon, with its quotes, its trailing comment and its surrounding whitespace
+# taken off — left in OKF_FRONTMATTER_SCALAR rather than printed. Reading a
+# concept costs no subprocess at all that way, which is what it takes for `okf
+# check` to read every concept in a bundle: printed instead, each field would be
+# a `$(...)` and so a fork apiece.
+#
+# Surrounding quotes come off. SPEC.md §4's own example writes `resource:` bare
+# and `content_hash:` quoted, so both spellings are in circulation, and a value
+# read with its quotes still on is one no comparison ever matches: a quoted
+# `content_hash` reports a concept drifted that is not, and a quoted `resource`
+# reports a live concept an orphan.
+#
+# A trailing `# comment` comes off with them, for the same reason and at the
+# same cost. YAML ends a scalar at an unquoted `#` that has whitespace in front
+# of it, and a note somebody left beside a hash — `content_hash: "sha256:…"  #
+# regenerate after the refactor` — read as part of the value is a file reported
+# drifted for as long as the note is there. Quoted first and comment second,
+# which is the order YAML resolves them in: a `#` inside quotes is part of the
+# value, and the comment can only begin after the closing quote.
+#
+# The rest of YAML's scalar rules are deliberately not implemented — an escape
+# sequence inside a double-quoted value stays as written, a doubled '' inside a
+# single-quoted one stays doubled. §4's formatting contract rules out what would
+# need them (no multi-line and no folded scalars in any field the shell reads),
+# and the fields §4 lists are timestamps, digests, paths and identifiers.
+OKF_FRONTMATTER_SCALAR=""
+frontmatter_scalar() { # $1 = everything after a frontmatter key's colon
+  local value="$1" quote="" rest
+  # Leading whitespace, so what is left starts with the value itself — or with
+  # the quote or `#` that decides how the rest of it is read.
+  value="${value#"${value%%[![:space:]]*}"}"
+
+  case "$value" in
+    '"'*) quote='"' ;;
+    "'"*) quote="'" ;;
+  esac
+  if [ -n "$quote" ]; then
+    rest="${value#"$quote"}"
+    case "$rest" in
+      *"$quote"*)
+        # Up to the closing quote, and nothing after it: the value ends there,
+        # and whatever follows is a comment or a stray.
+        OKF_FRONTMATTER_SCALAR="${rest%%"$quote"*}"
+        return 0
+        ;;
+    esac
+    # A quote that is never closed is not a quoted value at all. Read on as if
+    # it were bare, which leaves the opening quote in place — a `resource` that
+    # visibly still has one is a path that visibly does not exist, and that is
+    # a better answer than silently inventing where the value was meant to end.
+  fi
+
+  # The first `#` with whitespace in front of it starts a comment. `%%` removes
+  # the longest matching suffix, which is the earliest such `#` — a later one
+  # inside the comment cannot pull the cut back the other way. A `#` in the
+  # first column of the value is a comment too, and leaves nothing.
+  value="${value%%[[:space:]]#*}"
+  case "$value" in
+    '#'*) value="" ;;
+  esac
+
+  # Trailing whitespace last, once the comment that was behind it has gone. A
+  # value that is nothing but whitespace comes out empty, which is exactly what
+  # absent looks like: `resource:` with nothing after it names no file.
+  value="${value%"${value##*[![:space:]]}"}"
+  OKF_FRONTMATTER_SCALAR="$value"
+}
+
+# Reads one concept's SPEC.md §4 frontmatter into the OKF_FM_ variables above.
+#
+# Returns 0 when the file carries a block — `---` on line 1, closed by the next
+# line that is exactly `---` — and 1 when it has none, opens one it never
+# closes, or cannot be read at all. On 1 every variable is empty: a failed read
+# must not leave the last successful one's values standing, or a caller looping
+# over concepts would attribute one concept's hash to the next one along.
+#
+# One pass over the file, every field at once, rather than a function per field.
+# Eleven readers would be eleven opens of the same few lines for every concept
+# in the bundle, on exactly the subcommands — `check`, `chunk` — that ask about
+# all of them.
+#
+# Read to §4's formatting contract and no further, because that contract is what
+# makes reading YAML with `case` honest rather than lucky:
+#
+#   * A top-level key is unindented. Anchoring on that is what keeps the
+#     `  - resource: https://example.invalid/DON-86` inside a `sources:` list
+#     out of `resource` — §4 is explicit that `sources` is for external
+#     references and never a restatement of `resource`, so reading one as the
+#     other would point okf at a URL that is not a path at all.
+#   * `code.X` is "the first line matching `^  X: ` after the `^code:` line and
+#     before the next unindented key", which is §4's extraction rule quoted.
+#     Exactly two spaces, because §4 puts the block's scalars at two and its
+#     list items at four: a `code.members` entry describing a member called
+#     `symbol` or `language` sits a level deeper than anything read here.
+#     `generated.at` and `generated.by` are read by the same rule under
+#     `generated:`, that being the only reading of §4 that does not invent a
+#     second rule for a block it describes the same way.
+#   * A bare block header opens a block and `code: something` does not. What
+#     may follow the colon is whitespace and a comment, neither of which is a
+#     difference in what the line says.
+#   * A blank line closes nothing. §4's boundary is the next unindented *key*,
+#     and a blank line between two verified entries is cosmetic.
+#
+# The first line naming a value wins, for every field. A block with two
+# `status:` lines is malformed YAML with no defined meaning, and taking the
+# first is what §4's `code.X` rule does — the only choice that does not depend
+# on how far past the mistake the reader happened to keep going.
+#
+# `verified[].at` is collected per list entry: an entry opens on a `-`, and its
+# `at:` is whichever of that line and the lines that follow it at the entry's
+# own key column names one first. An entry naming none contributes nothing, so what comes back is
+# timestamps and not entries — there is no instant to compare with
+# `generated.at` in an entry that has not got one, and SPEC.md §8's trust rule
+# is entirely about comparing the two. It is also why an entry's own `by:` is
+# not read here: §4's shell-read list does not include it, and the subcommand
+# that needs it can say so then.
+#
+# CRLF and a UTF-8 BOM are stripped, for the reason has_frontmatter strips them:
 # a checkout on Windows changes how the lines are spelled and not what they say,
-# and a concept okf stopped recognising there would be one it silently reported
-# as documenting nothing.
-#
-# Surrounding quotes come off. §4's own example writes `resource:` bare and
-# `content_hash:` quoted, so both spellings are in circulation, and a quoted
-# path read with its quotes is a path that never exists — which on the orphan
-# listing means a live concept reported as dead.
-#
-# This is deliberately not the frontmatter reader of Phase 4, which owes the
-# whole §4 shell-read field set. It is the one field `okf list --orphans` needs,
-# written narrowly so that reader can replace it rather than work around it.
-concept_resource() { # $1 = a path to a concept file
-  local line opened=0 value
+# and a concept okf stopped recognising there is one it silently reports as
+# documenting nothing.
+read_frontmatter() { # $1 = a path to a concept file
+  local path="$1" line rest prefix indent opened=0 closed=0 block="" pending=0
+  # Where the open `verified` entry's `-` sits, and the column its keys line up
+  # in; -1 for "no entry open" and "not established yet" respectively.
+  local v_dash=-1 v_key=-1
+  local f_type="" f_resource="" f_status="" f_stale_after=""
+  local f_generated_at="" f_generated_by=""
+  local f_content_hash="" f_tier="" f_symbol="" f_language=""
+  local -a f_verified_at=()
+
+  clear_frontmatter
+
+  # Asked before the redirection, not left to it: a redirection that fails is a
+  # failure of the `while` itself, and under `set -e` that takes the whole
+  # script down instead of returning the 1 every caller here is written to
+  # handle. A path that is not a regular file — gone, or a directory called
+  # `Foo.md` — carries no frontmatter, which is the same answer.
+  if [ ! -f "$path" ] || [ ! -r "$path" ]; then
+    return 1
+  fi
+
   # `|| [ -n "$line" ]` so a last line with no newline after it is still read.
   while IFS= read -r line || [ -n "$line" ]; do
     line="${line#$'\xef\xbb\xbf'}"
     line="${line%$'\r'}"
+
     if [ "$opened" -eq 0 ]; then
-      [ "$line" = "---" ] || return 0
+      # Line 1 or nothing: §4 puts the block at the top of the file, and a
+      # `---` further down is a horizontal rule in somebody's prose.
+      [ "$line" = "---" ] || break
       opened=1
       continue
     fi
-    # The closing `---`. Nothing past it is frontmatter.
-    [ "$line" != "---" ] || return 0
+    if [ "$line" = "---" ]; then
+      closed=1
+      break
+    fi
+
     case "$line" in
-      resource:*)
-        value="${line#resource:}"
-        # Leading then trailing whitespace. A value that is nothing but
-        # whitespace comes out empty, which is the same as absent: `resource:`
-        # with nothing after it names no file, and okf cannot say whether a
-        # file it was never told about is still there.
-        value="${value#"${value%%[![:space:]]*}"}"
-        value="${value%"${value##*[![:space:]]}"}"
-        case "$value" in
-          '"'*'"') value="${value#\"}" && value="${value%\"}" ;;
-          "'"*"'") value="${value#\'}" && value="${value%\'}" ;;
+      [![:space:]#-]*)
+        # An unindented line that is neither a comment nor the start of a list
+        # item: a top-level key, and the end of whatever nested block was open.
+        # That boundary is §4's own — `code.X` is read "before the next
+        # unindented key" — and it is the only thing separating `generated:`'s
+        # `at:` from a `verified:` entry's.
+        #
+        # A `#` in the first column is a whole-line comment, and a comment is
+        # not a key. Ending a block on one would drop every field written below
+        # it — a note left above `content_hash:` would take the hash with it,
+        # and SPEC.md §8 reads a concept with no stored hash as one it cannot
+        # tell has drifted.
+        block=""
+        pending=0
+        v_dash=-1
+        v_key=-1
+        case "$line" in
+          "code:"*)
+            frontmatter_scalar "${line#"code:"}"
+            if [ -z "$OKF_FRONTMATTER_SCALAR" ]; then
+              block="code"
+            fi
+            ;;
+          "generated:"*)
+            frontmatter_scalar "${line#"generated:"}"
+            if [ -z "$OKF_FRONTMATTER_SCALAR" ]; then
+              block="generated"
+            fi
+            ;;
+          "verified:"*)
+            frontmatter_scalar "${line#"verified:"}"
+            if [ -z "$OKF_FRONTMATTER_SCALAR" ]; then
+              block="verified"
+            fi
+            ;;
+          "type:"*)
+            if [ -z "$f_type" ]; then
+              frontmatter_scalar "${line#"type:"}"
+              f_type="$OKF_FRONTMATTER_SCALAR"
+            fi
+            ;;
+          "resource:"*)
+            if [ -z "$f_resource" ]; then
+              frontmatter_scalar "${line#"resource:"}"
+              f_resource="$OKF_FRONTMATTER_SCALAR"
+            fi
+            ;;
+          "status:"*)
+            if [ -z "$f_status" ]; then
+              frontmatter_scalar "${line#"status:"}"
+              f_status="$OKF_FRONTMATTER_SCALAR"
+            fi
+            ;;
+          "stale_after:"*)
+            if [ -z "$f_stale_after" ]; then
+              frontmatter_scalar "${line#"stale_after:"}"
+              f_stale_after="$OKF_FRONTMATTER_SCALAR"
+            fi
+            ;;
         esac
-        [ -n "$value" ] || return 0
-        printf '%s\n' "$value"
-        return 0
+        ;;
+      *)
+        # Indented, blank, a comment, or a list item written flush left: inside
+        # whatever block is open, and inside none at all when the last
+        # unindented key was an ordinary scalar. `sources:` lands there, which is what keeps its
+        # `resource:` and `title:` out of the top-level fields of the same name.
+        #
+        # A sequence item is the one construct YAML lets sit at its parent key's
+        # own indentation — `verified:` then `- by: human:dcruver` in the first
+        # column is the same document as §4's indented example, and is what most
+        # YAML writers emit. Reading it as a top-level key would end the
+        # `verified:` block on its first entry and quietly leave a concept a
+        # human has reviewed with no verified timestamps at all, which SPEC.md
+        # §8 then reads as never verified. A mapping's values have no such
+        # licence — they must be indented past their key — so this is the whole
+        # of the exception.
+        case "$block" in
+          code)
+            case "$line" in
+              "  content_hash: "*)
+                if [ -z "$f_content_hash" ]; then
+                  frontmatter_scalar "${line#"  content_hash:"}"
+                  f_content_hash="$OKF_FRONTMATTER_SCALAR"
+                fi
+                ;;
+              "  tier: "*)
+                if [ -z "$f_tier" ]; then
+                  frontmatter_scalar "${line#"  tier:"}"
+                  f_tier="$OKF_FRONTMATTER_SCALAR"
+                fi
+                ;;
+              "  symbol: "*)
+                if [ -z "$f_symbol" ]; then
+                  frontmatter_scalar "${line#"  symbol:"}"
+                  f_symbol="$OKF_FRONTMATTER_SCALAR"
+                fi
+                ;;
+              "  language: "*)
+                if [ -z "$f_language" ]; then
+                  frontmatter_scalar "${line#"  language:"}"
+                  f_language="$OKF_FRONTMATTER_SCALAR"
+                fi
+                ;;
+            esac
+            ;;
+          generated)
+            case "$line" in
+              "  at: "*)
+                if [ -z "$f_generated_at" ]; then
+                  frontmatter_scalar "${line#"  at:"}"
+                  f_generated_at="$OKF_FRONTMATTER_SCALAR"
+                fi
+                ;;
+              "  by: "*)
+                if [ -z "$f_generated_by" ]; then
+                  frontmatter_scalar "${line#"  by:"}"
+                  f_generated_by="$OKF_FRONTMATTER_SCALAR"
+                fi
+                ;;
+            esac
+            ;;
+          verified)
+            # No width is written down here: §4 puts an entry's `-` at two
+            # spaces and its keys at four, a YAML writer puts them at zero and
+            # two, and the two spellings are the same document. What is tracked
+            # instead is the relationship — where this entry's `-` sits, and the
+            # column its own keys line up in.
+            #
+            # Both are needed to keep an entry's timestamp its own. A mapping
+            # nested inside an entry indents past those keys, so an `at:` under
+            # a `context:` is deeper than the entry's key column and is not the
+            # entry's `at` — in whichever order the two are written. A sequence
+            # nested inside one indents past the entry's `-`, so its items are
+            # not new entries. Read without those two tests, a concept whose
+            # entry carries anything at all beside `by:` and `at:` comes back
+            # with somebody else's instant, or with an entry that was never
+            # verified by anyone.
+            prefix="${line%%[![:space:]]*}"
+            rest="${line#"$prefix"}"
+            indent="${#prefix}"
+            case "$rest" in
+              -*)
+                if [ "$v_dash" -lt 0 ] || [ "$indent" -le "$v_dash" ]; then
+                  v_dash="$indent"
+                  rest="${rest#-}"
+                  prefix="${rest%%[![:space:]]*}"
+                  rest="${rest#"$prefix"}"
+                  if [ -n "$rest" ]; then
+                    # `- at: …`, or `- by: …`: the entry's keys start right
+                    # here, past the `-` and the space after it.
+                    v_key=$((v_dash + 1 + ${#prefix}))
+                  else
+                    # A `-` with nothing after it puts the entry's first key on
+                    # a following line, at a column this cannot predict. Left
+                    # unknown, to be taken from that line when it arrives.
+                    v_key=-1
+                  fi
+                  pending=1
+                else
+                  # Deeper than this entry's own `-`: a list nested inside it.
+                  rest=""
+                fi
+                ;;
+              *)
+                if [ "$v_dash" -lt 0 ]; then
+                  # Something before the first entry — a comment, or a key of a
+                  # block written `verified:` with a mapping under it.
+                  rest=""
+                elif [ "$v_key" -lt 0 ]; then
+                  if [ "$indent" -gt "$v_dash" ]; then
+                    v_key="$indent"
+                  else
+                    rest=""
+                  fi
+                elif [ "$indent" -ne "$v_key" ]; then
+                  # Deeper than the entry's keys, so inside something nested in
+                  # it; shallower, and it is not part of the entry at all.
+                  rest=""
+                fi
+                ;;
+            esac
+            case "$rest" in
+              "at: "*)
+                if [ "$pending" -eq 1 ]; then
+                  frontmatter_scalar "${rest#"at:"}"
+                  if [ -n "$OKF_FRONTMATTER_SCALAR" ]; then
+                    f_verified_at+=("$OKF_FRONTMATTER_SCALAR")
+                  fi
+                  # Cleared whether or not the value was usable: this entry has
+                  # had its say, and a deeper `at:` nested under it belongs to
+                  # something else.
+                  pending=0
+                fi
+                ;;
+            esac
+            ;;
+        esac
         ;;
     esac
-  # stderr redirected before the input, for the reason has_frontmatter gives:
-  # a `2> /dev/null` written after it is set up too late to catch the shell's
-  # own complaint about opening the file.
-  done 2> /dev/null < "$1"
+  # stderr redirected before the input, and not after it: the order is the order
+  # they are opened in, so a `2> /dev/null` written second is set up too late to
+  # catch the shell's own complaint about the first.
+  done 2> /dev/null < "$path"
+
+  # Both ends of the block, exactly as has_frontmatter asks for them. A file
+  # that opens one and never closes it is the half-written concept — an
+  # interrupted /okf-generate — and the fields read out of it are whatever had
+  # been written by the time it stopped. Reporting that as a concept read
+  # cleanly is how a truncated `content_hash` becomes a drift report nobody can
+  # explain.
+  if [ "$opened" -eq 0 ] || [ "$closed" -eq 0 ]; then
+    return 1
+  fi
+
+  OKF_FM_TYPE="$f_type"
+  OKF_FM_RESOURCE="$f_resource"
+  OKF_FM_STATUS="$f_status"
+  OKF_FM_STALE_AFTER="$f_stale_after"
+  OKF_FM_GENERATED_AT="$f_generated_at"
+  OKF_FM_GENERATED_BY="$f_generated_by"
+  OKF_FM_CODE_CONTENT_HASH="$f_content_hash"
+  OKF_FM_CODE_TIER="$f_tier"
+  OKF_FM_CODE_SYMBOL="$f_symbol"
+  OKF_FM_CODE_LANGUAGE="$f_language"
+  OKF_FM_VERIFIED_AT=(${f_verified_at[@]+"${f_verified_at[@]}"})
   return 0
 }
 
@@ -1983,7 +2349,12 @@ cmd_list() {
     load_concepts
     load_bundle_globs
     for path in ${OKF_CONCEPTS[@]+"${OKF_CONCEPTS[@]}"}; do
-      resource="$(concept_resource "$path")"
+      # A concept that cannot be read at all is left off for the same reason:
+      # load_concepts only put files carrying a closed frontmatter block on this
+      # list, so a read that fails here is one the file stopped being readable
+      # between the two — not a fact about what it documents.
+      read_frontmatter "$path" || continue
+      resource="$OKF_FM_RESOURCE"
       [ -n "$resource" ] || continue
       # §4 puts path-valued fields in bundle-absolute form — a leading `/` that
       # means the bundle root and not the filesystem's. okf is standing in the

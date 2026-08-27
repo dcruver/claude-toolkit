@@ -4250,6 +4250,383 @@ test_okf_fanin_needs_a_git_work_tree() {
   return 0
 }
 
+# SPEC.md §4 names the fields the shell is allowed to read, so the list is read
+# back out of it rather than restated here: a field added to §4 with no reader
+# in bin/okf then fails as a missing one instead of going quietly unread.
+#
+# §4 writes the last four with the prefix factored out — "`code.` `content_hash`,
+# `tier`, `symbol`, `language`" — so a quoted token ending in a dot is a prefix
+# for the tokens after it rather than a field of its own. The sentence stops at
+# the extraction rule that follows it, whose own quoted spans (`^  X: `, and the
+# rest) are pattern syntax and not field names.
+_okf_spec_frontmatter_fields() {
+  awk '
+    /^## 4\./ { in_section = 1; next }
+    in_section && /^## / { exit }
+    in_section && /^Fields the shell reads:/ { in_fields = 1 }
+    in_fields && /^Extraction rule/ { exit }
+    in_fields {
+      n = split($0, part, "`")
+      # Backticks come in pairs, so the quoted spans are the even indices.
+      for (i = 2; i <= n; i += 2) {
+        token = part[i]
+        if (token ~ /\.$/) { prefix = token; continue }
+        print prefix token
+      }
+    }
+  ' "$TOOLKIT_ROOT/SPEC.md"
+}
+
+# bin/okf's own reading of one concept: `status=<rc>` for what read_frontmatter
+# returned, then one `field:<name>=<value>` line per SPEC.md §4 field asked
+# about — or `missing:<name>` for a field bin/okf keeps no variable for.
+# `verified[].at` is a list, so it prints one line per entry and none at all
+# when there are none.
+#
+# Obtained by sourcing bin/okf and calling read_frontmatter directly, the way
+# _okf_context calls parse_globals: none of this is printed anywhere, because
+# SPEC.md §7 defines no subcommand that prints frontmatter and a flag invented
+# to test with would be CLI surface the spec has not got. The names used here —
+# read_frontmatter, and the OKF_FM_ variables it fills — are the contract this
+# item owes every subcommand written after it, so a rename that breaks them
+# should fail loudly.
+#
+# The variable name is derived from §4's field name rather than looked up in a
+# table written here: `OKF_FM_` plus the field upper-cased, its dots turned into
+# underscores and its `[]` dropped. That derivation is what makes this a check
+# on §4's list and not on a copy of it.
+#
+# $1 is a concept to read *before* the one under test, or empty for none. It is
+# what makes an empty field mean "this concept has not got one" rather than
+# "nothing was ever read": after a full concept, every variable holds a value
+# that a failed or sparser read has to clear.
+_okf_frontmatter_probe() { # $1 = concept to read first or "", $2 = concept, $3.. = field names
+  local probe="$HARNESS_STATE/okf-frontmatter-probe.sh"
+  if [ ! -f "$probe" ]; then
+    cat > "$probe" <<'PROBE'
+#!/usr/bin/env bash
+okf_script="$1"
+preload="$2"
+concept="$3"
+shift 3
+# shellcheck source=/dev/null
+. "$okf_script"
+
+if [ -n "$preload" ]; then
+  read_frontmatter "$preload" || true
+fi
+
+rc=0
+read_frontmatter "$concept" || rc=$?
+printf 'status=%s\n' "$rc"
+
+report_field() { # $1 = a SPEC.md §4 field name
+  local field="$1" var decl item
+  local -a items=()
+  var="OKF_FM_$(printf '%s' "$field" | tr -d '[]' | tr '.' '_' | tr '[:lower:]' '[:upper:]')"
+  if ! decl="$(declare -p "$var" 2> /dev/null)"; then
+    printf 'missing:%s\n' "$field"
+    return 0
+  fi
+  case "$decl" in
+    "declare -a"*)
+      eval "items=( \${$var[@]+\"\${$var[@]}\"} )"
+      for item in ${items[@]+"${items[@]}"}; do
+        printf 'field:%s=%s\n' "$field" "$item"
+      done
+      ;;
+    *) printf 'field:%s=%s\n' "$field" "${!var}" ;;
+  esac
+}
+
+for field in "$@"; do
+  report_field "$field"
+done
+PROBE
+    chmod +x "$probe" || return 1
+  fi
+  "$probe" "$TOOLKIT_ROOT/bin/okf" "$@" 2>&1
+}
+
+_okf_frontmatter_status() { # $1 = probe output
+  printf '%s\n' "$1" | sed -n 's/^status=//p'
+}
+
+# Every value the probe reported for one field, in order: one line for a scalar,
+# one per entry for `verified[].at`, and nothing at all for a field that is
+# absent or empty. Matched as a literal prefix rather than with a regular
+# expression, because `verified[].at` is a bracket expression to sed and would
+# match nothing at all.
+_okf_frontmatter_field() { # $1 = probe output, $2 = field name
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      "field:$2="*) printf '%s\n' "${line#"field:$2="}" ;;
+    esac
+  done <<< "$1"
+}
+
+# Every SPEC.md §4 field, read out of one concept and asserted empty — what a
+# file that is not a concept must leave behind. The probe reads a full concept
+# first, so every variable held a value that this had to clear.
+_okf_frontmatter_assert_not_a_concept() { # $1 = path, $2 = what it is, $3.. = field names
+  local path="$1" what="$2"
+  shift 2
+  local out field
+  out="$(_okf_frontmatter_probe \
+    "$FIXTURES_DIR/concepts/src/route/RouteRegistry.md" "$path" "$@")"
+
+  assert_eq "1" "$(_okf_frontmatter_status "$out")" \
+    "read_frontmatter refuses $what"
+  for field in "$@"; do
+    assert_eq "" "$(_okf_frontmatter_field "$out" "$field")" \
+      "$field is empty after read_frontmatter refused $what"
+  done
+}
+
+# The reader owed by PLAN.md's Phase 4: every field SPEC.md §4 lists as
+# shell-read, out of a concept that carries all of them.
+test_okf_frontmatter_reader_exposes_every_spec_field() {
+  local okf="$TOOLKIT_ROOT/bin/okf"
+  if [ ! -x "$okf" ]; then
+    _fail "bin/okf is an executable script" "missing or not executable: $okf"
+    return 1
+  fi
+
+  local -a fields=()
+  local field
+  while IFS= read -r field; do
+    [ -n "$field" ] && fields+=("$field")
+  done < <(_okf_spec_frontmatter_fields)
+
+  # Guards the extraction above: were §4's sentence reworded past it, every
+  # check below would vanish and this test would pass having asserted nothing.
+  # Bailing rather than continuing, because "${fields[@]}" on an empty array
+  # aborts the whole run under `set -u` on bash 3.2.
+  if [ "${#fields[@]}" -eq 0 ]; then
+    _fail "SPEC.md §4 lists the fields the shell reads" \
+      "extracted no field names from §4's \"Fields the shell reads\" sentence"
+    return 1
+  fi
+
+  local out
+  out="$(_okf_frontmatter_probe "" \
+    "$FIXTURES_DIR/concepts/src/route/RouteRegistry.md" "${fields[@]}")"
+  assert_eq "0" "$(_okf_frontmatter_status "$out")" \
+    "read_frontmatter accepts a concept carrying a §4 frontmatter block"
+
+  local expected
+  for field in "${fields[@]}"; do
+    case "$out" in
+      *"missing:$field"*)
+        _fail "bin/okf exposes SPEC.md §4's $field" \
+          "read_frontmatter fills no variable for it, so §4 lists a field that" \
+          "nothing in bin/okf reads"
+        continue
+        ;;
+    esac
+    case "$field" in
+      type) expected="Class" ;;
+      resource) expected="/src/route/RouteRegistry.java" ;;
+      status) expected="stable" ;;
+      stale_after) expected="2026-11-24T00:00:00Z" ;;
+      generated.at) expected="2026-08-26T14:02:11Z" ;;
+      generated.by) expected="claude-code/opus-5" ;;
+      # Both entries, in document order: SPEC.md §8 never strips one, so the
+      # newest is not the only one a caller gets to see.
+      "verified[].at") expected="$(printf '2026-08-26T15:00:00Z\n2026-08-26T16:40:00Z')" ;;
+      code.content_hash)
+        expected="sha256:e36b6b992dae1387b2cc894187355b3556b3ca483e4670efa7283ce08c88fa19"
+        ;;
+      code.tier) expected="2" ;;
+      code.symbol) expected="com.kairos.route.RouteRegistry" ;;
+      code.language) expected="java" ;;
+      *)
+        _fail "this test knows what SPEC.md §4's $field should read as" \
+          "§4 lists a field the fixture concept and this test say nothing about" \
+          "— add it to tests/fixtures/concepts/src/route/RouteRegistry.md and" \
+          "to the expected values here"
+        continue
+        ;;
+    esac
+    assert_eq "$expected" "$(_okf_frontmatter_field "$out" "$field")" \
+      "okf reads $field out of a concept's frontmatter"
+  done
+  return 0
+}
+
+# The other half of reading §4: where the reader has to stop. Every line in the
+# Boundaries fixture that looks like one of these fields is one it must not be
+# read as — a `sources:` entry's `resource:`, a `symbol:` nested deeper inside
+# the `code:` block, an unindented `tier:` written after that block closed — and
+# each impostor sits above the real field it imitates, so a reader that took it
+# would take it in preference rather than be outvoted by first-one-wins.
+test_okf_frontmatter_reader_stops_where_spec_says_it_stops() {
+  local concept="$FIXTURES_DIR/concepts/src/route/Boundaries.md" out
+  out="$(_okf_frontmatter_probe "" "$concept" \
+    resource status stale_after generated.at generated.by "verified[].at" \
+    code.content_hash code.tier code.symbol code.language)"
+
+  assert_eq "0" "$(_okf_frontmatter_status "$out")" \
+    "read_frontmatter accepts the boundaries concept"
+
+  # §4: `sources` is external references and never a restatement of `resource`,
+  # so the indented `resource:` inside that list is not the concept's own. The
+  # trailing `# comment` on the real one is not part of the path either — YAML
+  # ends an unquoted scalar at a `#` with whitespace in front of it.
+  assert_eq "/src/route/Boundaries.java" "$(_okf_frontmatter_field "$out" resource)" \
+    "a sources[] entry's resource is not read as the concept's resource"
+
+  # A top-level key ends the block above it, so `status:` written after the
+  # `code:` block is the concept's status; and the first line naming a value
+  # wins, so the second `status:` further down does not replace it. Two keys of
+  # one name is malformed YAML with no defined meaning — this is bin/okf's
+  # documented choice for it, and the same one §4 makes for `code.X`.
+  assert_eq "stable" "$(_okf_frontmatter_field "$out" status)" \
+    "a top-level key after the code: block is read, and the first one wins"
+
+  # §4's extraction rule is `^  X: ` inside the `code:` block — exactly two
+  # spaces — so neither the unindented `tier:` written after the block nor the
+  # `symbol:` and `tier:` of a mapping nested a level deeper inside it is a
+  # value of that field.
+  assert_eq "" "$(_okf_frontmatter_field "$out" code.tier)" \
+    "an unindented tier: after the code: block is not code.tier"
+  assert_eq "" "$(_okf_frontmatter_field "$out" code.symbol)" \
+    "a symbol: nested a level deeper inside the code: block is not code.symbol"
+  # The `code:` header carries a comment, so this also says the comment did not
+  # stop the bare header opening its block; and a whole-line comment sits inside
+  # that block, above `content_hash:`, so the hash below says the comment did
+  # not end the block either.
+  assert_eq "java" "$(_okf_frontmatter_field "$out" code.language)" \
+    "a deeper mapping inside the code: block neither ends it nor supplies its scalars"
+  # Quoted, and with a comment after the closing quote: the quotes go, the
+  # comment goes, and what is left is what `okf hash` has to match for SPEC.md
+  # §8 to call the concept undrifted.
+  assert_eq "sha256:52f70d8e08c013253274deae575fa6f3e725ed5bd9ae6705c4b15714b9119645" \
+    "$(_okf_frontmatter_field "$out" code.content_hash)" \
+    "the two-space content_hash is read and the four-space one above it is not"
+
+  # `generated.at` is read by the same rule, so a deeper `at:` nested under
+  # `generated:` is not it.
+  assert_eq "2026-08-26T14:02:11Z" "$(_okf_frontmatter_field "$out" generated.at)" \
+    "an at: nested deeper under generated: is not generated.at"
+  assert_eq "claude-code/opus-5" "$(_okf_frontmatter_field "$out" generated.by)" \
+    "generated.by is read from the same block"
+
+  # A verified entry names its `at` on the `-` line or on one of the lines after
+  # it, whichever comes first. An entry naming none contributes no timestamp,
+  # and an `at:` nested deeper inside an entry that has already named one
+  # belongs to something else.
+  #
+  # This fixture writes those entries flush left, which is the same document as
+  # §4's indented example and what most YAML writers emit. Read as top-level
+  # keys they would end the block on its first entry, and a concept a human has
+  # reviewed would come back with no verified timestamps at all.
+  #
+  # Its second entry buries an `at:` in a nested mapping and another in a nested
+  # list, both above the one that is really the entry's. Only a reader that
+  # knows which column the entry's own keys are in gets that entry right. Its
+  # last entry names `at` twice, which is one entry however malformed, so it
+  # contributes the first of the two and no more.
+  assert_eq "$(printf '2026-08-27T09:00:00Z\n2026-08-27T10:00:00Z\n2026-08-27T11:00:00Z')" \
+    "$(_okf_frontmatter_field "$out" "verified[].at")" \
+    "verified[].at is one timestamp per entry that names one, and nothing else"
+
+  assert_eq "" "$(_okf_frontmatter_field "$out" stale_after)" \
+    "a field the concept does not declare reads as absent"
+  return 0
+}
+
+# A concept that declares almost nothing is read, not refused: the fields it
+# leaves out are absent rather than an error, because SPEC.md §5's Tier 0 stub
+# is a concept with frontmatter and little else.
+test_okf_frontmatter_reader_leaves_absent_fields_empty() {
+  local concept="$FIXTURES_DIR/concepts/src/route/RouteSource.md" out
+  out="$(_okf_frontmatter_probe \
+    "$FIXTURES_DIR/concepts/src/route/RouteRegistry.md" "$concept" \
+    type resource status stale_after generated.at generated.by "verified[].at" \
+    code.content_hash code.tier code.symbol code.language)"
+
+  assert_eq "0" "$(_okf_frontmatter_status "$out")" \
+    "read_frontmatter accepts a concept declaring only type and resource"
+  assert_eq "Interface" "$(_okf_frontmatter_field "$out" type)" \
+    "the fields a sparse concept does declare are read"
+  assert_eq "/src/route/RouteSource.java" "$(_okf_frontmatter_field "$out" resource)" \
+    "a sparse concept's resource is read"
+
+  local field
+  for field in status stale_after generated.at generated.by "verified[].at" \
+    code.content_hash code.tier code.symbol code.language; do
+    assert_eq "" "$(_okf_frontmatter_field "$out" "$field")" \
+      "$field reads as absent, and not as the last concept's value"
+  done
+  return 0
+}
+
+# SPEC.md §4's own example quotes some values and not others, and a concept
+# written on Windows arrives with CRLF line endings and a UTF-8 BOM. Neither
+# changes what the block says, and a reader that let either change what it read
+# would report a concept drifted, or orphaned, on the strength of punctuation.
+test_okf_frontmatter_reader_reads_quoted_crlf_frontmatter() {
+  local concept="$FIXTURES_DIR/concepts/src/route/Legacy.md" out
+  out="$(_okf_frontmatter_probe "" "$concept" \
+    type resource status generated.by "verified[].at" \
+    code.content_hash code.tier code.symbol)"
+
+  assert_eq "0" "$(_okf_frontmatter_status "$out")" \
+    "read_frontmatter accepts a concept written with CRLF and a BOM"
+  assert_eq "Class" "$(_okf_frontmatter_field "$out" type)" \
+    "the first key is read through a UTF-8 BOM"
+  assert_eq "/src/route/Legacy.java" "$(_okf_frontmatter_field "$out" resource)" \
+    "a double-quoted resource is read without its quotes"
+  assert_eq "stable" "$(_okf_frontmatter_field "$out" status)" \
+    "a single-quoted value is read without its quotes"
+  assert_eq "claude-code/opus-5" "$(_okf_frontmatter_field "$out" generated.by)" \
+    "a quoted value inside a nested block is read without its quotes"
+  assert_eq "2026-08-26T16:40:00Z" "$(_okf_frontmatter_field "$out" "verified[].at")" \
+    "a quoted verified entry's at is read without its quotes, and without a CR"
+  assert_eq "sha256:795f83987409387de7865a9e6bf1616535a9abee05abf3a32be590dd3e23c656" \
+    "$(_okf_frontmatter_field "$out" code.content_hash)" \
+    "a quoted content_hash is read without its quotes"
+  assert_eq "0" "$(_okf_frontmatter_field "$out" code.tier)" \
+    "a quoted tier is read without its quotes"
+  assert_eq "com.kairos.route.Legacy" "$(_okf_frontmatter_field "$out" code.symbol)" \
+    "a CRLF line's value keeps no carriage return"
+  return 0
+}
+
+# What is not a concept is refused, and refusing leaves nothing of the last
+# concept behind. A caller looping over files takes the fields as read; values
+# left standing from the file before would attribute one concept's hash, or one
+# concept's resource, to the next file along.
+test_okf_frontmatter_reader_refuses_what_is_not_a_concept() {
+  local -a fields=()
+  local field
+  while IFS= read -r field; do
+    [ -n "$field" ] && fields+=("$field")
+  done < <(_okf_spec_frontmatter_fields)
+
+  if [ "${#fields[@]}" -eq 0 ]; then
+    _fail "SPEC.md §4 lists the fields the shell reads" \
+      "extracted no field names from §4's \"Fields the shell reads\" sentence"
+    return 1
+  fi
+
+  local route="$FIXTURES_DIR/concepts/src/route"
+  _okf_frontmatter_assert_not_a_concept "$route/README.md" \
+    "prose with no frontmatter" "${fields[@]}"
+  # An interrupted /okf-generate: the block opens, names fields, and stops. What
+  # it says was on its way to being superseded, and reporting it as read cleanly
+  # is how a half-written content_hash becomes a drift report nobody can explain.
+  _okf_frontmatter_assert_not_a_concept "$route/Interrupted.md" \
+    "a frontmatter block that is never closed" "${fields[@]}"
+  _okf_frontmatter_assert_not_a_concept "$route/NoSuchConcept.md" \
+    "a file that is not there" "${fields[@]}"
+  _okf_frontmatter_assert_not_a_concept "$route" \
+    "a directory" "${fields[@]}"
+  return 0
+}
+
 # --- add new test_* functions above this line ------------------------------
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,5 @@
+# src/route/Legacy.md is checked in with CRLF line endings and a UTF-8 BOM,
+# which is the point of that file: a concept written on Windows must still be
+# read. Without this, a checkout with core.autocrlf set would rewrite the line
+# endings on the way out of git and the fixture would stop being one.
+* -text

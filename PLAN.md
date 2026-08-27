@@ -31,7 +31,7 @@ there). Items are ordered so none depends on a later one. Every item verifies wi
 
 ## Phase 4 — Tier A: frontmatter I/O
 
-- [ ] Add a frontmatter reader to bin/okf exposing the fields SPEC.md §4 lists as shell-read (type, resource, status, stale_after, generated.at, generated.by, verified[].at, and code.content_hash, code.tier, code.symbol, code.language), using the §4 extraction rule for code.X (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
+- [x] Add a frontmatter reader to bin/okf exposing the fields SPEC.md §4 lists as shell-read (type, resource, status, stale_after, generated.at, generated.by, verified[].at, and code.content_hash, code.tier, code.symbol, code.language), using the §4 extraction rule for code.X (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Add a frontmatter writer to bin/okf that sets one field in place under the SPEC.md §4 formatting contract, with tests proving an unknown top-level key and an unknown key inside the code: block both survive a rewrite byte for byte (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 
 ## Phase 5 — Tier A: drift and trust
