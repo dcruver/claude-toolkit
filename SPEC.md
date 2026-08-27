@@ -50,8 +50,14 @@ claude-toolkit/
 
 ## 3. Runtime prerequisites
 
-`bin/okf` requires `bash`, `git`, `sha256sum`, `awk`, `sed`, `rg` (ripgrep), `jq`, and —
-for Tier B only — `curl`. All are present on this machine.
+`bin/okf` requires `bash`, `git`, `sha256sum`, `awk`, `sed`, `sort`, `rg` (ripgrep),
+`jq`, and — for Tier B only — `curl`. All are present on this machine.
+
+`sort` was added 2026-08-27. Its earlier absence was not a portability decision —
+it is coreutils, present wherever `bash` and `git` are — but it did cost real
+behaviour: `okf list` omits untracked files entirely because merging them into
+sorted order needed `sort`. That omission is now a bug to fix, not a constraint
+to design around.
 
 `okf` runs a preflight on every invocation and exits 1 with a single line naming exactly
 which tools are missing and what is degraded. `jq` and `rg` are **hard** requirements for

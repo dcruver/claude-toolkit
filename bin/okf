@@ -107,7 +107,13 @@ not_implemented() { # $1 = subcommand name
 # counting fan-in — has a fallback, and a half-finished run is worse than a
 # refusal. bash is listed because §3 lists it; see have_tool for how it is
 # checked.
-OKF_REQUIRED_TOOLS=(bash git sha256sum awk sed rg jq)
+#
+# The list is §3's, not an inventory of what today's subcommands happen to
+# invoke. §3 added `sort` on 2026-08-27 for the merge of untracked files into
+# `okf list`, which is not written yet: a preflight that waited for the first
+# caller to need it would let a machine without `sort` install okf, pass every
+# check, and then fail on the run that finally used it.
+OKF_REQUIRED_TOOLS=(bash git sha256sum awk sed sort rg jq)
 
 # Needed by Tier B alone, which is the only part of okf that speaks HTTP. Its
 # absence degrades okf to Tier A rather than breaking it, so it is required
