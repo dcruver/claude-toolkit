@@ -4627,6 +4627,409 @@ test_okf_frontmatter_reader_refuses_what_is_not_a_concept() {
   return 0
 }
 
+# bin/okf's own writing of one field: `status=<rc>` for what
+# write_frontmatter_field returned and `error=<reason>` for what it left in
+# OKF_FRONTMATTER_ERROR.
+#
+# Obtained by sourcing bin/okf and calling the function directly, the way
+# _okf_frontmatter_probe calls read_frontmatter and for the same reason:
+# SPEC.md §7 defines no subcommand that sets a field, and a flag invented to
+# test with would be CLI surface the spec has not got. The names used here —
+# write_frontmatter_field, and OKF_FRONTMATTER_ERROR — are the contract this
+# item owes `check --stamp` and `verify`, so a rename that breaks them should
+# fail loudly.
+_okf_frontmatter_write() { # $1 = concept, $2 = field, $3 = value
+  local probe="$HARNESS_STATE/okf-frontmatter-write.sh"
+  if [ ! -f "$probe" ]; then
+    cat > "$probe" <<'PROBE'
+#!/usr/bin/env bash
+okf_script="$1"
+shift
+# shellcheck source=/dev/null
+. "$okf_script"
+
+rc=0
+write_frontmatter_field "$1" "$2" "$3" || rc=$?
+printf 'status=%s\n' "$rc"
+printf 'error=%s\n' "$OKF_FRONTMATTER_ERROR"
+PROBE
+    chmod +x "$probe" || return 1
+  fi
+  "$probe" "$TOOLKIT_ROOT/bin/okf" "$@" 2>&1
+}
+
+_okf_write_status() { # $1 = probe output
+  printf '%s\n' "$1" | sed -n 's/^status=//p'
+}
+
+_okf_write_error() { # $1 = probe output
+  printf '%s\n' "$1" | sed -n 's/^error=//p'
+}
+
+# Every byte of a concept, with the lines named by the given literal prefixes
+# left out, in a form two files can be compared as strings.
+#
+# This is what "byte for byte" is asserted with. Every line is printed exactly
+# as read — its CR, its BOM, its trailing comment, its indentation — and the
+# marker at the end says whether the file ended with a newline, which a `$(...)`
+# would otherwise strip from both sides and so could never report. Omitting the
+# line the writer was asked to set is what leaves the assertion saying "and
+# nothing else changed", which is the whole claim: SPEC.md §1 puts a concept's
+# unknown keys and its prose on Claude's side of the division of labour, and a
+# writer that reflowed either would be the shell overwriting work it cannot
+# reproduce.
+_okf_concept_bytes() { # $1 = path, $2.. = literal line prefixes to omit
+  local path="$1"
+  shift
+  local line prefix final=nl partial=0 emit
+  while true; do
+    if IFS= read -r line; then
+      partial=0
+    else
+      # A last line with no newline after it: still a line, and the fact that
+      # nothing followed it is part of what this has to report.
+      [ -n "$line" ] || break
+      partial=1
+      final=no-nl
+    fi
+    emit=1
+    # `${1+"$@"}` because an unquoted `"$@"` with no positional parameters is
+    # an unbound variable under `set -u` on bash 3.2, and this is called with
+    # no prefixes at all whenever a whole file is being compared.
+    for prefix in ${1+"$@"}; do
+      case "$line" in "$prefix"*) emit=0 ;; esac
+    done
+    [ "$emit" -eq 0 ] || printf '%s\n' "$line"
+    [ "$partial" -eq 0 ] || break
+  done < "$path"
+  printf '[[eof:%s]]\n' "$final"
+}
+
+# The first line of a concept starting with a literal prefix, exactly as it is
+# written in the file. Used to say that one particular line is still there and
+# still says what it said — an unknown key that survived — where
+# _okf_concept_bytes says that everything else did.
+_okf_concept_line() { # $1 = path, $2 = literal line prefix
+  local line
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "$2"*)
+        printf '%s\n' "$line"
+        return 0
+        ;;
+    esac
+  done < "$1"
+  return 0
+}
+
+# The writer owed by PLAN.md's Phase 4, on the field that already exists: it is
+# rewritten where it stood, and the rest of the concept is not touched.
+#
+# The fixture is the same one the reader is tested against, which is the point:
+# it carries keys SPEC.md §4 defines and bin/okf has no variable for (`title`,
+# `tags`, `sources`), and keys inside the `code:` block in the same position
+# (`kind`, `members`, `commit`). PLAN.md asks that an unknown top-level key and
+# an unknown key inside `code:` both survive a rewrite byte for byte, and they
+# are named individually below as well as covered by the whole-file comparison.
+_okf_writer_sets_a_field_in_place() {
+  local concept="src/route/RouteRegistry.md"
+  local pristine="$FIXTURES_DIR/concepts/$concept"
+  local digest="sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  local out
+
+  out="$(_okf_frontmatter_write "$concept" code.content_hash "$digest")"
+  assert_eq "0" "$(_okf_write_status "$out")" \
+    "write_frontmatter_field sets code.content_hash"
+  assert_eq "" "$(_okf_write_error "$out")" \
+    "a write that succeeded leaves no error behind"
+
+  # Read back with bin/okf's own reader: a value written where the reader does
+  # not look is a write that silently did nothing.
+  local read_out
+  read_out="$(_okf_frontmatter_probe "" "$concept" \
+    type resource status stale_after generated.at generated.by "verified[].at" \
+    code.content_hash code.tier code.symbol code.language)"
+  assert_eq "$digest" "$(_okf_frontmatter_field "$read_out" code.content_hash)" \
+    "the written code.content_hash is what read_frontmatter reads back"
+  assert_eq "2" "$(_okf_frontmatter_field "$read_out" code.tier)" \
+    "the field beside it in the code: block is unchanged"
+  assert_eq "stable" "$(_okf_frontmatter_field "$read_out" status)" \
+    "a top-level field is unchanged"
+  assert_eq "$(printf '2026-08-26T15:00:00Z\n2026-08-26T16:40:00Z')" \
+    "$(_okf_frontmatter_field "$read_out" "verified[].at")" \
+    "both verified entries survive, as SPEC.md §8 requires"
+
+  # The two PLAN.md names outright, before the whole-file comparison says the
+  # same thing about every other line.
+  assert_eq "title: RouteRegistry" "$(_okf_concept_line "$concept" "title:")" \
+    "an unknown top-level key survives the rewrite"
+  assert_eq "  kind: class" "$(_okf_concept_line "$concept" "  kind:")" \
+    "an unknown key inside the code: block survives the rewrite"
+
+  assert_eq "$(_okf_concept_bytes "$pristine" "  content_hash:")" \
+    "$(_okf_concept_bytes "$concept" "  content_hash:")" \
+    "every byte but the content_hash line is exactly as it was"
+  return 0
+}
+
+test_okf_frontmatter_writer_sets_a_field_in_place() {
+  with_fixture_repo concepts _okf_writer_sets_a_field_in_place
+}
+
+# The other half: a field the concept has not got, and a `code:` block it has
+# not got either. Both are inserted where SPEC.md §4's extraction rule looks
+# for them, and again nothing else moves.
+_okf_writer_inserts_absent_fields() {
+  local concept="src/route/RouteSource.md"
+  local pristine="$FIXTURES_DIR/concepts/$concept"
+  local out
+
+  out="$(_okf_frontmatter_write "$concept" status draft)"
+  assert_eq "0" "$(_okf_write_status "$out")" \
+    "write_frontmatter_field inserts an absent top-level field"
+
+  out="$(_okf_frontmatter_write "$concept" code.tier 0)"
+  assert_eq "0" "$(_okf_write_status "$out")" \
+    "write_frontmatter_field opens the code: block a concept has not got"
+
+  local read_out
+  read_out="$(_okf_frontmatter_probe "" "$concept" \
+    type resource status code.tier)"
+  assert_eq "0" "$(_okf_frontmatter_status "$read_out")" \
+    "the rewritten concept is still a concept"
+  assert_eq "draft" "$(_okf_frontmatter_field "$read_out" status)" \
+    "the inserted top-level field is read back"
+  assert_eq "0" "$(_okf_frontmatter_field "$read_out" code.tier)" \
+    "the field inserted into the new code: block is read back"
+  assert_eq "Interface" "$(_okf_frontmatter_field "$read_out" type)" \
+    "the fields the concept already declared are unchanged"
+
+  # Two spaces, exactly, because that is what §4's extraction rule matches and
+  # what read_frontmatter above implements.
+  assert_eq "  tier: 0" "$(_okf_concept_line "$concept" "  tier:")" \
+    "the inserted code.X sits at exactly two spaces"
+  assert_eq "code:" "$(_okf_concept_line "$concept" "code:")" \
+    "the block it went into is a bare header"
+
+  assert_eq "$(_okf_concept_bytes "$pristine")" \
+    "$(_okf_concept_bytes "$concept" "status:" "code:" "  tier:")" \
+    "insertion adds its lines and changes nothing else"
+  return 0
+}
+
+test_okf_frontmatter_writer_inserts_absent_fields() {
+  with_fixture_repo concepts _okf_writer_inserts_absent_fields
+}
+
+# Where the writer puts a field has to be where the reader takes it from, so
+# the awkward concept the reader is held to is the one the writer is held to as
+# well. Every line in it that looks like one of these fields is one neither of
+# them may treat as one.
+_okf_writer_writes_where_the_reader_reads() {
+  local concept="src/route/Boundaries.md"
+  local pristine="$FIXTURES_DIR/concepts/$concept"
+  local out
+
+  # `code.symbol` is absent from this block — the `symbol:` lines in it are a
+  # `code.members` entry and a mapping nested one level deeper, both at four
+  # spaces — so this inserts rather than replaces, and inserting it anywhere
+  # below those two would be writing a field the reader still would not read.
+  out="$(_okf_frontmatter_write "$concept" code.symbol com.kairos.route.Boundaries)"
+  assert_eq "0" "$(_okf_write_status "$out")" \
+    "write_frontmatter_field sets code.symbol on the boundaries concept"
+
+  # Two top-level `status:` lines, which is malformed YAML with no defined
+  # meaning: the reader takes the first, so the writer must rewrite that one.
+  out="$(_okf_frontmatter_write "$concept" status draft)"
+  assert_eq "0" "$(_okf_write_status "$out")" \
+    "write_frontmatter_field sets the first of two status: lines"
+
+  local read_out
+  read_out="$(_okf_frontmatter_probe "" "$concept" \
+    status code.symbol code.tier code.language code.content_hash)"
+  assert_eq "com.kairos.route.Boundaries" \
+    "$(_okf_frontmatter_field "$read_out" code.symbol)" \
+    "the inserted code.symbol is what read_frontmatter reads back"
+  assert_eq "draft" "$(_okf_frontmatter_field "$read_out" status)" \
+    "the rewritten status is what read_frontmatter reads back"
+  assert_eq "java" "$(_okf_frontmatter_field "$read_out" code.language)" \
+    "the code: block's own scalars are untouched"
+  assert_eq "" "$(_okf_frontmatter_field "$read_out" code.tier)" \
+    "a field the reader does not read is still not read after the write"
+
+  # The impostors are still there, still saying what they said: the writer read
+  # them the way the reader does and left them alone.
+  assert_eq "    symbol: com.kairos.route.OldBoundaries" \
+    "$(_okf_concept_line "$concept" "    symbol:")" \
+    "a symbol: nested deeper inside the code: block is not rewritten"
+  assert_eq "status: draft" "$(_okf_concept_line "$concept" "status: draft")" \
+    "the second status: line is left where it was"
+
+  # The same three lines omitted from both sides, spelled out in full rather
+  # than as prefixes: this concept has a second `status:` and a `  symbol:` of
+  # its own further down, and a prefix wide enough to catch the line that
+  # changed would take those with it and quietly stop comparing them.
+  assert_eq \
+    "$(_okf_concept_bytes "$pristine" \
+      "status: stable" "status: draft" "  symbol: com.kairos.route.Boundaries")" \
+    "$(_okf_concept_bytes "$concept" \
+      "status: stable" "status: draft" "  symbol: com.kairos.route.Boundaries")" \
+    "the rest of the awkward concept is byte for byte as it was"
+  return 0
+}
+
+test_okf_frontmatter_writer_writes_where_the_reader_reads() {
+  with_fixture_repo concepts _okf_writer_writes_where_the_reader_reads
+}
+
+# A concept written on Windows stays written on Windows. The line the writer
+# replaces takes the line ending of the line it replaced, and every other byte
+# — the UTF-8 BOM on line 1 included — comes through untouched. A writer that
+# normalised either would rewrite every line of the file on the first field it
+# was asked to set.
+_okf_writer_keeps_crlf_and_a_bom() {
+  local concept="src/route/Legacy.md"
+  local pristine="$FIXTURES_DIR/concepts/$concept"
+  local out
+
+  out="$(_okf_frontmatter_write "$concept" code.tier 1)"
+  assert_eq "0" "$(_okf_write_status "$out")" \
+    "write_frontmatter_field sets a field in a CRLF concept"
+
+  assert_eq "$(printf '  tier: 1\r')" "$(_okf_concept_line "$concept" "  tier:")" \
+    "the rewritten line keeps the CRLF ending of the line it replaced"
+  assert_eq "$(printf '\xef\xbb\xbf---\r')" "$(_okf_concept_line "$concept" "$(printf '\xef\xbb\xbf')")" \
+    "the UTF-8 BOM on line 1 is still there"
+
+  local read_out
+  read_out="$(_okf_frontmatter_probe "" "$concept" code.tier code.symbol)"
+  assert_eq "1" "$(_okf_frontmatter_field "$read_out" code.tier)" \
+    "the written value is read back without a carriage return"
+  assert_eq "com.kairos.route.Legacy" \
+    "$(_okf_frontmatter_field "$read_out" code.symbol)" \
+    "the rest of the CRLF block still reads"
+
+  assert_eq "$(_okf_concept_bytes "$pristine" "  tier:")" \
+    "$(_okf_concept_bytes "$concept" "  tier:")" \
+    "every other byte of the CRLF concept is as it was"
+  return 0
+}
+
+test_okf_frontmatter_writer_keeps_crlf_and_a_bom() {
+  with_fixture_repo concepts _okf_writer_keeps_crlf_and_a_bom
+}
+
+# SPEC.md §4's formatting contract is what the shell reads by, but a concept is
+# also YAML that OKF's own readers parse. A value that would not survive both
+# readings is quoted; one that could not survive either is refused rather than
+# written, because the field it would land in is `content_hash` — and a hash
+# that reads back as something else is a concept reported drifted for ever.
+_okf_writer_quotes_what_it_must() {
+  local concept="src/route/RouteSource.md" out read_out value
+
+  for value in "a value with spaces" "no" "trailing space " "with #hash" \
+    "it's quoted" 'says "so"' 'back\slash' "-leading-dash" "a: b"; do
+    out="$(_okf_frontmatter_write "$concept" code.symbol "$value")"
+    assert_eq "0" "$(_okf_write_status "$out")" \
+      "write_frontmatter_field writes [$value]"
+    read_out="$(_okf_frontmatter_probe "" "$concept" code.symbol)"
+    assert_eq "$value" "$(_okf_frontmatter_field "$read_out" code.symbol)" \
+      "[$value] reads back exactly as it was written"
+  done
+
+  # A value carrying both kinds of quote has no spelling okf can read back:
+  # escaping it means `\"` or `''`, and frontmatter_scalar undoes neither.
+  out="$(_okf_frontmatter_write "$concept" code.symbol "it's \"both\"")"
+  assert_eq "1" "$(_okf_write_status "$out")" \
+    "a value carrying both kinds of quote is refused"
+  assert_contains "$(_okf_write_error "$out")" "both kinds of quote" \
+    "and the refusal says why"
+
+  # §4: no multi-line or folded scalars in any field the shell reads, and no
+  # tabs anywhere.
+  out="$(_okf_frontmatter_write "$concept" code.symbol "$(printf 'one\ntwo')")"
+  assert_eq "1" "$(_okf_write_status "$out")" \
+    "a value spanning two lines is refused"
+  out="$(_okf_frontmatter_write "$concept" code.symbol "$(printf 'one\ttwo')")"
+  assert_eq "1" "$(_okf_write_status "$out")" \
+    "a value containing a tab is refused"
+
+  # `key:` with nothing after it is a block header, so writing an empty value
+  # would write a structure rather than an empty field.
+  out="$(_okf_frontmatter_write "$concept" code.symbol "")"
+  assert_eq "1" "$(_okf_write_status "$out")" \
+    "an empty value is refused"
+  return 0
+}
+
+test_okf_frontmatter_writer_quotes_what_it_must() {
+  with_fixture_repo concepts _okf_writer_quotes_what_it_must
+}
+
+# What is not a concept is not edited, and neither is a line that is not a
+# field. Every refusal below has to leave the file byte for byte as it was:
+# a writer that truncated a file it then decided against would destroy the very
+# half-written concept it was refusing to touch.
+_okf_writer_refuses_what_it_must() {
+  local out before
+
+  before="$(_okf_concept_bytes src/route/README.md)"
+  out="$(_okf_frontmatter_write src/route/README.md status draft)"
+  assert_eq "1" "$(_okf_write_status "$out")" \
+    "prose with no frontmatter is refused"
+  assert_contains "$(_okf_write_error "$out")" "carries no frontmatter block" \
+    "and the refusal says why"
+  assert_eq "$before" "$(_okf_concept_bytes src/route/README.md)" \
+    "the refused file is byte for byte as it was"
+
+  before="$(_okf_concept_bytes src/route/Interrupted.md)"
+  out="$(_okf_frontmatter_write src/route/Interrupted.md status draft)"
+  assert_eq "1" "$(_okf_write_status "$out")" \
+    "a frontmatter block that is never closed is refused"
+  assert_eq "$before" "$(_okf_concept_bytes src/route/Interrupted.md)" \
+    "the interrupted concept is byte for byte as it was"
+
+  out="$(_okf_frontmatter_write src/route/NoSuchConcept.md status draft)"
+  assert_eq "1" "$(_okf_write_status "$out")" \
+    "a file that is not there is refused"
+  out="$(_okf_frontmatter_write src/route status draft)"
+  assert_eq "1" "$(_okf_write_status "$out")" \
+    "a directory is refused"
+
+  # Overwriting a block header with a scalar strands every line under it, and
+  # a `verified:` holding `- ` items is a list: appending an entry to it is
+  # SPEC.md §7's `okf verify` and not this.
+  before="$(_okf_concept_bytes src/route/RouteRegistry.md)"
+  out="$(_okf_frontmatter_write src/route/RouteRegistry.md code x)"
+  assert_eq "1" "$(_okf_write_status "$out")" \
+    "a field whose line is a bare block header is refused"
+  assert_contains "$(_okf_write_error "$out")" "opens a block" \
+    "and the refusal says why"
+  out="$(_okf_frontmatter_write src/route/RouteRegistry.md verified.at 2026-01-01T00:00:00Z)"
+  assert_eq "1" "$(_okf_write_status "$out")" \
+    "a field inside a block of list entries is refused"
+  assert_contains "$(_okf_write_error "$out")" "is a list" \
+    "and the refusal says why"
+  assert_eq "$before" "$(_okf_concept_bytes src/route/RouteRegistry.md)" \
+    "neither refusal touched the concept"
+
+  # Names that are not field names: nothing here is written into a file, but
+  # each would be built into a pattern or into the line itself.
+  local name
+  for name in "" "2tier" "st atus" "code.*" "a.b.c"; do
+    out="$(_okf_frontmatter_write src/route/RouteRegistry.md "$name" x)"
+    assert_eq "1" "$(_okf_write_status "$out")" \
+      "[$name] is refused as a field name"
+  done
+  assert_eq "$before" "$(_okf_concept_bytes src/route/RouteRegistry.md)" \
+    "and none of them touched the concept either"
+  return 0
+}
+
+test_okf_frontmatter_writer_refuses_what_it_must() {
+  with_fixture_repo concepts _okf_writer_refuses_what_it_must
+}
+
 # --- add new test_* functions above this line ------------------------------
 
 # ---------------------------------------------------------------------------

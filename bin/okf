@@ -1861,6 +1861,483 @@ read_frontmatter() { # $1 = a path to a concept file
   return 0
 }
 
+# Whether one half of a dotted frontmatter field name is a name at all.
+#
+# Both halves are built into `case` patterns below and into the line that is
+# written, so neither can be taken on trust: a name carrying a `*` or a `[`
+# would match lines it does not name, and one carrying a `:`, a space or a
+# newline would write a line that is not the field it was asked for. The set
+# allowed here is the set OKF's own field names are drawn from.
+valid_frontmatter_key() { # $1 = one half of a field name
+  case "$1" in
+    "" | *[!A-Za-z0-9_-]*) return 1 ;;
+    # A leading digit or `-` is a name no YAML writer produces and a name this
+    # would have to quote to write; refusing is the shorter answer.
+    [A-Za-z_]*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Why a value read back out of a concept is not always the value that was
+# written into it, and what this does about that.
+#
+# SPEC.md §4's formatting contract is a promise made to `awk` — and through it
+# to read_frontmatter above — but a concept is also YAML, which OKF's own
+# readers parse properly. A writer that satisfied only the first of those two
+# would produce files okf agrees with and nothing else does. So a value is
+# written bare only when it is a plain scalar to a real parser as well: no
+# whitespace anywhere in it (which is what rules out both a `: ` inside it and
+# a trailing ` #` that would start a comment), nothing that opens a flow
+# collection, an anchor, a tag or a block scalar, and none of the words a
+# YAML 1.1 reader turns into a boolean or a null. `status: no` written bare
+# comes back from such a reader as `false`.
+#
+# Everything else is single-quoted, and double-quoted only when the value
+# contains a `'`. That order is the opposite of SPEC.md §4's example, which
+# quotes its hashes with `"`, and the difference is deliberate: YAML processes
+# escape sequences inside double quotes and none at all inside single quotes,
+# while frontmatter_scalar above processes neither. A Windows path or a regex
+# written into a double-quoted scalar is one value to okf and another to every
+# real parser; single-quoted, the two agree. §4's own spelling is still read
+# correctly — this is about what okf emits, not about what it accepts.
+#
+# A value carrying both kinds of quote is refused rather than escaped, because
+# escaping it means `\"` or `''` and neither is something frontmatter_scalar
+# undoes: writing one would be okf producing a file okf itself misreads.
+#
+# The answer is left in OKF_FRONTMATTER_RENDERED rather than printed, as
+# frontmatter_scalar leaves its own: a `$(...)` here is a fork per field
+# written.
+OKF_FRONTMATTER_RENDERED=""
+render_frontmatter_scalar() { # $1 = the value to write
+  local value="$1" safe=1
+
+  # Empty is refused, and not on a technicality. `key:` with nothing after it
+  # is a bare block header — the very line read_frontmatter reads as "a block
+  # opens here" — so writing an empty value would not write an empty field, it
+  # would write a structure. Clearing a field means removing its line, which is
+  # a different operation with a different name and one nothing asks for.
+  if [ -z "$value" ]; then
+    OKF_FRONTMATTER_ERROR="an empty value would write a block header, not a field"
+    return 1
+  fi
+  case "$value" in
+    *$'\n'* | *$'\r'*)
+      # §4: no multi-line or folded scalars in any field the shell reads.
+      OKF_FRONTMATTER_ERROR="a value spanning more than one line cannot be written"
+      return 1
+      ;;
+    *$'\t'*)
+      # §4: no tabs anywhere. YAML forbids them as indentation, and a writer
+      # emitting one would be putting a character into the file that its own
+      # contract says is not in there.
+      OKF_FRONTMATTER_ERROR="a value containing a tab cannot be written"
+      return 1
+      ;;
+  esac
+
+  # One `case`, every disqualification in it, because they all have the same
+  # consequence. In order: a character outside the plain-scalar set; one of the
+  # few characters in that set that means something else in first position; a
+  # trailing `:`, which is where a plain scalar turns into a mapping key; and
+  # YAML 1.1's booleans and nulls, spelled out because `${value,,}` needs
+  # bash 4 and macOS still ships 3.2.
+  case "$value" in
+    *[!A-Za-z0-9_.:+@=/-]* | [-.:+=@]* | *: \
+      | [Tt][Rr][Uu][Ee] | [Ff][Aa][Ll][Ss][Ee] | [Yy][Ee][Ss] | [Nn][Oo] \
+      | [Oo][Nn] | [Oo][Ff][Ff] | [Nn][Uu][Ll][Ll] | [Nn][Oo][Nn][Ee] \
+      | [Nn][Aa][Nn] | [Ii][Nn][Ff] | [YyNn])
+      safe=0
+      ;;
+  esac
+
+  if [ "$safe" -eq 1 ]; then
+    OKF_FRONTMATTER_RENDERED="$value"
+  else
+    case "$value" in
+      *"'"*)
+        case "$value" in
+          *'"'* | *'\'*)
+            OKF_FRONTMATTER_ERROR="a value carrying both kinds of quote cannot be written"
+            return 1
+            ;;
+        esac
+        OKF_FRONTMATTER_RENDERED="\"$value\""
+        ;;
+      *) OKF_FRONTMATTER_RENDERED="'$value'" ;;
+    esac
+  fi
+
+  # Read back with this file's own reader before it goes anywhere near the
+  # concept. Everything above is a rule about YAML; this is the one check that
+  # the two readings agree, and it is the difference between a writer that is
+  # correct and one that is correct as far as anybody has thought about it.
+  # A value okf could not read back is refused rather than written, because the
+  # field it would land in is `content_hash` — and a hash that reads back as
+  # something else is a concept reported drifted for ever.
+  frontmatter_scalar " $OKF_FRONTMATTER_RENDERED"
+  if [ "$OKF_FRONTMATTER_SCALAR" != "$value" ]; then
+    OKF_FRONTMATTER_ERROR="the value cannot be written as a scalar okf can read back"
+    return 1
+  fi
+  return 0
+}
+
+# Sets one field of one concept's SPEC.md §4 frontmatter, in place, leaving
+# every other byte of the file exactly as it was.
+#
+#   write_frontmatter_field <concept> <field> <value>
+#
+# `<field>` is §4's own dotted spelling — `status`, `stale_after`,
+# `code.content_hash`, `generated.at` — and the field is written where §4's
+# extraction rule looks for it: a top-level key unindented, a `code.X` or
+# `generated.X` at exactly two spaces inside that block. An existing field is
+# rewritten in place, an absent one inserted, and an absent `code:` block
+# created. Returns 0 on success and 1 otherwise, with the reason left in
+# OKF_FRONTMATTER_ERROR for the caller to report: nothing is printed here,
+# because what a subcommand needs to say about a failed `check --stamp` is not
+# what it needs to say about a failed `verify`.
+#
+# **Byte for byte is the requirement, not a nicety.** A concept is mostly
+# fields this script has no opinion about — §4's `title`, `tags`, `sources`,
+# `code.members`, whatever OKF adds next — around a body somebody wrote.
+# SPEC.md §1 puts all of that on Claude's side of the division of labour, so a
+# writer that reformatted, reordered or dropped an unrecognised key would be
+# the shell overwriting work it cannot reproduce. Every line but the one being
+# set is therefore copied out exactly as it came in, keeping its CRLF, a UTF-8
+# BOM, a trailing comment, and the absence of a final newline. tests/toolkit.sh
+# holds it to that with an unknown top-level key and an unknown key inside the
+# `code:` block.
+#
+# The one line that does change is replaced whole, so a `# regenerate after the
+# refactor` somebody left beside the old value goes with it. That is the
+# honest outcome: the note was about a value that is no longer there, and
+# read_frontmatter has been discarding it as a comment all along — carrying it
+# over would attach it to a value it was never written about.
+#
+# Which line *is* the field is decided by read_frontmatter's rules, because the
+# two have to agree: a value written where the reader does not look is a write
+# that silently did nothing.
+#
+#   * A top-level key is unindented and is neither a comment nor a list item;
+#     it ends whatever nested block was open.
+#   * `code.X` is the first `^  X:` after the bare `code:` header and before
+#     that boundary, which is §4's extraction rule. Exactly two spaces — a
+#     `symbol:` inside a `code.members` entry is at four, and belongs to a
+#     member rather than to the type.
+#   * The first line naming the field wins, which is §4's rule for `code.X` and
+#     the one read_frontmatter applies to every field. So the line rewritten is
+#     the line the reader was reading, and a malformed duplicate below it is
+#     left alone — it was already being ignored.
+#
+# An absent field is inserted rather than appended: a new `code.X` goes
+# immediately below its block header and a new top-level key immediately above
+# the closing `---`. Both positions make the written line the first of its
+# name, so a malformed duplicate further down cannot shadow it — writing a
+# field that another line then wins over is the same silent no-op as writing it
+# where the reader never looks.
+#
+# What it refuses, and why each is a refusal rather than a best effort:
+#
+#   * A file with no frontmatter, one that opens a block and never closes it,
+#     or no file at all. That is read_frontmatter's own definition of "not a
+#     concept", and the answer to a half-written concept is to finish writing
+#     it rather than to edit it.
+#   * A field whose existing line is a bare block header — `code`, or a
+#     `verified` written as a list. Overwriting `code:` with `code: value`
+#     strands every line indented under it. A key written with nothing after
+#     its colon and nothing indented under it is not that: it is a field whose
+#     value is null, and it is given one.
+#   * A field inside a block whose entries are a sequence, which is the same
+#     objection from the other end: `verified:` holds `- ` items, and an
+#     `  at:` inserted under it turns a list into a mapping. Appending a
+#     verified entry is SPEC.md §7's `okf verify`, a list operation and not
+#     this one.
+#   * A `code.X` where `code:` is a scalar. There is no block to put it in, and
+#     opening a second `code:` would leave the concept with two.
+#
+# The write truncates the concept and rewrites it, which is the trade
+# init_write makes and for the same reason: SPEC.md §3's tool list has no
+# `mktemp` and no `mv`, and a preflight promising to name exactly what is
+# missing cannot quietly depend on tools it never checks. The window that opens
+# is between the truncation and the last line going out, and it is kept as
+# narrow as it can be — the whole file is read and the replacement built before
+# the concept is opened for writing at all, so nothing between those two points
+# can fail on anything except the write itself.
+OKF_FRONTMATTER_ERROR=""
+write_frontmatter_field() { # $1 = concept path, $2 = field name, $3 = value
+  local path="$1" field="$2" value="$3"
+  local block="" key=""
+  OKF_FRONTMATTER_ERROR=""
+
+  case "$field" in
+    *.*.*)
+      OKF_FRONTMATTER_ERROR="$field names a field nested deeper than SPEC.md §4 goes"
+      return 1
+      ;;
+    *.*)
+      block="${field%%.*}"
+      key="${field#*.}"
+      ;;
+    *) key="$field" ;;
+  esac
+  if ! valid_frontmatter_key "$key" \
+    || { [ -n "$block" ] && ! valid_frontmatter_key "$block"; }; then
+    OKF_FRONTMATTER_ERROR="$field is not a frontmatter field name"
+    return 1
+  fi
+
+  # Before the file is opened: a value that cannot be written is not a reason
+  # to have read the concept, let alone to have truncated it.
+  render_frontmatter_scalar "$value" || return 1
+  local rendered="$OKF_FRONTMATTER_RENDERED"
+
+  if [ ! -f "$path" ] || [ ! -r "$path" ]; then
+    OKF_FRONTMATTER_ERROR="$(display_path "$path") is not a readable file"
+    return 1
+  fi
+
+  # The whole file, in order, before anything is decided about it. The scan
+  # below has to know where the closing `---` is before it can insert a line
+  # above it, and the write has to have the file in memory because opening it
+  # for writing is what destroys it.
+  local -a lines=()
+  local line final_nl=1
+  while true; do
+    if IFS= read -r line; then
+      lines+=("$line")
+    else
+      if [ -n "$line" ]; then
+        lines+=("$line")
+        # A last line with no newline after it, written back the same way: the
+        # byte a file does not end with is as much a part of it as the bytes it
+        # does.
+        final_nl=0
+      fi
+      break
+    fi
+  # stderr redirected before the input and not after it — see read_frontmatter.
+  done 2> /dev/null < "$path"
+
+  local total="${#lines[@]}"
+  if [ "$total" -eq 0 ]; then
+    OKF_FRONTMATTER_ERROR="$(display_path "$path") carries no frontmatter block"
+    return 1
+  fi
+
+  local i probe bare
+  local close=-1 hit=-1 hit_bare=0 in_block=0 block_hdr=-1
+  local block_scalar=0 block_seq=0 block_first=0
+  local hit_indent=0 hit_pending=0 hit_block=0
+  for ((i = 0; i < total; i++)); do
+    probe="${lines[i]}"
+    # A BOM belongs to the first line only, a CR to any of them. Both are
+    # stripped for the comparison and neither from what is written back.
+    if [ "$i" -eq 0 ]; then
+      probe="${probe#$'\xef\xbb\xbf'}"
+    fi
+    probe="${probe%$'\r'}"
+
+    if [ "$i" -eq 0 ]; then
+      if [ "$probe" != "---" ]; then
+        OKF_FRONTMATTER_ERROR="$(display_path "$path") carries no frontmatter block"
+        return 1
+      fi
+      continue
+    fi
+    if [ "$probe" = "---" ]; then
+      close="$i"
+      break
+    fi
+
+    # The line after a field written with nothing after its colon, which is the
+    # one thing that says what such a line meant. `status:` followed by another
+    # key is a field with a null value and can be given one; `code:` followed by
+    # an indented line is a block header, and giving *that* a value would strand
+    # every line under it. A sequence item counts as under it whatever its
+    # indentation — YAML lets a list sit at its parent key's own column, and
+    # SPEC.md §4's `verified:` is usually written that way.
+    #
+    # Blank lines and whole-line comments are skipped rather than answering the
+    # question, for the reason read_frontmatter does not let them end a block:
+    # neither says anything about what shape the value is.
+    if [ "$hit_pending" -eq 1 ]; then
+      bare="${probe#"${probe%%[![:space:]]*}"}"
+      case "$bare" in
+        "" | "#"*) ;;
+        -*)
+          hit_block=1
+          hit_pending=0
+          ;;
+        *)
+          [ "$((${#probe} - ${#bare}))" -le "$hit_indent" ] || hit_block=1
+          hit_pending=0
+          ;;
+      esac
+    fi
+
+    case "$probe" in
+      [![:space:]#-]*)
+        # A top-level key: the end of whatever nested block was open, which is
+        # §4's own boundary for `code.X`.
+        in_block=0
+        if [ -z "$block" ] && [ "$hit" -lt 0 ]; then
+          case "$probe" in
+            "$key:"*)
+              hit="$i"
+              frontmatter_scalar "${probe#"$key:"}"
+              if [ -z "$OKF_FRONTMATTER_SCALAR" ]; then
+                hit_bare=1
+                hit_indent=0
+                hit_pending=1
+              fi
+              ;;
+          esac
+        fi
+        if [ -n "$block" ] && [ "$block_hdr" -lt 0 ] && [ "$block_scalar" -eq 0 ]; then
+          case "$probe" in
+            "$block:"*)
+              frontmatter_scalar "${probe#"$block:"}"
+              if [ -n "$OKF_FRONTMATTER_SCALAR" ]; then
+                # `code: java` opens no block. The first key of that name is
+                # the one the reader takes, so a bare `code:` further down is
+                # not a second chance — this is the answer for the file.
+                block_scalar=1
+              else
+                block_hdr="$i"
+                in_block=1
+              fi
+              ;;
+          esac
+        fi
+        ;;
+      *)
+        if [ "$in_block" -eq 1 ]; then
+          if [ "$block_first" -eq 0 ] && [ -n "$probe" ]; then
+            bare="${probe#"${probe%%[![:space:]]*}"}"
+            case "$bare" in
+              # Blank, and a whole-line comment, say nothing about what shape
+              # the block is.
+              "" | "#"*) ;;
+              -*)
+                block_seq=1
+                block_first=1
+                ;;
+              *) block_first=1 ;;
+            esac
+          fi
+          if [ "$hit" -lt 0 ]; then
+            case "$probe" in
+              "  $key:"*)
+                hit="$i"
+                frontmatter_scalar "${probe#"  $key:"}"
+                if [ -z "$OKF_FRONTMATTER_SCALAR" ]; then
+                  hit_bare=1
+                  hit_indent=2
+                  hit_pending=1
+                fi
+                ;;
+            esac
+          fi
+        fi
+        ;;
+    esac
+  done
+
+  if [ "$close" -lt 0 ]; then
+    OKF_FRONTMATTER_ERROR="$(display_path "$path") opens a frontmatter block it never closes"
+    return 1
+  fi
+  if [ "$hit" -ge 0 ]; then
+    if [ "$hit_bare" -eq 1 ] && [ "$hit_block" -eq 1 ]; then
+      OKF_FRONTMATTER_ERROR="$field opens a block in $(display_path "$path") and is not a field"
+      return 1
+    fi
+  elif [ -n "$block" ]; then
+    if [ "$block_scalar" -eq 1 ]; then
+      OKF_FRONTMATTER_ERROR="$block: is not a block in $(display_path "$path")"
+      return 1
+    fi
+    if [ "$block_seq" -eq 1 ]; then
+      OKF_FRONTMATTER_ERROR="$block: is a list in $(display_path "$path"), not a block of fields"
+      return 1
+    fi
+  fi
+
+  # Where the line goes, and which existing line it takes its ending from.
+  # Replacing copies the ending of the line replaced; inserting copies it from
+  # the line it goes in beside, so a concept written on Windows stays that way
+  # and one that is not does not acquire a stray CR.
+  local at anchor insert=0 open_block=0 indent=""
+  if [ "$hit" -ge 0 ]; then
+    at="$hit"
+    anchor="$hit"
+    [ -z "$block" ] || indent="  "
+  elif [ -z "$block" ]; then
+    at="$close"
+    anchor="$close"
+    insert=1
+  elif [ "$block_hdr" -ge 0 ]; then
+    at=$((block_hdr + 1))
+    anchor="$block_hdr"
+    insert=1
+    indent="  "
+  else
+    at="$close"
+    anchor="$close"
+    insert=1
+    open_block=1
+    indent="  "
+  fi
+
+  local eol=""
+  case "${lines[anchor]}" in
+    *$'\r') eol=$'\r' ;;
+  esac
+  local written="$indent$key: $rendered$eol"
+
+  # Built whole before the concept is opened, so that the only thing left to go
+  # wrong after the truncation is the write.
+  local -a out=()
+  for ((i = 0; i < total; i++)); do
+    if [ "$i" -eq "$at" ]; then
+      if [ "$insert" -eq 1 ]; then
+        [ "$open_block" -eq 0 ] || out+=("$block:$eol")
+        out+=("$written")
+      else
+        out+=("$written")
+        continue
+      fi
+    fi
+    out+=("${lines[i]}")
+  done
+
+  # Asked before the truncation rather than left to it, for the reason
+  # read_frontmatter asks before its redirection: a redirection that fails is a
+  # failure of the compound command itself, and under `set -e` that ends the
+  # script instead of returning the 1 every caller here is written to handle.
+  if [ ! -w "$path" ]; then
+    OKF_FRONTMATTER_ERROR="$(display_path "$path") is not writable"
+    return 1
+  fi
+
+  local n="${#out[@]}" last
+  last=$((n - 1))
+  {
+    for ((i = 0; i < n; i++)); do
+      if [ "$i" -eq "$last" ] && [ "$final_nl" -eq 0 ]; then
+        printf '%s' "${out[i]}"
+      else
+        printf '%s\n' "${out[i]}"
+      fi
+    done
+  } 2> /dev/null > "$path" || {
+    OKF_FRONTMATTER_ERROR="cannot write $(display_path "$path")"
+    return 1
+  }
+  return 0
+}
+
 # Fills OKF_CONCEPTS with the repo's concept files, in the order `load_in_scope`
 # lists its sources: every tracked `.md` that carries SPEC.md §4 frontmatter and
 # is not one of §4's reserved names.
