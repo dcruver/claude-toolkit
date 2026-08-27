@@ -1232,6 +1232,148 @@ load_in_scope() {
 }
 
 # ---------------------------------------------------------------------------
+# Co-location (SPEC.md §5)
+# ---------------------------------------------------------------------------
+
+# SPEC.md §4's reserved OKF filenames. Neither is ever a source's concept:
+# `index.md` is the directory's own document — `type: Package`, or `type:
+# Codebase` at the bundle root — and `log.md` is left to OKF's own semantics and
+# is never generated.
+OKF_RESERVED_CONCEPT_NAMES=(index.md log.md)
+
+# Whether a file carries a SPEC.md §4 frontmatter block: `---` on line 1, closed
+# by the next line that is exactly `---`. Both ends are checked, because a file
+# that opens one and never closes it is the half-written concept this is here to
+# tell from a whole one.
+#
+# Whether the block *says* anything in particular is not asked. Which fields are
+# in there is the frontmatter reader a later PLAN.md item builds; what is being
+# asked here is only whether there is frontmatter at all.
+has_frontmatter() { # $1 = a path to a file
+  local line opened=0
+  # `|| [ -n "$line" ]` so a last line with no newline after it is still read.
+  while IFS= read -r line || [ -n "$line" ]; do
+    # A checkout with CRLF line endings ends every line with a `\r`, and an
+    # editor on Windows opens the file with a UTF-8 BOM. Neither changes what
+    # the line says, and neither may turn a concept into something unrecognised
+    # — a source whose concept goes unrecognised is one that never comes off
+    # `okf list --missing`.
+    line="${line#$'\xef\xbb\xbf'}"
+    line="${line%$'\r'}"
+    if [ "$opened" -eq 0 ]; then
+      [ "$line" = "---" ] || return 1
+      opened=1
+      continue
+    fi
+    [ "$line" != "---" ] || return 0
+  # stderr redirected before the input, and not after it: the order is the
+  # order they are opened in, and a `2> /dev/null` written second is set up too
+  # late to catch the shell's own complaint about the first. A concept whose
+  # permissions have been taken away is answered by the source turning up in
+  # `okf list --missing`, which is a line the caller can act on — not by a
+  # "Permission denied" carrying a line number from inside this script.
+  done 2> /dev/null < "$1"
+  # Falls through for an empty file, one that opens a block it never closes, and
+  # one that could not be read at all — none of them a concept.
+  return 1
+}
+
+# Whether a source has the co-located concept SPEC.md §5 puts beside it:
+# `UserException.java` -> `UserException.md` in the same directory. Returns 0
+# when it is there, 1 when it is not. The path is bundle-relative, as everything
+# out of `load_in_scope` is, and is resolved against the root okf is standing
+# in.
+#
+# The stem is the name minus its final extension, so the concept for
+# `helper.ts` is `helper.md` and not `helper.ts.md`. A name that is all
+# extension — a dotfile such as `.gitignore` — keeps its whole name, because
+# stripping it would leave nothing and every dotfile in a directory would then
+# share the one concept `.md`.
+#
+# Only `<stem>.md` is looked for, never the `<stem>.<TypeName>.md` files §5
+# gives a file's *additional* top-level types: §5 also says the first or
+# same-named type takes `<stem>.md`, so a documented source always has that one.
+# Which types a file declares is Claude's to know and not the shell's — see
+# SPEC.md §1's division of labour — so the additional files cannot be predicted
+# here anyway.
+#
+# Existence on disk, not `git ls-files`: a concept written by /okf-generate and
+# not yet committed is a concept, and a run of `okf list --missing` straight
+# after generating is the obvious way to see what is left.
+#
+# One thing this cannot see, deliberately: two sources in one directory sharing
+# a stem — `helper.ts` beside `helper.py` — share `helper.md`, so documenting
+# either covers both. Telling them apart means reading the concept's `resource`
+# field, which is the frontmatter reader a later PLAN.md item builds; until then
+# the answer here is the mechanical one §5 describes.
+has_concept() { # $1 = a bundle-relative source path
+  local path="$1" dir base stem
+  base="${path##*/}"
+  case "$path" in
+    */*) dir="${path%/*}/" ;;
+    *) dir="" ;;
+  esac
+  case "$base" in
+    ?*.*) stem="${base%.*}" ;;
+    *) stem="$base" ;;
+  esac
+
+  # A directory named `Foo.md`, or a symlink pointing at nothing, is not a
+  # concept file — `-f` answers for both.
+  [ -f "$dir$stem.md" ] || return 1
+
+  # A `.md` source is not its own concept. `bundle.extensions` decides what
+  # counts as a source and nothing stops it naming `md`, and a source called
+  # `notes.md` has a stem of `notes` and so derives itself: without this, every
+  # markdown source in the bundle would mark itself documented and drop out of
+  # the listing /okf-generate walks.
+  [ ! "$dir$stem.md" -ef "$path" ] || return 1
+
+  # It has to carry SPEC.md §4 frontmatter to be a concept and not just a
+  # markdown file that happens to sit there: a README beside a source of the
+  # same name is prose, and a `/okf-generate` interrupted part way through
+  # leaves a file that opens like a concept and stops. Counted as concepts,
+  # either would take that source off this list for good — including out of the
+  # re-run that is the way to finish the interrupted write.
+  has_frontmatter "$dir$stem.md" || return 1
+
+  # Last, one of SPEC.md §4's reserved names is not a concept either, whatever
+  # is written in it. A source whose stem collides with one — `index.ts`,
+  # `log.py` — has no concept of its own to be found, because that name is
+  # already spoken for: `index.md` is the directory's own document and `log.md`
+  # belongs to OKF. So it is reported as having none.
+  #
+  # Reporting it is the honest answer — it really has none — and the one whose
+  # mistakes are visible. The alternative is counting the directory's own
+  # `index.md`, which would have `okf index` mark every such source documented
+  # without writing a word about it, and a source silently dropped from the
+  # bundle is the failure nobody goes looking for.
+  #
+  # It is also, admittedly, a source `/okf-generate` cannot take off this list:
+  # every name it could write the concept under is either reserved or §5's
+  # additional-type spelling `<stem>.<TypeName>.md`, and a `<stem>.<X>.md` is
+  # indistinguishable from the concept of a sibling source called
+  # `<stem>.<X>.<ext>` — `index.spec.md` beside `index.spec.ts` — so matching
+  # one here would hide `index.ts` the moment its neighbour got documented.
+  # SPEC.md does not settle what that concept is called, and this is not the
+  # place to invent it: a name for it belongs in SPEC.md, and until there is
+  # one, saying so every run beats guessing wrong in silence.
+  #
+  # Asked of the filesystem with `-ef` rather than of the string, because the
+  # two disagree on a case-insensitive one — macOS's APFS, Windows — where
+  # `Index.md` and the directory's own `index.md` are one file that a string
+  # compare reads as two. That is exactly the silent drop this is here to stop,
+  # so it is the file that has to be identified and not the name. `-ef` is
+  # false when the reserved file is not there at all, which is the ordinary
+  # case and needs no check of its own.
+  local reserved
+  for reserved in "${OKF_RESERVED_CONCEPT_NAMES[@]}"; do
+    [ ! "$dir$stem.md" -ef "$dir$reserved" ] || return 1
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Subcommands
 #
 # One function per SPEC.md §7 subcommand, each replaced by its real
@@ -1619,18 +1761,27 @@ cmd_list() {
   [ $# -eq 0 ] || die "list takes no arguments, but was given: $1" \
     "usage: okf list [--missing] [--orphans]"
 
-  # Recognised by the parser above so that a caller who types one is told it is
+  # Recognised by the parser above so that a caller who types it is told it is
   # not built yet rather than told it is not a flag — the difference between
-  # something to wait for and something to stop typing. Each is its own PLAN.md
+  # something to wait for and something to stop typing. It is its own PLAN.md
   # item; until then, exiting 1 keeps a caller from mistaking the whole listing
-  # for the filtered one they asked for.
-  [ "$missing" -eq 0 ] || die "list: --missing is not implemented yet"
+  # for the filtered one they asked for. Checked before --missing does any work,
+  # so `list --missing --orphans` is answered by the flag okf cannot honour
+  # rather than by the one it can — the two name different listings, and which
+  # of them wins when both are given is the --orphans item's to settle.
   [ "$orphans" -eq 0 ] || die "list: --orphans is not implemented yet"
 
   load_in_scope
 
+  # --missing narrows the same listing rather than producing another one, so the
+  # order and the paths are the ones plain `okf list` prints. That is what makes
+  # it the input /okf-generate walks: the sources with no concept beside them,
+  # in the order the bundle holds them.
   local path
   for path in ${OKF_IN_SCOPE[@]+"${OKF_IN_SCOPE[@]}"}; do
+    if [ "$missing" -eq 1 ] && has_concept "$path"; then
+      continue
+    fi
     printf '%s\n' "$path"
   done
 }

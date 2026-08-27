@@ -2507,6 +2507,31 @@ _okf_assert_listing() { # $1 = expected listing, $2 = description, $3.. = okf ar
   assert_eq "$expected" "$actual" "$what"
 }
 
+# Runs okf and hands its stdout back in the named variable, having first checked
+# that okf exited 0. An okf that failed prints nothing, and nothing is a listing
+# every _okf_assert_not_listed passes against without having checked anything —
+# the vacuous check this file's header warns about.
+#
+# Through a variable rather than a command substitution, because a _fail from in
+# here would otherwise be captured as part of the listing instead of reported.
+_okf_capture() { # $1 = variable to fill, $2.. = okf arguments
+  local _var="$1"
+  shift
+  local _stderr="$HARNESS_STATE/okf-list-stderr" _out _rc
+  _out="$("$TOOLKIT_ROOT/bin/okf" "$@" 2> "$_stderr")"
+  _rc=$?
+  if [ "$_rc" -ne 0 ]; then
+    local -a _detail=("okf $* exited $_rc" "stderr:")
+    local _line
+    while IFS= read -r _line; do _detail+=("$_line"); done \
+      < <(_detail_lines "$(cat "$_stderr" 2> /dev/null)")
+    _fail "okf $* exits 0" "${_detail[@]}"
+    return 1
+  fi
+  printf -v "$_var" '%s' "$_out"
+  return 0
+}
+
 # Whole-line membership, not `assert_contains`: `src/util/helper.md` contains
 # `src/util/helper.ts`'s stem, and a substring check would call the concept file
 # listed whenever its source was.
@@ -2537,7 +2562,7 @@ _okf_assert_not_listed() { # $1 = listing, $2 = path, $3 = description
 # SPEC.md §5's exclusion rules, each named on its own, so a listing that goes
 # wrong says which rule stopped working rather than only that one did.
 _okf_list_scope_probe() {
-  local okf="$TOOLKIT_ROOT/bin/okf" listing
+  local okf="$TOOLKIT_ROOT/bin/okf" listing probe
 
   # tests/fixtures/scoped carries its own .gitignore, which the *toolkit's*
   # repository obeys too: without a `git add -f`, the ignored fixture file is
@@ -2615,11 +2640,13 @@ _okf_list_scope_probe() {
   # git ls-files answers from the index, which still names a file deleted from
   # the working tree. Nothing downstream can read a path that is not there.
   rm -f lib/core.py
-  _okf_assert_not_listed "$("$okf" list 2> /dev/null)" lib/core.py \
-    "a source deleted from the working tree is not listed"
+  _okf_capture probe list \
+    && _okf_assert_not_listed "$probe" lib/core.py \
+      "a source deleted from the working tree is not listed"
   if git checkout -- lib/core.py > /dev/null 2>&1; then
-    _okf_assert_listed "$("$okf" list 2> /dev/null)" lib/core.py \
-      "and is listed again once it is back"
+    _okf_capture probe list \
+      && _okf_assert_listed "$probe" lib/core.py \
+        "and is listed again once it is back"
   else
     _fail "the fixture copy restores a deleted file" "git checkout -- lib/core.py failed"
   fi
@@ -2631,11 +2658,13 @@ _okf_list_scope_probe() {
   # Scope comes out of the index, so a file git has never been told about is
   # not yet part of what the repo says it is.
   printf 'export const fresh = 1;\n' > src/fresh.ts
-  _okf_assert_not_listed "$("$okf" list 2> /dev/null)" src/fresh.ts \
-    "a source git does not track is not listed"
+  _okf_capture probe list \
+    && _okf_assert_not_listed "$probe" src/fresh.ts \
+      "a source git does not track is not listed"
   if git add src/fresh.ts > /dev/null 2>&1; then
-    _okf_assert_listed "$("$okf" list 2> /dev/null)" src/fresh.ts \
-      "and is listed once git has been told about it"
+    _okf_capture probe list \
+      && _okf_assert_listed "$probe" src/fresh.ts \
+        "and is listed once git has been told about it"
     git rm -q --cached src/fresh.ts > /dev/null 2>&1
   else
     _fail "the fixture copy accepts a git add" "git add src/fresh.ts failed"
@@ -2759,6 +2788,229 @@ src/util/helper.ts' \
   return 0
 }
 
+# What `okf list --missing` prints in tests/fixtures/scoped: the in-scope
+# listing minus src/util/helper.ts, the one source the fixture ships a
+# co-located concept for.
+_OKF_SCOPED_MISSING='lib/conventions.py
+lib/core.py
+src/app.ts
+src/generated/Handwritten.java
+src/util/Accessors.java'
+
+# SPEC.md §5's co-location rule, read backwards: which in-scope sources have no
+# concept beside them. The fixture copy is a throwaway, so concepts can be
+# written into it and taken back out again between checks.
+_okf_list_missing_probe() {
+  local listing
+
+  # The fixture's one concept has to be there for any of this to mean anything:
+  # without it every check below would be comparing --missing against the whole
+  # listing, and a --missing that filtered nothing would pass them all.
+  if [ -f src/util/helper.md ]; then
+    _pass "the fixture ships a co-located concept to be filtered out"
+  else
+    _fail "the fixture ships a co-located concept to be filtered out" \
+      "no src/util/helper.md under $PWD"
+    return 1
+  fi
+
+  _okf_assert_listing "$_OKF_SCOPED_MISSING" \
+    "okf list --missing prints the in-scope sources with no concept beside them" \
+    list --missing || return 1
+
+  _okf_capture listing list --missing || return 1
+  _okf_assert_not_listed "$listing" src/util/helper.ts \
+    "a source whose sibling .md exists is not missing"
+  _okf_capture listing list || return 1
+  _okf_assert_listed "$listing" src/util/helper.ts \
+    "while plain okf list still prints it"
+
+  # A concept written but not yet committed still counts: /okf-generate writes
+  # concepts into the working tree, and `okf list --missing` straight after is
+  # how what is left gets seen.
+  printf -- '---\ntype: Module\nresource: /src/app.ts\n---\n' > src/app.md
+  _okf_capture listing list --missing || return 1
+  _okf_assert_not_listed "$listing" src/app.ts \
+    "a concept git has not been told about still counts"
+
+  # A file that is not frontmatter is not a concept: a README beside a source of
+  # the same name is prose, and an /okf-generate interrupted between creating
+  # the file and writing its frontmatter leaves an empty one. Counting either
+  # would take the source off this list for good, including out of the re-run
+  # that is how the interrupted write gets finished.
+  : > src/app.md
+  _okf_capture listing list --missing || return 1
+  _okf_assert_listed "$listing" src/app.ts \
+    "an empty .md is not a concept"
+  printf 'Notes about the app. No frontmatter, so not a concept.\n' > src/app.md
+  _okf_capture listing list --missing || return 1
+  _okf_assert_listed "$listing" src/app.ts \
+    "nor is a markdown file that never opens with ---"
+  printf -- '---\ntype: Modu' > src/app.md
+  _okf_capture listing list --missing || return 1
+  _okf_assert_listed "$listing" src/app.ts \
+    "nor is one that opens a frontmatter block and never closes it"
+  printf -- '---\r\ntype: Module\r\n---\r\n' > src/app.md
+  _okf_capture listing list --missing || return 1
+  _okf_assert_not_listed "$listing" src/app.ts \
+    "while a concept checked out with CRLF line endings still is one"
+  printf -- '\357\273\277---\ntype: Module\n---\n' > src/app.md
+  _okf_capture listing list --missing || return 1
+  _okf_assert_not_listed "$listing" src/app.ts \
+    "and so is one an editor on Windows opened with a UTF-8 BOM"
+  printf -- '---\ntype: Module\nresource: /src/app.ts\n---\n' > src/app.md
+
+  # Co-located means the same directory. The same name one directory up, or in
+  # a sibling directory, is a different concept for a different source.
+  printf -- '---\ntype: Module\n---\n' > app.md
+  printf -- '---\ntype: Module\n---\n' > src/util/app.md
+  rm -f src/app.md
+  _okf_capture listing list --missing || return 1
+  _okf_assert_listed "$listing" src/app.ts \
+    "a concept in another directory does not cover src/app.ts"
+  rm -f app.md src/util/app.md
+
+  # The stem is the name minus its final extension: Accessors.java is covered by
+  # Accessors.md and not by Accessors.java.md.
+  printf -- '---\ntype: Class\n---\n' > src/util/Accessors.java.md
+  _okf_capture listing list --missing || return 1
+  _okf_assert_listed "$listing" src/util/Accessors.java \
+    "a <name>.<ext>.md does not cover <name>.<ext>"
+  rm -f src/util/Accessors.java.md
+  printf -- '---\ntype: Class\n---\n' > src/util/Accessors.md
+  _okf_capture listing list --missing || return 1
+  _okf_assert_not_listed "$listing" src/util/Accessors.java \
+    "while the sibling <name>.md does"
+  rm -f src/util/Accessors.md
+
+  # A directory is not a concept file, and neither is a symlink pointing at
+  # nothing or a file whose permissions have been taken away. Counted as one,
+  # each would mark a source documented that no reader could read a word of.
+  #
+  # Every one of them is checked against a concept that does work in the same
+  # place first: lib/core.py and lib/conventions.py have no concept either way,
+  # so without the positive these would all pass on a has_concept that never
+  # looked at the sibling at all.
+  printf -- '---\ntype: Module\n---\n' > lib/core.md
+  _okf_capture listing list --missing || return 1
+  _okf_assert_not_listed "$listing" lib/core.py \
+    "lib/core.py is covered while a readable lib/core.md is there"
+  if chmod 000 lib/core.md > /dev/null 2>&1 && [ ! -r lib/core.md ]; then
+    _okf_capture listing list --missing \
+      && _okf_assert_listed "$listing" lib/core.py \
+        "but a concept that cannot be read is not one okf may count"
+    assert_eq "" "$(cat "$HARNESS_STATE/okf-list-stderr" 2> /dev/null)" \
+      "and okf says nothing on stderr about it, having answered on stdout"
+  else
+    # root reads anything, so the check cannot be made to hold there.
+    _skip "a concept that cannot be read is not one okf may count" \
+      "chmod 000 does not make a file unreadable here"
+  fi
+  chmod 644 lib/core.md > /dev/null 2>&1
+  rm -f lib/core.md
+  if mkdir lib/core.md > /dev/null 2>&1; then
+    _okf_capture listing list --missing \
+      && _okf_assert_listed "$listing" lib/core.py \
+        "nor is a directory named like the concept"
+    rmdir lib/core.md
+  else
+    _fail "a directory can be made in the fixture copy" "mkdir lib/core.md failed"
+  fi
+
+  printf -- '---\ntype: Module\n---\n' > lib/conventions.md
+  _okf_capture listing list --missing || return 1
+  _okf_assert_not_listed "$listing" lib/conventions.py \
+    "lib/conventions.py is covered while a real lib/conventions.md is there"
+  rm -f lib/conventions.md
+  if ln -s nowhere.md lib/conventions.md > /dev/null 2>&1; then
+    _okf_capture listing list --missing \
+      && _okf_assert_listed "$listing" lib/conventions.py \
+        "but a symlink pointing at nothing is not a concept either"
+    rm -f lib/conventions.md
+  else
+    _fail "a symlink can be made in the fixture copy" "ln -s lib/conventions.md failed"
+  fi
+
+  # SPEC.md §4 reserves index.md for the directory's own Package document, so a
+  # source named index.<ext> has no <stem>.md of its own to be found. Counting
+  # the directory's would have `okf index` mark every such source documented
+  # without writing a word about it — a source dropped from the bundle in
+  # silence, which is the one failure mode worth being noisy to avoid.
+  mkdir -p src/pkg
+  printf 'export const port = 1;\n' > src/pkg/index.ts
+  printf 'export const other = 1;\n' > src/pkg/index.spec.ts
+  if git add src/pkg/index.ts src/pkg/index.spec.ts > /dev/null 2>&1; then
+    _okf_capture listing list --missing \
+      && _okf_assert_listed "$listing" src/pkg/index.ts \
+        "a source named index.ts starts out missing like any other"
+    printf -- '---\ntype: Package\n---\n' > src/pkg/index.md
+    _okf_capture listing list --missing \
+      && _okf_assert_listed "$listing" src/pkg/index.ts \
+        "and the directory's own index.md does not cover it"
+
+    # index.spec.md is index.spec.ts's own concept. Read as an index.<TypeName>
+    # spelling for index.ts it would take index.ts off this list the moment its
+    # neighbour was documented, and nothing would ever put it back.
+    printf -- '---\ntype: Module\nresource: /src/pkg/index.spec.ts\n---\n' \
+      > src/pkg/index.spec.md
+    if _okf_capture listing list --missing; then
+      _okf_assert_listed "$listing" src/pkg/index.ts \
+        "nor does a sibling source's concept that happens to start with index."
+      _okf_assert_not_listed "$listing" src/pkg/index.spec.ts \
+        "while that sibling itself is covered by it"
+    fi
+
+    # The same file under two names is still the directory's own document, and
+    # a hard link is the one spelling of that a string compare cannot see —
+    # the same blind spot a case-insensitive filesystem opens up for `Index.md`
+    # beside `index.md`, which is not reproducible here.
+    rm -f src/pkg/index.spec.md
+    if ln src/pkg/index.md src/pkg/index.spec.md > /dev/null 2>&1; then
+      _okf_capture listing list --missing \
+        && _okf_assert_listed "$listing" src/pkg/index.spec.ts \
+          "a hard link to the directory's index.md is not a concept either"
+    else
+      _fail "a hard link can be made in the fixture copy" "ln src/pkg/index.md failed"
+    fi
+    git rm -q --cached src/pkg/index.ts src/pkg/index.spec.ts > /dev/null 2>&1
+  else
+    _fail "the fixture copy accepts a git add" "git add src/pkg failed"
+  fi
+  rm -rf src/pkg
+
+  # bundle.extensions decides what counts as a source, and nothing stops it
+  # naming md. A markdown source derives its own name — notes.md has a stem of
+  # notes — so without a check that the concept and the source are two files,
+  # every one of them would mark itself documented and drop out of the listing
+  # /okf-generate walks.
+  printf '%s\n' '{"bundle": {"include": ["src/**"], "exclude": [],
+    "extensions": ["md"]}}' > okf.json
+  _okf_assert_listing 'src/notes.md
+src/util/helper.md' \
+    "a markdown source is not its own concept" list --missing
+
+  # --missing narrows the listing, so everything that decides the listing still
+  # decides this one: a source no include glob reaches has no concept either and
+  # is still not printed.
+  printf '%s\n' '{"bundle": {"include": ["lib/**"],
+    "exclude": ["**/vendor/**", "**/node_modules/**"]}}' > okf.json
+  _okf_assert_listing 'lib/conventions.py
+lib/core.py' \
+    "okf list --missing honours the bundle settings" list --missing
+
+  # Every in-scope source documented is an empty listing exiting 0, not an
+  # error: nothing missing is the outcome /okf-generate is driving towards.
+  printf '%s\n' '{"bundle": {"include": ["src/util/**"], "exclude": []}}' > okf.json
+  _okf_assert_listing 'src/util/Accessors.java' \
+    "a narrowed scope leaves only its own undocumented sources" list --missing
+  printf -- '---\ntype: Class\n---\n' > src/util/Accessors.md
+  _okf_assert_listing '' \
+    "and a scope with a concept for every source prints nothing, exiting 0" \
+    list --missing
+  rm -f src/util/Accessors.md okf.json
+  return 0
+}
+
 # The refusals: a line okf cannot act on is answered, not guessed at.
 _okf_list_refusal_probe() {
   local okf="$TOOLKIT_ROOT/bin/okf"
@@ -2769,13 +3021,21 @@ _okf_list_refusal_probe() {
   assert_exit 1 "$okf" list extra
   assert_contains "$(last_output)" "extra" "okf list names an argument it does not take"
 
-  # SPEC.md §7 gives list these two, and each is its own PLAN.md item. Until
-  # they are built, exiting 1 is what keeps a caller from mistaking the whole
-  # listing for the filtered one they asked for.
-  assert_exit 1 "$okf" list --missing
-  assert_contains "$(last_output)" "--missing" "okf list --missing says it is not built yet"
+  # SPEC.md §7 gives list two flags and each is its own PLAN.md item. --orphans
+  # is not built yet, and until it is, exiting 1 keeps a caller from mistaking
+  # the whole listing for the filtered one they asked for.
   assert_exit 1 "$okf" list --orphans
-  assert_contains "$(last_output)" "--orphans" "okf list --orphans says so too"
+  assert_contains "$(last_output)" "--orphans" "okf list --orphans says it is not built yet"
+
+  # --missing and --orphans name different listings, and which of them wins when
+  # both are given is the --orphans item's to settle. Until then the refusal has
+  # to come out whichever order they are typed in, or `list --missing --orphans`
+  # is a listing of one thing answering a request for another.
+  assert_exit 1 "$okf" list --missing --orphans
+  assert_contains "$(last_output)" "--orphans" \
+    "--missing does not talk okf past an --orphans it cannot honour"
+  assert_exit 1 "$okf" list --orphans --missing
+  assert_contains "$(last_output)" "--orphans" "nor does it in the other order"
 
   printf 'not json at all\n' > okf.json
   assert_exit 1 "$okf" list
@@ -3008,6 +3268,13 @@ test_okf_list_honours_the_bundle_settings() {
 test_okf_list_refuses_what_it_cannot_answer() {
   _okf_preconditions || return 1
   with_fixture_repo scoped _okf_list_refusal_probe
+}
+
+# SPEC.md §5 co-locates a concept beside its source, so --missing is that rule
+# read backwards: the in-scope sources with no sibling concept file.
+test_okf_list_missing_lists_undocumented_sources() {
+  _okf_preconditions || return 1
+  with_fixture_repo scoped _okf_list_missing_probe
 }
 
 # Scope is read out of git, so a bundle root outside a work tree is a question
