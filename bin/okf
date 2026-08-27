@@ -2048,7 +2048,117 @@ cmd_list() {
 }
 
 # okf hash <file> — sha256:… of one file
-cmd_hash() { not_implemented hash; }
+#
+# The measuring half of SPEC.md §8's drift rule: a concept's `code.content_hash`
+# is the sha256 of its `resource` as that file stood when the prose was written,
+# and drift is that stored string differing from what this prints today. What
+# comes out here is therefore a value that gets *stored* — written into
+# frontmatter by a slash command, read back months later by an `okf check` that
+# has nothing to go on but the two strings.
+#
+# Which is why the `sha256:` prefix is part of the answer and not a label on it.
+# SPEC.md §4 writes the field as "sha256:9f2a…", so a bare hex digest written
+# into it would be a stored value naming no algorithm at all, and the day okf
+# grows a second one there would be no telling which had produced it.
+#
+# Nothing here reads okf.json, and nothing here reads git. A digest is a fact
+# about one file's bytes rather than about the bundle, and every caller that has
+# one to hash has already decided it is theirs to hash: `okf check` asks about a
+# resource a concept named, and a scope test it had to pass first would refuse
+# exactly the concept whose source has just moved out of `include` — the one
+# where knowing whether it drifted matters most.
+cmd_hash() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --)
+        # End of flags. Past it a word beginning with a dash is the filename,
+        # which is how a caller hashes a file that really is named `-weird.py`.
+        shift
+        break
+        ;;
+      -*)
+        # The same hint parse_globals gives for a --config whose path begins
+        # with a dash, because it is the same slip: a file can be named
+        # anything, and nothing else here could tell the two apart.
+        die "hash: unknown flag: $1" \
+            "spell it ./$1, or put it after --, if that really is the file" \
+            "usage: okf hash <file>"
+        ;;
+      *) break ;;
+    esac
+    shift
+  done
+
+  [ $# -gt 0 ] || die "hash needs a file to hash" "usage: okf hash <file>"
+
+  # One file and not a list. The output is a bare digest with nothing in it
+  # naming what it is of, so a second path could only come back as a second
+  # unlabelled line for the caller to match up by position — or be dropped in
+  # silence, leaving them holding the first file's digest for the second file's
+  # concept, which is a `content_hash` that is wrong rather than missing.
+  [ $# -eq 1 ] || die "hash takes one file, but was given $#: $*" \
+    "usage: okf hash <file>"
+
+  local path="$1"
+
+  if [ ! -e "$path" ]; then
+    # SPEC.md §4 spells path-valued fields bundle-absolute — a leading `/` that
+    # means the bundle root and not the filesystem's — so a `resource` read out
+    # of a concept and handed straight to `okf hash` names a file that is almost
+    # never there. The argument is read as a filesystem path all the same:
+    # guessing between the two spellings would give `okf hash /etc/hosts` two
+    # possible answers and no way for the caller to say which they meant. What
+    # the guess is spent on instead is this line, which names the other
+    # spelling without hashing anything.
+    local rooted="${path#/}"
+    if [ "$rooted" != "$path" ] && [ -e "$rooted" ]; then
+      die "no such file: $path" \
+        "paths are read as the filesystem's, not as SPEC.md §4's bundle-absolute form" \
+        "did you mean $rooted ?"
+    fi
+    die "no such file: $path"
+  fi
+
+  # A directory is named as one rather than left to the regular-file line below,
+  # because it is the answer to a plausible question — `okf hash src/util` from
+  # someone expecting a digest of the tree — and "not a regular file" would read
+  # as okf having failed to open something it could see.
+  [ ! -d "$path" ] || die "hash takes a file, but $path is a directory"
+
+  # -f and not -e for everything else: a fifo would hang here waiting on a
+  # writer that is never coming, and a device would hand back bytes that are
+  # nobody's file contents. A symlink to a regular file passes and hashes what
+  # it points at, which is the file the caller named.
+  [ -f "$path" ] || die "hash takes a regular file, but $path is not one"
+  [ -r "$path" ] || die "cannot read: $path"
+
+  # Fed on stdin rather than named as an argument. sha256sum echoes the name it
+  # was given beside the digest, and escapes one containing a backslash or a
+  # newline by prefixing the whole line with `\` — so the digest is not reliably
+  # where the first field is — while a name beginning with a dash would be read
+  # as an option before the file was ever opened. Redirected in, there is no
+  # name in the output to work around and none on the command line to be
+  # misread, and the shell has already opened the file by the time sha256sum
+  # runs.
+  local digest
+  digest="$(sha256sum < "$path")" || die "could not hash: $path"
+  digest="${digest%% *}"
+
+  # Checked rather than trusted, because everything downstream of this compares
+  # the string and never reads it: a truncated or decorated digest stored as a
+  # `content_hash` would not look wrong in frontmatter, and would report drift
+  # on every `okf check` from then on — against a file nobody had touched.
+  case "$digest" in
+    "" | *[!0-9a-f]*)
+      die "sha256sum did not print a digest for $path: $digest"
+      ;;
+  esac
+  if [ "${#digest}" -ne 64 ]; then
+    die "sha256sum printed ${#digest} hex characters for $path, not a sha256's 64: $digest"
+  fi
+
+  printf 'sha256:%s\n' "$digest"
+}
 
 # okf fanin <Name> — whole-word reference count across in-scope files
 cmd_fanin() { not_implemented fanin; }

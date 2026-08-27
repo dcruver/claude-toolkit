@@ -3674,6 +3674,193 @@ test_okf_list_needs_a_git_work_tree() {
   return 0
 }
 
+# SPEC.md §8's drift rule is a comparison between a digest stored when a concept
+# was written and one computed now, so what these check is not that okf ran
+# sha256sum — it is that the number it printed is the sha256 of those exact
+# bytes. Every expected value below is written out as a constant for that
+# reason: a test that recomputed it with sha256sum would agree with okf about
+# anything, including being wrong in the same way.
+_okf_hash_digest_probe() {
+  local okf="$TOOLKIT_ROOT/bin/okf"
+  local greeter="sha256:cda1b9b92ca2cbf335c365972ff175c46b22998f4046e7eb12d8f7ac8ec18280"
+
+  # _okf_assert_listing is "okf exits 0 and its stdout is exactly this", which is
+  # the check a one-line digest wants as much as a listing does; only its name is
+  # about `okf list`. Exactly, and not a substring: a digest with anything else
+  # on the line is one no `okf check` could compare, and `sha256:` in front of it
+  # is part of the stored value SPEC.md §4 writes into `code.content_hash`.
+  _okf_assert_listing "$greeter" \
+    "okf hash prints the sha256: digest of a committed fixture file" \
+    hash src/greeter.py
+
+  # Written here rather than committed, so the bytes really are these whatever
+  # the checkout did to them. Each one is a way a plausible implementation goes
+  # wrong: `$(cat file)` strips the trailing newline, so the last two would
+  # collide; a digest routed through a shell variable loses everything from a
+  # NUL byte on; and a reader that went through git's text filters, or through
+  # awk, would make the CRLF file and the LF one agree.
+  printf 'hello\n' > payload.txt
+  printf 'hello' > no-trailing-newline.txt
+  : > empty.txt
+  printf 'a\r\nb\n' > crlf.txt
+  printf 'a\nb\n' > lf.txt
+  printf 'a\0b\n' > nul.dat
+
+  # payload.txt and the rest were made after the fixture's commit, so they are
+  # untracked — and hashing them proves what SPEC.md §7 asks of `okf hash`: one
+  # file's digest, with no scope test and no index lookup in front of it. A
+  # source that has just been written is exactly the one somebody is about to
+  # document.
+  _okf_assert_listing \
+    "sha256:5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03" \
+    "an untracked file is hashed like any other" \
+    hash payload.txt
+  _okf_assert_listing \
+    "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" \
+    "a file with no trailing newline hashes as its own bytes, not as payload.txt" \
+    hash no-trailing-newline.txt
+  _okf_assert_listing \
+    "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" \
+    "an empty file has the empty sha256 rather than no answer" \
+    hash empty.txt
+  _okf_assert_listing \
+    "sha256:953bba9ac9726eaea07e844abcf144a0afe998039257c7a88b6665819597f39d" \
+    "line endings are hashed, not normalised" \
+    hash crlf.txt
+  _okf_assert_listing \
+    "sha256:911169ddaaf146aff539f58c26c489af3b892dff0fe283c1c264c65ae5aa59a2" \
+    "so the same text with LF endings has a different digest" \
+    hash lf.txt
+  _okf_assert_listing \
+    "sha256:3a100994c4e38751871e6e8eef9adad2b20177fdeaf650daacdcd74f4c9421e3" \
+    "a NUL byte is hashed rather than truncating the file" \
+    hash nul.dat
+
+  # A file whose name begins with a dash, reachable both ways every other tool
+  # spells it. `okf hash -weird.py` is refused by name in the refusal probe;
+  # these two are what the refusal tells the caller to type instead.
+  printf '%s\n' '-weird.py content' > ./-weird.py
+  local weird="sha256:186df911c1177487a59bdb8c4a92389239ce89f150f4e21e3a1270eb07f76e1a"
+  _okf_assert_listing "$weird" "-- ends the flags, so a dash-named file is hashed" \
+    hash -- -weird.py
+  _okf_assert_listing "$weird" "and ./ names the same file without --" \
+    hash ./-weird.py
+
+  # SPEC.md §7's -C, asked of a subcommand whose argument is a path: the file is
+  # resolved against the root -C names and not against the directory okf was
+  # invoked from. Run from the toolkit checkout, where `src/greeter.py` is not
+  # there at all — so a -C that had been ignored would fail rather than quietly
+  # hash the wrong file.
+  local outside
+  outside="$(CDPATH= cd "$TOOLKIT_ROOT" && "$okf" -C "$FIXTURE_DIR" hash src/greeter.py 2>&1)"
+  assert_eq "$greeter" "$outside" \
+    "-C names the root okf hash resolves its argument against"
+  return 0
+}
+
+_okf_hash_refusal_probe() {
+  local okf="$TOOLKIT_ROOT/bin/okf"
+
+  assert_exit 1 "$okf" hash
+  assert_contains "$(last_output)" "usage: okf hash" \
+    "okf hash with nothing to hash says what it takes"
+
+  # The second path named in the refusal, because the alternative okf must not
+  # choose is hashing the first and saying nothing about the second — a digest
+  # that is right for a file the caller did not ask about.
+  assert_exit 1 "$okf" hash src/greeter.py README.md
+  assert_contains "$(last_output)" "README.md" \
+    "okf hash refuses a second file rather than silently dropping it"
+
+  assert_exit 1 "$okf" hash --bogus
+  assert_contains "$(last_output)" "unknown flag: --bogus" \
+    "okf hash names a flag it does not know"
+
+  # A word beginning with a dash is a flag here, and no filename check could
+  # tell the two apart — so the refusal carries the two spellings that do.
+  assert_exit 1 "$okf" hash -weird.py
+  assert_contains "$(last_output)" "./-weird.py" \
+    "and says how to name a file whose name begins with a dash"
+
+  assert_exit 1 "$okf" hash no-such-file.py
+  assert_contains "$(last_output)" "no-such-file.py" \
+    "a file that is not there is named rather than hashed as empty"
+
+  # sha256sum answers "Is a directory" for this one, on stderr, having already
+  # exited non-zero — but a caller who typed a directory by tab-completion is
+  # owed the reason and not that.
+  assert_exit 1 "$okf" hash src
+  assert_contains "$(last_output)" "directory" \
+    "a directory is refused as one"
+
+  # SPEC.md §4 writes `resource` bundle-absolute, so a caller pasting one
+  # straight out of a concept lands here. The refusal has to say which of the
+  # two spellings okf read it as, or it looks like the file is gone.
+  assert_exit 1 "$okf" hash /src/greeter.py
+  assert_contains "$(last_output)" "bundle-absolute" \
+    "a bundle-absolute path is refused with the spelling okf did not read it as"
+  assert_contains "$(last_output)" "src/greeter.py" \
+    "and with the path that would have worked"
+
+  # A fifo has no bytes until somebody writes them, so an okf that opened this
+  # one would wait for a writer that never comes — and the test suite every
+  # PLAN.md item verifies with would hang instead of failing. Run under
+  # `timeout` so that a regression is a failed check, not a run that never ends.
+  if command -v mkfifo > /dev/null 2>&1 && command -v timeout > /dev/null 2>&1; then
+    if mkfifo waiting.fifo 2> /dev/null; then
+      assert_exit 1 timeout 10 "$okf" hash waiting.fifo
+      assert_contains "$(last_output)" "regular file" \
+        "a fifo is refused rather than opened and waited on"
+      rm -f waiting.fifo
+    else
+      _skip "okf hash refuses a fifo rather than waiting on it" \
+        "mkfifo failed in the fixture copy"
+    fi
+  else
+    _skip "okf hash refuses a fifo rather than waiting on it" \
+      "mkfifo or timeout is not installed, and an unguarded fifo check could hang"
+  fi
+  return 0
+}
+
+# The PLAN.md item itself: the sha256: prefixed digest of one file, asserted
+# against a known digest over a tests/fixtures/ file.
+test_okf_hash_prints_a_known_digest() {
+  _okf_preconditions || return 1
+  with_fixture_repo tiny _okf_hash_digest_probe
+}
+
+test_okf_hash_refuses_what_it_cannot_digest() {
+  _okf_preconditions || return 1
+  with_fixture_repo tiny _okf_hash_refusal_probe
+}
+
+# Unlike `okf list`, `okf hash` answers about one file's bytes and not about the
+# bundle, so it needs neither a work tree nor an okf.json. That is what lets
+# `okf check` hash a resource in a repository mid-rebase, and what keeps a
+# repo with no okf.json — SPEC.md §6's defaults — from being a repo where
+# nothing can be hashed.
+test_okf_hash_needs_no_repository() {
+  _okf_preconditions || return 1
+
+  local tmp
+  if ! tmp="$(mktemp -d "${TMPDIR:-/tmp}/toolkit-hash.XXXXXX")"; then
+    _fail "a directory outside any git repo can be made" "mktemp -d failed"
+    return 1
+  fi
+  # Registered the way with_fixture_repo registers its copies, so an interrupted
+  # run takes it with everything else rather than leaving it in TMPDIR.
+  printf '%s\n' "$tmp" >> "$HARNESS_STATE/fixture_dirs"
+  printf 'hashed outside any git repository\n' > "$tmp/plain.txt"
+
+  assert_exit 0 "$TOOLKIT_ROOT/bin/okf" -C "$tmp" hash plain.txt
+  assert_eq "sha256:3b9e4fa6b81d40b5f4df687241be16d0507507adc7aa9b4bc14c7c525f0c5996" \
+    "$(last_output)" \
+    "okf hash answers for a file with no okf.json and no git repository around it"
+  rm -rf "$tmp"
+  return 0
+}
+
 # --- add new test_* functions above this line ------------------------------
 
 # ---------------------------------------------------------------------------

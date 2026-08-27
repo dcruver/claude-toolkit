@@ -1,0 +1,5 @@
+# tests/toolkit.sh asserts a known sha256 digest over src/greeter.py, so its
+# bytes are the point of the fixture: a checkout with core.autocrlf set would
+# otherwise rewrite its line endings on the way out of git and change the one
+# number the assertion is about.
+* -text
