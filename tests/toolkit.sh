@@ -8251,6 +8251,442 @@ test_okf_trust_tier_answers_for_an_unverified_concept() {
   with_fixture_repo concepts _okf_trust_unverified_probe
 }
 
+# ---------------------------------------------------------------------------
+# install.sh (PLAN.md Phase 6)
+# ---------------------------------------------------------------------------
+
+# install.sh's copy of SPEC.md §3's tool lists, read out of the file the same
+# way _okf_bin_array reads bin/okf's.
+_install_sh_array() { # $1 = array name
+  sed -n "s/^$1=(\(.*\))\$/\1/p" "$TOOLKIT_ROOT/install.sh" | tr ' ' '\n' | sed '/^$/d'
+}
+
+# install.sh run against a throwaway HOME, which is the only thing that makes it
+# safe to run at all: every path it writes hangs off $HOME, so overriding that
+# one variable keeps a test run out of the real ~/.local/bin and ~/.claude.
+# A probe PATH must still carry bash: the assignment prefix governs the lookup
+# of `bash` itself just as it governs the shebang's, so spelling the run
+# `bash install.sh` buys nothing there — _okf_probe_path seeding bash into every
+# probe directory is what actually keeps these runs startable.
+_install_run() { # $1 = PATH to run under, $2 = HOME to install into
+  local path="$1" home="$2"
+  PATH="$path" HOME="$home" bash "$TOOLKIT_ROOT/install.sh"
+}
+
+# The first line of output holding the given fixed text, for a check that wants
+# to read one warning rather than everything install.sh printed — the jq-less
+# branch echoes permissions.json, and a tool name quoted in there is not
+# install.sh reporting that tool missing.
+_install_line_with() { # $1 = output, $2 = fixed text
+  printf '%s\n' "$1" | grep -F -- "$2" | head -1
+}
+
+# Sets INSTALL_SCRATCH_DIR rather than printing it: a helper that printed would
+# have to be called in a command substitution, and the _fail it reports on a
+# failure would then be captured into the caller's variable instead of the run's
+# output — a failing check nobody can read.
+INSTALL_SCRATCH_DIR=""
+_install_scratch_dir() { # $1 = what it is for
+  if ! INSTALL_SCRATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/toolkit-install.XXXXXX")"; then
+    _fail "$1" "mktemp -d failed"
+    return 1
+  fi
+  # Registered the way with_fixture_repo registers its copies, so an interrupted
+  # run takes it with everything else rather than leaving it in TMPDIR.
+  printf '%s\n' "$INSTALL_SCRATCH_DIR" >> "$HARNESS_STATE/fixture_dirs"
+  return 0
+}
+
+# PLAN.md Phase 6: bin/okf goes onto PATH alongside ralph, reported the same way.
+test_install_sh_installs_okf_alongside_ralph() {
+  if [ ! -e "$TOOLKIT_ROOT/bin/okf" ]; then
+    _fail "bin/okf exists to be installed" "missing: $TOOLKIT_ROOT/bin/okf"
+    return 1
+  fi
+
+  local home out
+  _install_scratch_dir "a throwaway HOME to install into" || return 1
+  home="$INSTALL_SCRATCH_DIR"
+
+  assert_exit 0 _install_run "$PATH" "$home"
+  out="$(last_output)"
+  assert_contains "$out" "  okf -> $home/.local/bin/okf" \
+    "install.sh reports okf in the same style it reports ralph"
+  assert_contains "$out" "  ralph -> $home/.local/bin/ralph" \
+    "and goes on reporting ralph"
+
+  if [ -x "$home/.local/bin/okf" ]; then
+    _pass "okf lands executable in ~/.local/bin"
+  else
+    _fail "okf lands executable in ~/.local/bin" \
+      "not an executable file: $home/.local/bin/okf"
+  fi
+  if cmp -s "$TOOLKIT_ROOT/bin/okf" "$home/.local/bin/okf"; then
+    _pass "the installed okf is this repo's bin/okf"
+  else
+    _fail "the installed okf is this repo's bin/okf" \
+      "$home/.local/bin/okf differs from $TOOLKIT_ROOT/bin/okf"
+  fi
+
+  # The header calls install.sh idempotent, and re-running it after a git pull
+  # is how an update is meant to arrive — so the second run has to be as good as
+  # the first, over a HOME that already holds both scripts. The installed copy
+  # is spoiled first: compared against a file the first run already made
+  # correct, the check below would pass just as happily for an update path that
+  # declined to replace an existing script at all.
+  printf 'not okf at all\n' > "$home/.local/bin/okf" || {
+    _fail "the installed okf can be spoiled before the second run" \
+      "could not write $home/.local/bin/okf"
+    return 1
+  }
+  assert_exit 0 _install_run "$PATH" "$home"
+  if cmp -s "$TOOLKIT_ROOT/bin/okf" "$home/.local/bin/okf"; then
+    _pass "a second install.sh run leaves okf in place"
+  else
+    _fail "a second install.sh run leaves okf in place" \
+      "$home/.local/bin/okf differs from $TOOLKIT_ROOT/bin/okf after re-running"
+  fi
+
+  # install.sh discovers bin/* rather than naming its scripts, and so does the
+  # parse test above — so a script added to bin/ later must land here too, or it
+  # is one that passes every check and still never reaches anybody's PATH.
+  local f base
+  for f in "$TOOLKIT_ROOT"/bin/*; do
+    [ -f "$f" ] || continue
+    base="$(basename "$f")"
+    if cmp -s "$f" "$home/.local/bin/$base"; then
+      _pass "bin/$base is installed as ~/.local/bin/$base"
+    else
+      _fail "bin/$base is installed as ~/.local/bin/$base" \
+        "install.sh copied every other script in bin/ but not this one"
+    fi
+  done
+
+  # The atomic replace works through a temp name in $BIN_DIR; a run that left
+  # one behind would leave a half-written script sitting next to a real one.
+  local leftover
+  leftover="$(find "$home/.local/bin" -maxdepth 1 -name '.*.new.*' 2> /dev/null)"
+  assert_eq "" "$leftover" "no temp file is left behind in ~/.local/bin"
+}
+
+# An empty settings.json is the case between "missing" and "malformed": it is
+# not mergeable as it stands, and it is not the user's data either.
+test_install_sh_merges_into_an_empty_settings_file() {
+  local home settings out
+  if ! command -v jq > /dev/null 2>&1; then
+    _skip "install.sh merges into an empty settings.json" "jq is not installed here"
+    return 0
+  fi
+  _install_scratch_dir "a throwaway HOME with an empty settings.json" || return 1
+  home="$INSTALL_SCRATCH_DIR"
+  settings="$home/.claude/settings.json"
+  mkdir -p "$home/.claude" || {
+    _fail "a throwaway HOME with an empty settings.json can be built" \
+      "could not create $home/.claude"
+    return 1
+  }
+  : > "$settings"
+
+  assert_exit 0 _install_run "$PATH" "$home"
+  out="$(last_output)"
+  assert_contains "$out" "merged generic read-only permissions" \
+    "an empty settings.json is seeded and merged, not reported unparseable"
+
+  # The merge really happened, rather than just being announced: one entry out
+  # of permissions.json has to be in there afterwards.
+  local entry present
+  entry="$(jq -r '.permissions.allow[0]' "$TOOLKIT_ROOT/permissions.json")"
+  if [ -z "$entry" ] || [ "$entry" = null ]; then
+    _fail "permissions.json holds an entry to merge" "its permissions.allow is empty"
+    return 1
+  fi
+  present="$(jq -r --arg e "$entry" '.permissions.allow | index($e) != null' "$settings")"
+  assert_eq "true" "$present" "the allowlist entry reached the settings file"
+}
+
+# The jq merge's own failure path. install.sh warns rather than failing there,
+# which means nothing else in the run reports it — so if it were to stop
+# happening, only a test would notice.
+test_install_sh_survives_an_unmergeable_settings_file() {
+  local home settings before out leftover
+  if ! command -v jq > /dev/null 2>&1; then
+    _skip "install.sh warns when jq cannot merge settings.json" "jq is not installed here"
+    return 0
+  fi
+  _install_scratch_dir "a throwaway HOME with a broken settings.json" || return 1
+  home="$INSTALL_SCRATCH_DIR"
+  settings="$home/.claude/settings.json"
+  mkdir -p "$home/.claude" || {
+    _fail "a throwaway HOME with a broken settings.json can be built" \
+      "could not create $home/.claude"
+    return 1
+  }
+  # Not JSON at all, which is the case install.sh cannot merge and must not
+  # overwrite: whatever is in there is the user's, and it is all they have.
+  before='{ this is not json'
+  printf '%s\n' "$before" > "$settings"
+
+  assert_exit 0 _install_run "$PATH" "$home"
+  out="$(last_output)"
+  assert_contains "$out" "jq could not merge" \
+    "install.sh says the merge failed instead of failing silently"
+
+  assert_eq "$before" "$(cat "$settings")" \
+    "the settings file it could not parse is left exactly as it was"
+
+  if [ -x "$home/.local/bin/okf" ]; then
+    _pass "the rest of the install still happened"
+  else
+    _fail "the rest of the install still happened" \
+      "not an executable file: $home/.local/bin/okf"
+  fi
+
+  leftover="$(find "$home/.claude" -maxdepth 1 -name 'settings.json.new.*' 2> /dev/null)"
+  assert_eq "" "$leftover" "and the merge takes its temp file with it"
+}
+
+# install.sh discovers its scripts with a glob, and an unmatched glob in bash
+# stands as its own literal rather than expanding to nothing — so an empty bin/
+# is the one way discovery can install nothing and still look like it worked.
+test_install_sh_refuses_to_install_nothing() {
+  local root home toolkit
+  _install_scratch_dir "a toolkit copy with an empty bin/" || return 1
+  root="$INSTALL_SCRATCH_DIR"
+  toolkit="$root/toolkit"
+  home="$root/home"
+  mkdir -p "$toolkit/bin" "$home" || {
+    _fail "a toolkit copy with an empty bin/ can be built" "mkdir failed under $root"
+    return 1
+  }
+  # A faithful copy but for bin/, so a failure here can only be the empty bin/.
+  if ! cp "$TOOLKIT_ROOT/install.sh" "$TOOLKIT_ROOT/permissions.json" "$toolkit/" \
+    || ! cp -R "$TOOLKIT_ROOT/commands" "$toolkit/commands"; then
+    _fail "a toolkit copy with an empty bin/ can be built" \
+      "could not copy install.sh, permissions.json and commands/ into $toolkit"
+    return 1
+  fi
+
+  assert_exit 1 env HOME="$home" bash "$toolkit/install.sh"
+  assert_contains "$(last_output)" "no scripts found in $toolkit/bin" \
+    "install.sh says which directory it found nothing in"
+
+  if [ -e "$home/.local/bin/okf" ] || [ -e "$home/.local/bin/ralph" ]; then
+    _fail "an install that found no scripts puts nothing on PATH" \
+      "something was installed into $home/.local/bin anyway"
+  else
+    _pass "an install that found no scripts puts nothing on PATH"
+  fi
+}
+
+# The failure path of that same temp name: $$ differs on every run, so a temp
+# abandoned by a run that died part way through is one nothing will ever
+# overwrite or clean up — a mode-755 half-written script in ~/.local/bin.
+test_install_sh_cleans_up_after_a_failed_copy() {
+  local root probe home record tmp
+  _install_scratch_dir "a probe root for a failing install.sh" || return 1
+  root="$INSTALL_SCRATCH_DIR"
+  probe="$root/bin"
+  home="$root/home"
+  record="$root/mv-calls"
+  mkdir -p "$home"
+
+  # Everything install_bin needs except a working `mv`, so the copy is made,
+  # made executable, and only then fails to be renamed into place. A stub rather
+  # than an absent mv, because the stub can record the path it was handed: that
+  # recording is the proof a temp file existed at the moment the run died, which
+  # is what makes the leftover check below mean anything at all.
+  if ! _okf_probe_path "$probe" dirname mkdir cp chmod rm basename; then
+    _fail "a probe PATH without a working mv can be built" \
+      "a coreutils install.sh needs is not installed here"
+    return 1
+  fi
+  printf '#!/bin/sh\nprintf "%%s\\n" "$@" >> "%s"\nexit 1\n' "$record" > "$probe/mv" \
+    && chmod 755 "$probe/mv" || {
+    _fail "a stand-in mv can be made" "could not write $probe/mv"
+    return 1
+  }
+
+  assert_exit 1 _install_run "$probe" "$home"
+
+  # The temp path install_bin asked the stub to rename. Matched on the name
+  # install_bin builds rather than taken positionally, so a change to mv's
+  # argument order cannot quietly turn this into a check of the wrong path.
+  tmp="$(grep -- '\.new\.' "$record" 2> /dev/null | head -1)"
+  if [ -z "$tmp" ]; then
+    _fail "the failing run had a temp file on disk to leave behind" \
+      "install.sh never got as far as renaming a temp file into place," \
+      "so the check below would pass without anything having been at risk"
+    return 1
+  fi
+  _pass "the failing run had a temp file on disk to leave behind"
+
+  if [ -e "$tmp" ]; then
+    _fail "a run that dies mid-copy takes its temp file with it" \
+      "still there after the run: $tmp"
+  else
+    _pass "a run that dies mid-copy takes its temp file with it"
+  fi
+
+  local leftover
+  leftover="$(find "$home/.local/bin" -maxdepth 1 -name '.*.new.*' 2> /dev/null)"
+  assert_eq "" "$leftover" "and leaves no other temp file behind either"
+}
+
+# PLAN.md Phase 6: a missing SPEC.md §3 prerequisite is warned about, not fatal.
+test_install_sh_warns_about_missing_okf_prerequisites() {
+  local root probe home out line tool
+  local -a hard=() tier_b=() expect_missing=() expect_present=()
+
+  while IFS= read -r tool; do
+    [ -n "$tool" ] && hard+=("$tool")
+  done < <(_okf_spec_tools_in_tier A)
+  while IFS= read -r tool; do
+    [ -n "$tool" ] && tier_b+=("$tool")
+  done < <(_okf_spec_tools_in_tier B)
+  # Without this the loops below would run over nothing and check nothing, on a
+  # suite that is the verify command for every PLAN.md item.
+  if [ "${#hard[@]}" -eq 0 ] || [ "${#tier_b[@]}" -eq 0 ]; then
+    _fail "SPEC.md §3 names the tools okf requires" \
+      "extracted no tool names from the runtime prerequisites section"
+    return 1
+  fi
+
+  _install_scratch_dir "a probe root for install.sh" || return 1
+  root="$INSTALL_SCRATCH_DIR"
+  probe="$root/bin"
+  home="$root/home"
+  mkdir -p "$home"
+
+  # Exactly what install.sh itself shells out to, and nothing else: every
+  # SPEC.md §3 tool it does not need for its own work is therefore missing here.
+  # What that leaves out is not fixed — install.sh's jq-less branch reaches for
+  # `sed` when it has one — so the checks below compute what to expect from the
+  # probe directory rather than hard-coding a list of names.
+  if ! _okf_probe_path "$probe" dirname mkdir cp chmod mv rm basename; then
+    _fail "a probe PATH holding only install.sh's own tools can be built" \
+      "a coreutils install.sh needs is not installed here"
+    return 1
+  fi
+
+  for tool in "${hard[@]}"; do
+    # bash is not provable by removal — install.sh is run as `bash install.sh`
+    # and answers for bash from the interpreter it is running under, exactly as
+    # bin/okf's preflight does. It belongs with the tools that must NOT be
+    # named, and that is where the loop below puts it.
+    if [ "$tool" = bash ] || [ -e "$probe/$tool" ]; then
+      expect_present+=("$tool")
+    else
+      expect_missing+=("$tool")
+    fi
+  done
+  if [ "${#expect_missing[@]}" -eq 0 ]; then
+    _fail "the probe PATH leaves a SPEC.md §3 tool missing" \
+      "install.sh needs every tool §3 requires, so none could be removed"
+    return 1
+  fi
+
+  # Warned about, not fatal: the whole point of this item.
+  assert_exit 0 _install_run "$probe" "$home"
+  out="$(last_output)"
+  if [ -x "$home/.local/bin/okf" ]; then
+    _pass "okf is still installed when a prerequisite is missing"
+  else
+    _fail "okf is still installed when a prerequisite is missing" \
+      "not an executable file: $home/.local/bin/okf"
+  fi
+
+  line="$(_install_line_with "$out" "okf needs these and they are not on PATH:")"
+  if [ -z "$line" ]; then
+    local -a detail=("no line matched 'okf needs these and they are not on PATH:'" "output:")
+    local d
+    while IFS= read -r d; do detail+=("$d"); done < <(_detail_lines "$out")
+    _fail "install.sh warns that okf's prerequisites are missing" "${detail[@]}"
+    return 1
+  fi
+  _pass "install.sh warns that okf's prerequisites are missing"
+
+  for tool in "${expect_missing[@]}"; do
+    _okf_assert_names_tool "$line" "$tool" \
+      "that warning names the missing prerequisite $tool"
+  done
+
+  # Naming a tool that is installed sends someone off to install what they
+  # already have — and bash, which no PATH could make missing here.
+  local named_present=""
+  if [ "${#expect_present[@]}" -gt 0 ]; then
+    for tool in "${expect_present[@]}"; do
+      if _okf_names_tool "$line" "$tool"; then
+        named_present="${named_present:+$named_present }$tool"
+      fi
+    done
+  fi
+  if [ -n "$named_present" ]; then
+    _fail "that warning names only what is missing" \
+      "these are installed and were named anyway: $named_present" "$line"
+  else
+    _pass "that warning names only what is missing"
+  fi
+
+  # SPEC.md §3 holds curl back for Tier B, whose absence degrades okf rather
+  # than breaking it — so it is said separately, and not as a hard requirement.
+  # Derived from the probe directory for the same reason the hard tools are: a
+  # Tier B tool install.sh came to need for its own work would be on this PATH,
+  # and demanding it be reported missing would fail a correct installer.
+  local -a tb_missing=()
+  for tool in "${tier_b[@]}"; do
+    if [ "$tool" != bash ] && [ ! -e "$probe/$tool" ]; then
+      tb_missing+=("$tool")
+    fi
+  done
+  if [ "${#tb_missing[@]}" -eq 0 ]; then
+    _skip "install.sh warns separately about the Tier B prerequisites" \
+      "install.sh needs every Tier B tool itself, so none is missing here"
+    return 0
+  fi
+
+  line="$(_install_line_with "$out" "reach Qdrant over HTTP need these")"
+  if [ -z "$line" ]; then
+    _fail "install.sh warns separately about the Tier B prerequisites" \
+      "no line matched 'reach Qdrant over HTTP need these'"
+    return 1
+  fi
+  _pass "install.sh warns separately about the Tier B prerequisites"
+  for tool in "${tb_missing[@]}"; do
+    _okf_assert_names_tool "$line" "$tool" \
+      "that warning names the missing Tier B tool $tool"
+  done
+  return 0
+}
+
+# SPEC.md §3 is the list of prerequisites; install.sh's copy of it is compared
+# against §3 itself rather than against a copy written out here, so a tool added
+# to §3 fails until install.sh mentions it too.
+test_install_sh_prerequisites_are_exactly_the_spec_tools() {
+  local spec_hard spec_tier_b
+  spec_hard="$(_okf_spec_tools_in_tier A)"
+  spec_tier_b="$(_okf_spec_tools_in_tier B)"
+
+  if [ -z "$spec_hard" ] || [ -z "$spec_tier_b" ]; then
+    _fail "SPEC.md §3 names the tools okf requires" \
+      "extracted no tool names from the runtime prerequisites section"
+    return 1
+  fi
+
+  assert_eq "$spec_hard" "$(_install_sh_array OKF_REQUIRED_TOOLS | sort -u)" \
+    "install.sh warns about exactly the tools SPEC.md §3 requires of every okf run"
+  assert_eq "$spec_tier_b" "$(_install_sh_array OKF_TIER_B_TOOLS | sort -u)" \
+    "install.sh holds back exactly SPEC.md §3's Tier B tools for Tier B"
+
+  # The two lists must also match bin/okf's, or install.sh would promise a
+  # preflight okf does not run.
+  assert_eq "$(_okf_bin_array OKF_REQUIRED_TOOLS | sort -u)" \
+    "$(_install_sh_array OKF_REQUIRED_TOOLS | sort -u)" \
+    "install.sh and bin/okf agree on what every okf run requires"
+  assert_eq "$(_okf_bin_array OKF_TIER_B_TOOLS | sort -u)" \
+    "$(_install_sh_array OKF_TIER_B_TOOLS | sort -u)" \
+    "install.sh and bin/okf agree on what only Tier B requires"
+}
+
 # --- add new test_* functions above this line ------------------------------
 
 # ---------------------------------------------------------------------------

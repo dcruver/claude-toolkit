@@ -47,7 +47,7 @@ there). Items are ordered so none depends on a later one. Every item verifies wi
 
 ## Phase 6 — install and permissions
 
-- [ ] Extend install.sh to copy bin/okf to $HOME/.local/bin/okf alongside ralph, report it in the same style, and warn without failing about any missing SPEC.md §3 runtime prerequisite (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
+- [x] Extend install.sh to copy bin/okf to $HOME/.local/bin/okf alongside ralph, report it in the same style, and warn without failing about any missing SPEC.md §3 runtime prerequisite (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Add the read-only okf list, okf hash, okf fanin, okf check and okf search entries to permissions.json, and add .okf/ to .gitignore (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 
 ## Phase 7 — slash commands
