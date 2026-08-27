@@ -5183,13 +5183,14 @@ _okf_check_silence_probe() {
 
   # A resource that is gone is an orphan, which is a different finding with a
   # different repair — the concept goes, or its `resource` is corrected — and
-  # naming it here would send somebody to re-read a file that is not there.
-  # Checked against `okf list --orphans`, so this says the concept is accounted
-  # for somewhere rather than only that check is quiet about it.
+  # calling it drift would send somebody to re-read a file that is not there.
+  # Checked against `okf list --orphans`, so this says the two listings account
+  # for the concept the same way rather than only that check said something.
   rm -f src/route/RouteRegistry.java
-  _okf_assert_check '' "a concept whose resource has been deleted is not drift" check
+  _okf_assert_check 'orphan: src/route/RouteRegistry.md' \
+    "a concept whose resource has been deleted is an orphan, not drift" check
   _okf_assert_listing 'src/route/RouteRegistry.md' \
-    "it is an orphan, which is where okf accounts for it" list --orphans
+    "and okf list --orphans names the same concept" list --orphans
   git checkout -q -- src/route/RouteRegistry.java
 
   # SPEC.md §5 co-locates a concept beside its source, and concept_resource is
@@ -5330,6 +5331,24 @@ _okf_check_warning_probe() {
     _okf_assert_check '' "a resource that cannot be read is not reported as drift" check
     assert_contains "$OKF_CHECK_ERR" "cannot read src/route/RouteSource.java" \
       "it is warned about too, naming the file okf could not open"
+
+    # It is also the file the in-scope walk cannot read: ripgrep's `@Generated`
+    # scan gives up on it and load_in_scope refuses to guess which sources a
+    # generator wrote. That is SPEC.md §7's exit 1 for `okf list`, whose whole
+    # answer is that one listing — and it is the status `okf check` must not
+    # inherit, because SPEC.md §8 has plain check always exiting 0 and one
+    # chmod'ed file turning "CI warns, never gates" into a failed build is
+    # exactly what that line is against.
+    #
+    # So the missing set is dropped rather than half-reported — a short listing
+    # of undocumented sources reads exactly like a well-documented repo — and
+    # the two sets read out of the concepts themselves are unaffected.
+    assert_contains "$OKF_CHECK_ERR" "no missing concepts are reported by this run" \
+      "the missing set okf could not work out is reported absent, not reported short"
+    printf '// touched\n' >> src/route/Legacy.java
+    _okf_assert_check 'drifted: src/route/Legacy.md' \
+      "and drift is still reported in full, since it is not read out of scope" check
+    git checkout -q -- src/route/Legacy.java
   else
     # root reads anything, so the check cannot be made to hold there.
     _skip "a resource that cannot be read is warned about" \
@@ -5400,6 +5419,193 @@ _okf_check_promises_probe() {
 
 test_okf_check_never_writes_and_always_exits_zero() {
   with_fixture_repo concepts _okf_check_promises_probe
+}
+
+# The two sets `okf check` grew past drift: an in-scope source with no concept
+# beside it, and a concept whose resource is gone. Each already has a listing of
+# its own — `okf list --missing` and `okf list --orphans` — and folding them into
+# one report is what lets a caller ask "what is wrong with this bundle" without
+# first knowing which of the three questions to put.
+_okf_check_missing_orphan_probe() {
+  # tests/fixtures/concepts has a concept for every source and a source for
+  # every concept, so the report starts empty and every finding below is one
+  # this probe caused.
+  _okf_assert_check '' \
+    "a bundle with a concept for every source and a source for every concept is silent" \
+    check
+
+  # A source with nothing documenting it. `git add` and no commit, for
+  # _okf_stage's reason: scope is `git ls-files`, which reads the index.
+  printf 'package route;\n\nclass Dispatcher {}\n' > src/route/Dispatcher.java
+  _okf_stage src/route/Dispatcher.java || return 1
+  _okf_assert_check 'missing: src/route/Dispatcher.java' \
+    "an in-scope source with no concept beside it is reported missing, naming the source" \
+    check
+  _okf_assert_listing 'src/route/Dispatcher.java' \
+    "and okf list --missing names the same source" list --missing
+
+  # A markdown file beside it that is not a concept does not cover it. This is
+  # has_concept's rule rather than a second copy of it — which is why check
+  # calls that function instead of deriving the name itself — but a README
+  # written beside a source is common enough to be worth one line here saying
+  # the report agrees with the listing about it.
+  printf '# Dispatcher\n\nDesign notes, not a concept.\n' > src/route/Dispatcher.md
+  _okf_assert_check 'missing: src/route/Dispatcher.java' \
+    "a markdown file with no frontmatter beside it is prose, so the source is still missing" \
+    check
+
+  # A real concept does cover it, and does so before it is staged. This is the
+  # asymmetry inside `okf check`, pinned as a decision: the missing set is
+  # has_concept's filesystem question, so a concept /okf-generate has just
+  # written takes its source off the listing at once, where the orphan set below
+  # is git's and a concept has to be staged to be in the bundle at all. Asking
+  # git's index here would report every freshly generated concept's source as
+  # still undocumented, which is noise on the one listing whose whole use is
+  # "what is left to write".
+  printf -- '---\ntype: Class\nresource: /src/route/Dispatcher.java\n---\n' \
+    > src/route/Dispatcher.md
+  _okf_assert_check '' \
+    "a concept written and not yet staged already takes its source off the missing set" \
+    check
+  _okf_stage src/route/Dispatcher.md || return 1
+  _okf_assert_check '' "and staging it changes nothing" check
+
+  # The other direction: the concept stays and the source goes. An orphan, and
+  # not also a missing source — the source left the bundle with the file, so
+  # there is nothing left to write a concept for, and sending somebody to
+  # document a path that is not there is the one way this report wastes a
+  # reader's time twice over.
+  rm -f src/route/Dispatcher.java
+  _okf_assert_check 'orphan: src/route/Dispatcher.md' \
+    "a concept whose resource is deleted is an orphan, and the source is not also called missing" \
+    check
+  _okf_assert_listing 'src/route/Dispatcher.md' \
+    "and okf list --orphans names the same concept" list --orphans
+  rm -f src/route/Dispatcher.md
+  git rm -q --cached src/route/Dispatcher.md src/route/Dispatcher.java > /dev/null 2>&1
+  _okf_assert_check '' "with both taken away the bundle is clean again" check
+
+  # A concept that stores no `code.content_hash` is still an orphan when its
+  # resource goes. src/route/RouteSource.md declares no hash at all — it is the
+  # concept the silence probe uses for "nothing to compare" — and it is exactly
+  # the hand-written concept somebody deleted the source for.
+  #
+  # The order of the two questions inside the concept walk is the whole of
+  # whether this holds: `okf list --orphans` never looks at `code.content_hash`,
+  # so a check that skipped hashless concepts before asking where their resource
+  # had gone would put this one on that listing and leave it off its own report.
+  rm -f src/route/RouteSource.java
+  _okf_assert_check 'orphan: src/route/RouteSource.md' \
+    "a concept storing no content_hash is still an orphan once its resource goes" check
+  _okf_assert_listing 'src/route/RouteSource.md' \
+    "and okf list --orphans agrees, which is what that ordering protects" list --orphans
+  git checkout -q -- src/route/RouteSource.java
+
+  # All three kinds in one run, which is the report's whole point. Grouped
+  # drifted, then missing, then orphan, each group in the bundle's own order —
+  # and every line carrying its kind, so `grep '^orphan: '` gets the same answer
+  # whatever order the groups come out in.
+  printf '// touched\n' >> src/route/RouteRegistry.java
+  printf 'package route;\n\nclass Dispatcher {}\n' > src/route/Dispatcher.java
+  _okf_stage src/route/Dispatcher.java || return 1
+  rm -f src/route/Legacy.java
+  _okf_assert_check 'drifted: src/route/RouteRegistry.md
+missing: src/route/Dispatcher.java
+orphan: src/route/Legacy.md' \
+    "drift, an undocumented source and an orphan are reported together, each labelled" \
+    check
+
+  git checkout -q -- src/route/
+  rm -f src/route/Dispatcher.java
+  git rm -q --cached src/route/Dispatcher.java > /dev/null 2>&1
+  _okf_assert_check '' "and putting all three right clears the whole report" check
+
+  # SPEC.md §6's settings decide the missing set exactly as they decide `okf
+  # list`'s, because it is the same walk: a source the bundle does not reach is
+  # not one the bundle is missing a concept for. The same run before and after
+  # each setting is what says the listing moved because of the setting.
+  printf 'package route;\n\nclass Dispatcher {}\n' > src/route/Dispatcher.java
+  _okf_stage src/route/Dispatcher.java || return 1
+  _okf_assert_check 'missing: src/route/Dispatcher.java' \
+    "the undocumented source is reported while nothing excludes it" check
+  printf '{"bundle": {"exclude": ["**/route/**"]}}\n' > okf.json
+  _okf_assert_check '' "and drops out when exclude covers it" check
+  printf '{"bundle": {"extensions": ["ts"]}}\n' > okf.json
+  _okf_assert_check '' "and when extensions no longer reach it" check
+  rm -f okf.json
+  _okf_assert_check 'missing: src/route/Dispatcher.java' \
+    "and comes back with the settings taken away again" check
+
+  # A source git has never been told about is not in the bundle, so it is not
+  # missing from it. Scope is read out of git throughout okf, and this is what
+  # keeps a scratch file in a work tree off the listing /okf-generate walks.
+  rm -f src/route/Dispatcher.java
+  git rm -q --cached src/route/Dispatcher.java > /dev/null 2>&1
+  printf 'package route;\n\nclass Scratch {}\n' > src/route/Scratch.java
+  _okf_assert_check '' "an untracked source is not in the bundle, so it is not missing" check
+  _okf_stage src/route/Scratch.java || return 1
+  _okf_assert_check 'missing: src/route/Scratch.java' \
+    "and is reported the moment git is told about it, with no commit needed" check
+  rm -f src/route/Scratch.java
+  git rm -q --cached src/route/Scratch.java > /dev/null 2>&1
+  _okf_assert_check '' "the bundle is clean once more" check
+  return 0
+}
+
+test_okf_check_reports_missing_and_orphan_concepts() {
+  with_fixture_repo concepts _okf_check_missing_orphan_probe
+}
+
+# The invariant that makes one report out of three listings: what `okf check`
+# prints under a kind is exactly what the listing for that kind prints. Asserted
+# mechanically rather than left as a claim in a comment, because the report and
+# the listings are separate code paths over separate sets — the missing half
+# asks the filesystem and the orphan half asks git — and a caller who reads the
+# report and then runs the listing on what it said must not be told two
+# different things about the same file.
+_okf_check_agrees_with_list_probe() {
+  local okf="$TOOLKIT_ROOT/bin/okf"
+
+  # All three states at once, so the comparison is over a report with something
+  # in every group rather than over three empty listings agreeing.
+  printf '// touched\n' >> src/route/RouteRegistry.java
+  printf 'package route;\n\nclass Dispatcher {}\n' > src/route/Dispatcher.java
+  _okf_stage src/route/Dispatcher.java || return 1
+  rm -f src/route/Legacy.java
+
+  _okf_check check
+  if [ "$OKF_CHECK_RC" -ne 0 ]; then
+    _fail "okf check exits 0 over a bundle in all three states" \
+      "okf check exited $OKF_CHECK_RC"
+    return 1
+  fi
+
+  local reported expected
+  reported="$(printf '%s\n' "$OKF_CHECK_OUT" | sed -n 's/^missing: //p')"
+  expected="$("$okf" list --missing)"
+  assert_eq "$expected" "$reported" \
+    "okf check's missing: lines are exactly okf list --missing's listing"
+
+  reported="$(printf '%s\n' "$OKF_CHECK_OUT" | sed -n 's/^orphan: //p')"
+  expected="$("$okf" list --orphans)"
+  assert_eq "$expected" "$reported" \
+    "and its orphan: lines are exactly okf list --orphans' listing"
+
+  # No path under two kinds. A source deleted with its concept left behind is an
+  # orphan and nothing else; a report that also called it missing would send a
+  # reader to write a concept for a file that is gone.
+  local duplicated
+  duplicated="$(printf '%s\n' "$OKF_CHECK_OUT" | sed -n 's/^[a-z]*: //p' | sort | uniq -d)"
+  assert_eq "" "$duplicated" "and no path is reported under two kinds at once"
+
+  git checkout -q -- src/route/
+  rm -f src/route/Dispatcher.java
+  git rm -q --cached src/route/Dispatcher.java > /dev/null 2>&1
+  return 0
+}
+
+test_okf_check_agrees_with_the_listings_it_folds_in() {
+  with_fixture_repo concepts _okf_check_agrees_with_list_probe
 }
 
 # The flags SPEC.md §7 gives `okf check`, and what it does with a line it cannot

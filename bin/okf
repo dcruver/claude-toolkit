@@ -3384,6 +3384,68 @@ cmd_fanin() {
   printf '%d\n' "$OKF_FANIN_TOTAL"
 }
 
+# The in-scope sources for a caller that must not die when the walk cannot be
+# made. Fills OKF_SOFT_IN_SCOPE and returns 0; returns 1 with it emptied when
+# load_in_scope gave up, having already said on stderr why.
+#
+# `okf check` is the only caller, and SPEC.md §8 is the whole reason this
+# exists. load_in_scope's last step is the one that opens files — the
+# `@Generated` scan — and it refuses to guess when ripgrep cannot read one of
+# them. That is right for `okf list`, whose entire answer is that listing:
+# SPEC.md §7's exit 1, and nothing printed that would be read as a complete
+# scope. It is not right for `okf check`, whose answer is three sets of which
+# that walk decides one. One file somebody chmod'ed to 000 must not turn §8's
+# "CI warns, never gates" into a non-zero status, and it must not take the drift
+# report down with it — drift is computed from concepts and their own resources
+# and has nothing to do with which sources are in scope.
+#
+# Degrading rather than dying is also the honest answer to what was asked. The
+# question `missing:` answers is "which in-scope sources have no concept", and a
+# run that cannot say which sources are in scope cannot answer it — so it says
+# so, and answers the two questions it still can. Silently reporting the sources
+# it did manage to walk would be the worst of the three: a short listing looks
+# exactly like a well-documented repository.
+#
+# The walk runs in a subshell with its exit status carried back out as one more
+# NUL record — load_tracked_paths' idiom, for the same reason it uses it: a
+# process substitution's own status is invisible to the shell reading it. The
+# `set +e` that lets that status be written is undone inside the inner subshell,
+# because leaving errexit off would change what the walk itself does.
+OKF_SOFT_IN_SCOPE=()
+soft_load_in_scope() {
+  local -a records=()
+  local record
+  while IFS= read -r -d '' record; do
+    records+=("$record")
+  done < <(
+    set +e
+    (
+      set -euo pipefail
+      load_in_scope
+      # An empty scope must write no record at all: `printf '%s\0'` with no
+      # arguments still runs its format once, and the empty string that came
+      # back would be read out here as a source whose name is nothing.
+      [ "${#OKF_IN_SCOPE[@]}" -eq 0 ] || printf '%s\0' "${OKF_IN_SCOPE[@]}"
+    )
+    printf 'status:%s\0' "$?"
+  )
+
+  OKF_SOFT_IN_SCOPE=()
+  local count="${#records[@]}"
+  # Not a bundle okf could not read but a subshell that did not run: the status
+  # record is written unconditionally, so its absence is this script broken
+  # rather than this repository being in some state. SPEC.md §7's exit 1, like
+  # load_tracked_paths' own version of this line.
+  [ "$count" -gt 0 ] \
+    || die "the in-scope source walk wrote nothing at all, not even its exit status"
+  local status="${records[$((count - 1))]}"
+  unset "records[$((count - 1))]"
+  [ "$status" = "status:0" ] || return 1
+
+  OKF_SOFT_IN_SCOPE=(${records[@]+"${records[@]}"})
+  return 0
+}
+
 # okf check [--strict] [--stamp] [--json] — drift, missing and orphan concepts
 #
 # SPEC.md §8's drift rule, and nothing more than it: "stored `code.content_hash`
@@ -3407,11 +3469,24 @@ cmd_fanin() {
 #     not parse — is SPEC.md §7's exit 1 like anywhere else, because that run
 #     did not find no drift, it found nothing.
 #
-# One line per finding on stdout, `drifted: <concept>`, so a caller pipes it
-# into `cut -d' ' -f2` or greps it by kind. The kind is on the line rather than
-# implied by a section header because the sets this grows — missing sources,
-# orphan concepts — are paths of different kinds, and a listing whose meaning
-# depends on how far down it a line appears is one a filter destroys.
+# One line per finding on stdout, `<kind>: <path>`, so a caller pipes it into
+# `cut -d' ' -f2` or greps it by kind. Three kinds, because three different
+# things go wrong between a bundle and its sources and each has its own repair:
+#
+#   * `drifted: <concept>` — the concept describes a version of its source that
+#     is not the one on disk any more. Re-read the source, re-author the body.
+#   * `missing: <source>` — an in-scope source with no concept beside it.
+#     Write one; `/okf-generate` is what walks these.
+#   * `orphan: <concept>` — a concept whose `resource` is gone. Delete the
+#     concept, or correct the `resource` it names.
+#
+# The kind is on the line rather than implied by a section header because the
+# three are paths of different kinds — two name concepts, one names a source —
+# and a listing whose meaning depends on how far down it a line appears is one
+# a filter destroys. The lines are still grouped by kind, because a reader
+# works through one repair at a time and interleaving three of them helps
+# nobody; but the grouping carries no meaning the label does not, so `grep
+# '^orphan: '` gets the same answer whatever order they come out in.
 #
 # A clean bundle prints nothing at all, which is `okf list --orphans`'s
 # convention and the one a warning should keep: something to read means
@@ -3425,9 +3500,22 @@ cmd_fanin() {
 # has just written is not compared until it is staged, which costs nothing in
 # practice: a concept written from its source this minute stores that source's
 # current digest and has no drift to find. `git add` is enough; no commit is
-# needed. Note that this is a stricter rule than has_concept's, which asks the
-# filesystem — `okf list --missing` counts an unstaged concept as covering its
-# source. The two answer different questions, and the difference is git's index.
+# needed.
+#
+# Which sources are walked for the missing set is the other rule, deliberately:
+# it is has_concept's, which asks the filesystem. So each half of this report
+# says exactly what the listing that already reports it says — `missing:` is
+# `okf list --missing`'s output and `orphan:` is `okf list --orphans`'s — and a
+# caller who runs both never sees the two disagree about the same file.
+#
+# That the two halves read different sets is the point rather than an oversight
+# nobody got round to. Asking git's index for the missing set would report every
+# concept `/okf-generate` had just written as still missing until somebody
+# staged it, which is noise on the one listing whose whole use is "what is left
+# to write". Asking the filesystem for the orphan set would put files git has
+# never heard of on a listing acted on by deleting them. The difference between
+# the two sets is git's index, and each side takes the rule that costs less when
+# it is the wrong one.
 cmd_check() {
   local strict=0 stamp=0 json=0
 
@@ -3463,8 +3551,15 @@ cmd_check() {
   [ "$stamp" -eq 0 ] || not_implemented "check --stamp"
   [ "$json" -eq 0 ] || not_implemented "check --json"
 
-  load_concepts
   load_bundle_globs
+  load_concepts
+
+  # Collected rather than printed as they are found, so the three kinds come out
+  # grouped and the source walk below does not have to be threaded through the
+  # concept walk above to keep them so. Nothing here is large: each set is
+  # bounded by the bundle, and a report too big to hold in memory is a repository
+  # nobody was going to work through a line at a time anyway.
+  local -a drifted=() missing=() orphans=()
 
   local concept resource stored
   for concept in ${OKF_CONCEPTS[@]+"${OKF_CONCEPTS[@]}"}; do
@@ -3473,29 +3568,43 @@ cmd_check() {
     # to say about whether it drifted.
     read_frontmatter "$concept" || continue
 
+    # Which concepts this bundle answers for at all — see concept_resource. The
+    # same rule `okf list --orphans` uses, deliberately: a concept inside a
+    # nested bundle, or one whose `resource` is not co-located with it, is not
+    # this run's to have an opinion about in any of the three directions.
+    concept_resource "$concept" "$OKF_FM_RESOURCE" || continue
+    resource="$OKF_CONCEPT_RESOURCE"
+
+    # A resource that is not there is an orphan, and an orphan is not drift: the
+    # repair is a different one — the concept goes, or its `resource` is
+    # corrected — and reporting it as drift would send somebody to re-read a
+    # file that does not exist. `-e` and not `-f`, so that this and `okf list
+    # --orphans` agree on what "gone" means; a dangling symlink is gone to both.
+    #
+    # Asked before the stored hash below, and that order is the whole of whether
+    # the two listings agree. `okf list --orphans` never looks at
+    # `code.content_hash` — a concept is an orphan because of what happened to
+    # its resource, not because of what it wrote down about it — so a check that
+    # skipped hashless concepts first would report every hand-written concept's
+    # deleted source on one listing and not the other. The concept whose source
+    # is gone and which never stored a digest is precisely the one somebody
+    # wrote by hand and then deleted the file for; it is the most orphaned
+    # concept in the bundle, not the least.
+    if [ ! -e "$resource" ]; then
+      orphans+=("$concept")
+      continue
+    fi
+
     # No stored hash is not drift. A concept written by hand, or one a slash
     # command has not stamped yet, has never claimed to describe a particular
     # version of its source — and §8's rule is a comparison between two values,
     # not a demand that both exist. The concept still shows up as a draft to
     # whoever is reading `status`, and `okf verify` is what settles its trust.
+    #
+    # Everything past this line is about drift alone, so a concept that gets no
+    # further has still been asked both of the other two questions.
     stored="$OKF_FM_CODE_CONTENT_HASH"
     [ -n "$stored" ] || continue
-
-    # Which concepts this bundle answers for at all — see concept_resource. The
-    # same rule `okf list --orphans` uses, deliberately: a concept inside a
-    # nested bundle, or one whose `resource` is not co-located with it, is not
-    # this run's to have an opinion about in either direction.
-    concept_resource "$concept" "$OKF_FM_RESOURCE" || continue
-    resource="$OKF_CONCEPT_RESOURCE"
-
-    # A resource that is not there is an orphan, which is a different finding
-    # with a different repair — the concept goes, or its `resource` is
-    # corrected — and reporting it as drift would send someone to re-read a file
-    # that does not exist. It is reported by `okf list --orphans` today, and by
-    # a later PLAN.md item as part of this same run. `-e` and not `-f`, so that
-    # this and that listing agree on what "gone" means; a dangling symlink is
-    # gone to both.
-    [ -e "$resource" ] || continue
 
     # Present, but not something a sha256 can be taken of: a resource replaced
     # by a directory, or one that is a fifo — which would hang here waiting on a
@@ -3541,7 +3650,49 @@ cmd_check() {
     fi
 
     [ "$OKF_FILE_DIGEST" != "$stored" ] || continue
-    printf 'drifted: %s\n' "$concept"
+    drifted+=("$concept")
+  done
+
+  # SPEC.md §5's co-location read the third way: an in-scope source with nothing
+  # documenting it. has_concept holds the whole of what "beside it" means — the
+  # stem rule, §4's reserved names, a `.md` source not being its own concept —
+  # so that rule stays in one place and this report and `okf list --missing`
+  # cannot come apart.
+  #
+  # `if !` rather than `has_concept "$path" && continue`, because that AND-list
+  # is the last command in the loop body and a failing one is a status `set -e`
+  # would take the whole run down on — on exactly the undocumented source this
+  # loop exists to find.
+  #
+  # Walked last, and softly: see soft_load_in_scope. The two sets above are
+  # already collected by the time this runs, so a scope okf cannot work out
+  # costs this report the `missing:` lines and nothing else.
+  local path
+  if soft_load_in_scope; then
+    for path in ${OKF_SOFT_IN_SCOPE[@]+"${OKF_SOFT_IN_SCOPE[@]}"}; do
+      if ! has_concept "$path"; then
+        missing+=("$path")
+      fi
+    done
+  else
+    warn "the in-scope source listing could not be made — see the message above" \
+      "  so no missing concepts are reported by this run" \
+      "  drifted and orphan findings are unaffected: neither is read out of scope"
+  fi
+
+  # Grouped in the order the repairs are usually worked through: concepts that
+  # describe their source wrongly, then sources described nowhere, then concepts
+  # describing nothing at all. Within a group the bundle's own order, which is
+  # git's, and so `okf list`'s.
+  local finding
+  for finding in ${drifted[@]+"${drifted[@]}"}; do
+    printf 'drifted: %s\n' "$finding"
+  done
+  for finding in ${missing[@]+"${missing[@]}"}; do
+    printf 'missing: %s\n' "$finding"
+  done
+  for finding in ${orphans[@]+"${orphans[@]}"}; do
+    printf 'orphan: %s\n' "$finding"
   done
 
   # Explicit, and not left to the loop's own status. SPEC.md §8's "always exits
