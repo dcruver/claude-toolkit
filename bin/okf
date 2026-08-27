@@ -27,6 +27,52 @@ set -euo pipefail
 # doing nothing.
 OKF_SUBCOMMANDS=(init list hash fanin check index verify chunk embed search)
 
+# The help text, and the user-facing half of the SPEC.md §7 CLI surface.
+#
+# Written out as one literal block rather than generated from OKF_SUBCOMMANDS,
+# because the flags and the one-line summaries are as much a part of that
+# surface as the names are, and a generated list could only ever print names.
+# The names here and in OKF_SUBCOMMANDS are both checked against SPEC.md §7 by
+# tests/toolkit.sh, so the two cannot drift apart unnoticed.
+#
+# Nothing here reads okf.json or the repo: help is the one thing that must
+# print the same for every caller, in any directory, whatever the bundle
+# contains. SPEC.md §3's preflight still runs ahead of it.
+#
+# SPEC.md §7's global -C DIR and --config PATH are deliberately absent: they
+# are not built yet, and help that lists a flag dispatch would reject as an
+# unknown subcommand is worse than help that omits it. The PLAN.md item adding
+# them adds their lines here.
+usage() {
+  cat <<'USAGE'
+okf — OKF code knowledge for a repository.
+
+Usage: okf <subcommand> [flags]
+
+Subcommands:
+  init [--force]                       write okf.json + the bundle-root index.md
+  list [--missing] [--orphans]         in-scope source files
+  hash <file>                          the sha256: digest of one file
+  fanin <Name>                         whole-word reference count for a name
+  check [--strict] [--stamp] [--json]  drift, missing and orphan concepts
+  index                                regenerate the per-directory index.md files
+  verify <concept> [--by ACTOR]        append a verified entry
+  chunk <concept>                      JSON chunks for one concept
+  embed [--all]                        embed and upsert to Qdrant
+  search <query> [--hyde-prompt] [--k N] [--repo R] [--type T]
+
+  -h, --help                           print this help
+
+chunk, embed and search are Tier B: each needs an `index` block in okf.json.
+
+Exit codes:
+  0  success
+  1  error, or a missing prerequisite
+  2  a Tier B subcommand was invoked without an `index` block in okf.json
+  3  `check --strict` found drift
+USAGE
+}
+
 die() { # $1.. = message lines
   local line
   for line in "$@"; do
@@ -85,12 +131,25 @@ cmd_search() { not_implemented search; }
 # ---------------------------------------------------------------------------
 
 main() {
+  # No subcommand at all: the same help, but on stderr and exiting 1. A caller
+  # that reached here with an empty argument asked for nothing and got nothing
+  # done, and exiting 0 would let it mistake that for success.
   if [ $# -eq 0 ]; then
-    die "no subcommand given" "expected one of: ${OKF_SUBCOMMANDS[*]}"
+    usage >&2
+    return 1
   fi
 
   local sub="$1"
   shift
+
+  # Answered before the subcommand table, so `--help` stays help rather than
+  # becoming "unknown subcommand: --help".
+  case "$sub" in
+    -h | --help)
+      usage
+      return 0
+      ;;
+  esac
 
   local known
   for known in "${OKF_SUBCOMMANDS[@]}"; do

@@ -532,6 +532,51 @@ _okf_spec_subcommands() {
   ' "$TOOLKIT_ROOT/SPEC.md" | sort -u
 }
 
+# The subcommand names bin/okf's help actually documents: the first word of
+# every indented, non-flag line in its `Subcommands:` block.
+_okf_help_subcommands() { # help text on stdin
+  awk '
+    /^Subcommands:/ { in_block = 1; next }
+    # The block runs to the next unindented line — the prose or the exit-code
+    # table that follows it. Deliberately not "to the next blank line": that
+    # would make a cosmetic blank line inside the block load-bearing, and
+    # removing one would silently shrink the set this comparison is built on.
+    in_block && /^[^[:space:]]/ { exit }
+    # Flag entries such as "-h, --help" are not subcommands.
+    in_block && $1 ~ /^-/ { next }
+    in_block && NF > 0 { print $1 }
+  ' | sort -u
+}
+
+# The names bin/okf's dispatch accepts, read out of its OKF_SUBCOMMANDS array.
+_okf_dispatch_subcommands() {
+  sed -n 's/^OKF_SUBCOMMANDS=(\(.*\))$/\1/p' "$TOOLKIT_ROOT/bin/okf" \
+    | tr ' ' '\n' | sort -u
+}
+
+# The usage portion of a subcommand's SPEC.md §7 line — the name and its flags,
+# with the aligned description (two or more spaces, then prose) cut off.
+#
+#   okf list [--missing] [--orphans]   in-scope source files
+#     -> list [--missing] [--orphans]
+_okf_spec_usage() { # $1 = subcommand name
+  awk -v want="$1" '
+    /^## 7\./ { in_section = 1; next }
+    in_section && /^## / { exit }
+    in_section && $1 == "okf" && $2 == want {
+      sub(/^okf[ \t]+/, "")
+      sub(/[ \t][ \t]+.*$/, "")
+      print
+      exit
+    }
+  ' "$TOOLKIT_ROOT/SPEC.md"
+}
+
+# Every <arg> and [--flag ARG] token of a SPEC.md §7 usage line, one per line.
+_okf_spec_usage_tokens() { # $1 = subcommand name
+  _okf_spec_usage "$1" | grep -oE '<[^>]+>|\[[^]]+\]' || true
+}
+
 # Runs each subcommand inside a throwaway fixture repo, because the ones already
 # implemented do real work: `init` writes okf.json, `index` writes index.md. In
 # the toolkit checkout that would edit the repo under test.
@@ -669,6 +714,103 @@ test_okf_rejects_an_unknown_subcommand() {
   bare="$("$okf" 2>&1)" || true
   assert_contains "$bare" "init" "a bare invocation names the subcommands"
   assert_contains "$bare" "search" "a bare invocation names the subcommands"
+}
+
+test_okf_help_lists_every_spec_subcommand() {
+  local okf="$TOOLKIT_ROOT/bin/okf"
+  if [ ! -x "$okf" ]; then
+    _fail "bin/okf is an executable script" "missing or not executable: $okf"
+    return 1
+  fi
+
+  # Help needs nothing but bash and cat today, so its exit status is asserted
+  # outright. SPEC.md §3's preflight does not exist yet; the PLAN.md item that
+  # adds it owns the interaction, and has two honest ways to keep this passing:
+  # exempt -h/--help from the preflight, or narrow this to the case where the
+  # required tools are present.
+  assert_exit 0 "$okf" --help
+
+  # Captured again with the two streams kept apart, because assert_exit merges
+  # them and so cannot tell help printed on stdout from help printed on stderr.
+  # Everything below reads this stdout-only copy.
+  local help help_err="$HARNESS_STATE/okf_help_stderr"
+  help="$("$okf" --help 2> "$help_err")"
+  assert_contains "$help" "Subcommands:" "okf --help prints its help on stdout"
+  assert_eq "" "$(cat "$help_err")" "okf --help prints nothing on stderr"
+  rm -f "$help_err"
+
+  local -a subs=()
+  local name
+  while IFS= read -r name; do
+    [ -n "$name" ] && subs+=("$name")
+  done < <(_okf_spec_subcommands)
+  # Same guard as the dispatch test: no names extracted would turn every check
+  # below into one that cannot fail, and "${subs[@]}" on an empty array aborts
+  # the run under `set -u` on bash 3.2.
+  if [ "${#subs[@]}" -eq 0 ]; then
+    _fail "SPEC.md §7 lists its subcommands" \
+      "extracted no subcommand names from SPEC.md's CLI surface section"
+    return 1
+  fi
+
+  local sub entry token
+  for sub in "${subs[@]}"; do
+    # The help entry for this subcommand: the line whose first word is its name.
+    entry="$(printf '%s\n' "$help" | awk -v want="$sub" '$1 == want { print; exit }')"
+    if [ -z "$entry" ]; then
+      _fail "okf --help lists $sub" "no line in the help output begins with \"$sub\""
+      continue
+    fi
+    _pass "okf --help lists $sub"
+
+    # Its flags and arguments, read back out of SPEC.md rather than restated
+    # here, so a flag added to the spec and not to the help fails as a missing
+    # flag instead of quietly never being checked.
+    while IFS= read -r token; do
+      [ -n "$token" ] || continue
+      assert_contains "$entry" "$token" "okf --help shows $sub $token"
+    done < <(_okf_spec_usage_tokens "$sub")
+  done
+
+  # A bare invocation is the same help, so a user who typed `okf` and a user who
+  # typed `okf --help` are told the same things. It exits non-zero because
+  # nothing was asked for and nothing was done.
+  local bare
+  bare="$("$okf" 2>&1)"
+  local bare_rc=$?
+  assert_eq "$help" "$bare" "a bare invocation prints the same help as --help"
+  if [ "$bare_rc" -ne 0 ]; then
+    _pass "a bare invocation exits non-zero"
+  else
+    _fail "a bare invocation exits non-zero" "exit status was 0"
+  fi
+  # ...and on stderr, so a pipeline capturing okf's stdout gets nothing rather
+  # than a page of help text where its data should be. The stderr side is
+  # asserted first on purpose: on its own, "stdout was empty" is a check that
+  # would also pass if okf had died without printing anything at all.
+  local bare_out bare_err="$HARNESS_STATE/okf_bare_stderr"
+  bare_out="$("$okf" 2> "$bare_err" || true)"
+  assert_contains "$(cat "$bare_err")" "Subcommands:" \
+    "a bare invocation prints its help on stderr"
+  assert_eq "" "$bare_out" "a bare invocation prints nothing on stdout"
+  rm -f "$bare_err"
+
+  # Both directions, so the help cannot document a subcommand that SPEC.md §7
+  # does not define and dispatch would reject, and dispatch cannot accept one
+  # the help never mentions. The per-subcommand checks above only cover
+  # spec -> help; on their own an invented entry would ship unnoticed.
+  local spec_names help_names table_names
+  spec_names="$(_okf_spec_subcommands)"
+  help_names="$(printf '%s\n' "$help" | _okf_help_subcommands)"
+  table_names="$(_okf_dispatch_subcommands)"
+  assert_eq "$spec_names" "$help_names" \
+    "okf --help documents exactly the SPEC.md §7 subcommands, and no others"
+  assert_eq "$spec_names" "$table_names" \
+    "okf dispatch accepts exactly the SPEC.md §7 subcommands, and no others"
+
+  # -h is the same help on stdout, exiting 0: asking for help is not an error.
+  assert_exit 0 "$okf" -h
+  assert_eq "$help" "$(last_output)" "okf -h prints the same help as --help"
 }
 
 # --- add new test_* functions above this line ------------------------------
