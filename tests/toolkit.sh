@@ -5810,6 +5810,266 @@ test_okf_check_strict_exits_three_only_on_drift() {
   with_fixture_repo concepts _okf_check_strict_probe
 }
 
+
+# `okf check --json` — SPEC.md §7's third flag on this subcommand, and the one
+# that changes the shape of the report rather than what is in it.
+#
+# Everything below is written around one claim: the flag is a rendering of the
+# finished report and nothing else. The same walk, the same findings, the same
+# warnings on stderr, the same exit status — so the two shapes are compared
+# against each other on the same state rather than each being asserted against
+# a literal of its own, which is the one way two spellings of a report drift
+# apart without either looking wrong.
+
+# okf check's stdout, parsed, with the parse itself asserted rather than
+# assumed. A jq filter over output that was not JSON comes back empty, so every
+# comparison underneath an unchecked parse would be against an empty string and
+# would pass whatever the run had printed.
+#
+# Slurped rather than filtered in place, because "one JSON document" is part of
+# what is being asserted: a report emitted as one object per finding would parse
+# perfectly well one line at a time and could not tell a clean bundle from a run
+# that stopped before it printed anything.
+OKF_CHECK_JSON=""
+_okf_check_json() { # $1.. = okf arguments
+  _okf_check "$@"
+  OKF_CHECK_JSON=""
+
+  local slurped
+  if ! slurped="$(printf '%s\n' "$OKF_CHECK_OUT" | jq -s -c . 2> /dev/null)"; then
+    local -a detail=("okf $* did not print JSON" "stdout:")
+    local line
+    while IFS= read -r line; do detail+=("$line"); done < <(_detail_lines "$OKF_CHECK_OUT")
+    _fail "okf $* prints one JSON document" "${detail[@]}"
+    return 1
+  fi
+
+  local count
+  count="$(printf '%s\n' "$slurped" | jq -c 'length')"
+  if [ "$count" != "1" ]; then
+    _fail "okf $* prints one JSON document" \
+      "stdout parsed as $count JSON documents, not one" "stdout:" "$OKF_CHECK_OUT"
+    return 1
+  fi
+
+  OKF_CHECK_JSON="$(printf '%s\n' "$slurped" | jq -c '.[0]')"
+  return 0
+}
+
+# The document okf check --json printed, exactly, next to the status it came
+# back with. Both on every call for _okf_assert_check_status' reason: `--json`
+# must not have quietly become a flag that also changes what a caller branches
+# on.
+_okf_assert_check_json() { # $1 = expected status, $2 = expected compact JSON, $3 = description, $4.. = okf arguments
+  local expected_rc="$1" expected_json="$2" what="$3"
+  shift 3
+  _okf_check_json "$@" || return 1
+  if [ "$OKF_CHECK_RC" -eq "$expected_rc" ]; then
+    _pass "$what: exits $expected_rc"
+  else
+    local -a detail=("okf $* exited $OKF_CHECK_RC, expected $expected_rc" "stderr:")
+    local line
+    while IFS= read -r line; do detail+=("$line"); done < <(_detail_lines "$OKF_CHECK_ERR")
+    _fail "$what: exits $expected_rc" "${detail[@]}"
+  fi
+  assert_eq "$expected_json" "$OKF_CHECK_JSON" "$what"
+  return 0
+}
+
+_okf_check_json_probe() {
+  # A bundle with nothing wrong with it, which is where the two shapes part
+  # company on purpose. The plain report prints nothing — something to read
+  # means something to do — and nothing is not a JSON document: a caller who
+  # asked for JSON is parsing what comes back, and `jq` given an empty stream
+  # fails rather than reporting a clean bundle. So the empty answer is spelled
+  # out, three empty arrays and no findings.
+  _okf_assert_check_json 0 '{"drifted":[],"missing":[],"orphan":[]}' \
+    "a clean bundle is three empty arrays, not the plain report's silence" \
+    check --json
+
+  # The three keys, and only those three. Named for the labels the plain report
+  # prints — `drifted:`, `missing:`, `orphan:` — so `grep '^orphan: '` and
+  # `.orphan` are one set and not two that can come apart, and asserted in the
+  # document's own order so the two listings stay readable side by side.
+  assert_eq '["drifted","missing","orphan"]' \
+    "$(printf '%s\n' "$OKF_CHECK_JSON" | jq -c 'keys_unsorted')" \
+    "its keys are the three kinds the plain report labels its lines with"
+
+  _okf_assert_check '' "while the plain run over the same bundle still prints nothing" \
+    check
+
+  # All three kinds at once, which is the only state that says the sets are kept
+  # apart rather than concatenated.
+  printf '// touched\n' >> src/route/RouteRegistry.java
+  printf 'package route;\n\nclass Dispatcher {}\n' > src/route/Dispatcher.java
+  _okf_stage src/route/Dispatcher.java || return 1
+  rm -f src/route/Legacy.java
+
+  _okf_assert_check_json 0 \
+    '{"drifted":["src/route/RouteRegistry.md"],"missing":["src/route/Dispatcher.java"],"orphan":["src/route/Legacy.md"]}' \
+    "drift, an undocumented source and an orphan each land under their own key" \
+    check --json
+
+  # The same run, both ways, compared to each other. This is the invariant the
+  # flag lives or dies by: a caller who reads the JSON and a caller who greps
+  # the lines must be told the same thing about the same bundle, and asserting
+  # each against a literal of its own could not catch the day they stop
+  # agreeing.
+  local kind reported rendered
+  _okf_check check
+  for kind in drifted missing orphan; do
+    reported="$(printf '%s\n' "$OKF_CHECK_OUT" | sed -n "s/^$kind: //p")"
+    rendered="$(printf '%s\n' "$OKF_CHECK_JSON" | jq -r --arg kind "$kind" '.[$kind][]')"
+    assert_eq "$reported" "$rendered" \
+      "the $kind array is exactly the plain report's $kind: lines"
+  done
+
+  # SPEC.md §8's statuses are the walk's, not the rendering's. `--json` is not a
+  # quieter run and not a sterner one: the plain report exits 0 over these three
+  # findings and `--strict` exits 3 over the drift among them, and asking for
+  # JSON changes neither.
+  local three='{"drifted":["src/route/RouteRegistry.md"],"missing":["src/route/Dispatcher.java"],"orphan":["src/route/Legacy.md"]}'
+  _okf_assert_check_json 3 "$three" \
+    "--json alongside --strict still exits 3 on drift, printing the same document" \
+    check --json --strict
+  _okf_assert_check_json 3 "$three" \
+    "and the two flags in the other order are the same run" check --strict --json
+
+  # SPEC.md §8's other promise, which the new flag does not get to break: plain
+  # `okf check` never mutates a file. Asserted over the run that exits 3, since
+  # that is the run with something it might think worth writing down.
+  local marker=".okf-json-marker" before_status touched
+  : > "$marker"
+  before_status="$(git status --porcelain)"
+  _okf_assert_check_json 3 "$three" \
+    "a --json --strict run that finds drift exits 3" check --json --strict
+  assert_eq "$before_status" "$(git status --porcelain)" \
+    "and leaves the work tree exactly as it found it"
+  touched="$(find . -path ./.git -prune -o -type f -newer "$marker" -print | sort)"
+  assert_eq "" "$touched" "and not one file in the copy was written to"
+  rm -f "$marker"
+
+  git checkout -q -- src/route/
+  rm -f src/route/Dispatcher.java
+  git rm -q --cached src/route/Dispatcher.java > /dev/null 2>&1
+  _okf_assert_check_json 0 '{"drifted":[],"missing":[],"orphan":[]}' \
+    "putting all three right empties every array" check --json
+
+  # What JSON is actually for, and the reason the sets reach jq NUL-separated
+  # rather than a line at a time. A path with a `"` in it is a document a
+  # hand-rolled encoder would have produced invalid JSON for, and a path with a
+  # newline in it is a *finding* the plain report cannot express: its two lines
+  # read as two paths, neither of which exists. Both are legal names in git and
+  # on any POSIX filesystem.
+  local quoted=$'src/route/Odd "Name".java'
+  local split=$'src/route/Two\nLines.java'
+  printf 'package route;\n\nclass Odd {}\n' > "$quoted"
+  printf 'package route;\n\nclass Two {}\n' > "$split"
+  _okf_stage "$quoted" "$split" || return 1
+
+  _okf_check_json check --json || return 1
+  assert_eq "0" "$OKF_CHECK_RC" "a bundle holding awkwardly named sources still exits 0"
+  assert_eq '["src/route/Odd \"Name\".java","src/route/Two\nLines.java"]' \
+    "$(printf '%s\n' "$OKF_CHECK_JSON" | jq -c '.missing')" \
+    "a quote and a newline in a path are escaped, not emitted raw or split in two"
+
+  # Read back out, which is the half that matters to a caller: the newline path
+  # survives the round trip as one string. `jq -r` would print it as two lines
+  # again, so it comes back as JSON and is compared as JSON.
+  assert_eq '"src/route/Two\nLines.java"' \
+    "$(printf '%s\n' "$OKF_CHECK_JSON" | jq -c '.missing[1]')" \
+    "and the path with a newline in it is one element, not two"
+
+  rm -f "$quoted" "$split"
+  git rm -q --cached -- "$quoted" "$split" > /dev/null 2>&1
+  _okf_assert_check_json 0 '{"drifted":[],"missing":[],"orphan":[]}' \
+    "the bundle is clean once the awkward names are gone" check --json
+  return 0
+}
+
+test_okf_check_json_emits_one_document() {
+  with_fixture_repo concepts _okf_check_json_probe
+}
+
+# The two things that must stay off stdout when a caller has asked for JSON: the
+# warnings SPEC.md §8 has this subcommand say out loud, and a set that could not
+# be worked out at all. The first would make the document unparseable; the
+# second would make it wrong in a way nothing in it admits to.
+_okf_check_json_degraded_probe() {
+  # A concept okf can only warn about — a `content_hash` that was never a
+  # digest. The warning is a fact about one file rather than a finding about the
+  # bundle, so it goes to stderr, and under `--json` that separation stops being
+  # a nicety: a line of prose on stdout is a document that will not parse.
+  printf -- '---\ntype: Class\nresource: /src/route/RouteSource.java\ncode:\n  content_hash: "not-a-digest"\n---\n' \
+    > src/route/Bad.md
+  _okf_stage src/route/Bad.md || return 1
+  _okf_assert_check_json 0 '{"drifted":[],"missing":[],"orphan":[]}' \
+    "a concept okf can only warn about leaves the document empty and parseable" \
+    check --json
+  assert_contains "$OKF_CHECK_ERR" "code.content_hash is not" \
+    "and the warning it kept off stdout was still said on stderr"
+  rm -f src/route/Bad.md
+  git rm -q --cached src/route/Bad.md > /dev/null 2>&1
+
+  # The missing set is the one of the three read out of scope, and a run that
+  # cannot work out its scope has not found no undocumented sources — it has
+  # not looked. `null` says so; `[]` would be indistinguishable from a fully
+  # documented repository, which is the reading a dashboard lights up green
+  # for. The plain report says the same thing on stderr, which is exactly the
+  # stream a caller piping stdout into jq has thrown away.
+  #
+  # Driven by a stand-in ripgrep, since there is no way to make a working one
+  # fail on demand — the same device the scope tests use, and the @Generated
+  # scan is the step of the in-scope walk that needs it. `okf check`'s other two
+  # sets come out of git and are unaffected, which is what the drift and orphan
+  # below are here to show.
+  printf '// touched\n' >> src/route/RouteRegistry.java
+  rm -f src/route/Legacy.java
+
+  local fakebin
+  if ! fakebin="$(mktemp -d "${TMPDIR:-/tmp}/toolkit-fakerg.XXXXXX")"; then
+    _fail "a stand-in ripgrep can be made" "mktemp -d failed"
+    return 1
+  fi
+  printf '%s\n' "$fakebin" >> "$HARNESS_STATE/fixture_dirs"
+  printf '#!/bin/sh\nprintf "rg: broken\\n" >&2\nexit 2\n' > "$fakebin/rg"
+  if ! chmod +x "$fakebin/rg"; then
+    _fail "a stand-in ripgrep can be made" "chmod +x failed: $fakebin/rg"
+    rm -rf "$fakebin"
+    return 1
+  fi
+
+  # Put in front on PATH for exactly the two calls below and taken off again:
+  # every other command this probe runs — git, jq, sed — still resolves to the
+  # real one, and a fake left on PATH would silently degrade every test after
+  # this one.
+  local saved_path="$PATH"
+  PATH="$fakebin:$PATH"
+  _okf_assert_check_json 0 \
+    '{"drifted":["src/route/RouteRegistry.md"],"missing":null,"orphan":["src/route/Legacy.md"]}' \
+    "a scope that could not be worked out is a null missing set, not an empty one" \
+    check --json
+  assert_contains "$OKF_CHECK_ERR" "in-scope source listing could not be made" \
+    "and the run says why on stderr, as the plain report does"
+  PATH="$saved_path"
+  rm -rf "$fakebin"
+
+  # The same state with a working ripgrep, so the null above is the failed scan
+  # and not something about this bundle. An array either way for the other two
+  # keys: neither is read out of scope, so both were answered on both runs.
+  _okf_assert_check_json 0 \
+    '{"drifted":["src/route/RouteRegistry.md"],"missing":[],"orphan":["src/route/Legacy.md"]}' \
+    "and the same bundle scanned properly reports an empty missing set instead" \
+    check --json
+
+  git checkout -q -- src/route/
+  return 0
+}
+
+test_okf_check_json_says_what_it_could_not_work_out() {
+  with_fixture_repo concepts _okf_check_json_degraded_probe
+}
+
 # --- add new test_* functions above this line ------------------------------
 
 # ---------------------------------------------------------------------------

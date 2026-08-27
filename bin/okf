@@ -3446,6 +3446,32 @@ soft_load_in_scope() {
   return 0
 }
 
+# One JSON array of strings, built by jq rather than by quoting them here.
+#
+# The alternative — wrapping each element in `"` and escaping what has to be
+# escaped — is a JSON encoder written in bash, and it would be wrong about the
+# first path that contains a `"`, a backslash or a tab. jq is a hard requirement
+# of every okf run (see OKF_REQUIRED_TOOLS), so there is nothing to weigh here:
+# the tool that knows the grammar does the encoding.
+#
+# NUL is the separator because it is the one byte a path cannot contain, so the
+# elements reach jq intact — a path with a newline in it is legal in git and in
+# a POSIX filesystem, and any line-oriented hand-off would silently split one
+# finding into two. `split` leaves a trailing empty element after the final
+# separator, which `[:-1]` drops.
+#
+# The empty case is answered without jq at all, because `printf '%s\0'` with no
+# arguments still runs its format once, and the lone NUL that came back would
+# split into one empty string: an empty set reported as a finding whose path is
+# nothing. soft_load_in_scope guards the same printf for the same reason.
+json_string_array() { # $1.. = the elements
+  if [ $# -eq 0 ]; then
+    printf '[]'
+    return 0
+  fi
+  printf '%s\0' "$@" | jq -Rs 'split("\u0000")[:-1]'
+}
+
 # okf check [--strict] [--stamp] [--json] — drift, missing and orphan concepts
 #
 # SPEC.md §8's drift rule, and nothing more than it: "stored `code.content_hash`
@@ -3491,6 +3517,14 @@ soft_load_in_scope() {
 # A clean bundle prints nothing at all, which is `okf list --orphans`'s
 # convention and the one a warning should keep: something to read means
 # something to do.
+#
+# `--json` prints the same three sets as one document — `{"drifted": [...],
+# "missing": [...], "orphan": [...]}` — keyed by the labels the plain report
+# uses, so the two spellings cannot come to mean different things. It is a
+# rendering of the finished report and nothing else: the same walk, the same
+# warnings on stderr, the same exit status, so `--json --strict` is still 3 on
+# drift. The one place the two shapes differ is the clean bundle, which prints
+# nothing plainly and three empty arrays as JSON — see the emitting branch.
 #
 # Which concepts are walked is load_concepts', and so git's: a `.md` written and
 # never added is not in the bundle yet. That is the same rule `okf list
@@ -3542,19 +3576,18 @@ cmd_check() {
 
   # Recognised here so that the flag is answered by the subcommand that owns it
   # rather than by "unknown flag", which would send a caller looking for a
-  # typo — and, for the two not written yet, refused, because each changes what
-  # a run *means*. `--json` changes the shape of what is parsed and `--stamp`
-  # whether files are written; accepting either and quietly doing the plain
-  # thing would be answering a different question than the one asked, in a way
-  # the caller cannot see.
+  # typo — and, for the one not written yet, refused, because it changes what a
+  # run *means*: `--stamp` decides whether files are written, and accepting it
+  # while quietly doing the plain read-only thing would be answering a different
+  # question than the one asked, in a way the caller cannot see.
   #
-  # `--strict` is off that list because it is carried out, at the bottom of this
-  # function and nowhere else. It changes only the status the run comes back
-  # with: what is walked, what is warned about and what is printed are the plain
-  # run's, line for line, so everything between here and there is written as
-  # though the flag were not there.
+  # `--strict` and `--json` are off that list because both are carried out at
+  # the bottom of this function and nowhere else. Neither changes what is
+  # walked or what is warned about — one decides the status the run comes back
+  # with, the other how the same three sets are spelled on stdout — so
+  # everything between here and there is written as though neither flag were
+  # there.
   [ "$stamp" -eq 0 ] || not_implemented "check --stamp"
-  [ "$json" -eq 0 ] || not_implemented "check --json"
 
   load_bundle_globs
   load_concepts
@@ -3672,6 +3705,13 @@ cmd_check() {
   # Walked last, and softly: see soft_load_in_scope. The two sets above are
   # already collected by the time this runs, so a scope okf cannot work out
   # costs this report the `missing:` lines and nothing else.
+  # Whether the missing set is a set at all, kept because `--json` has to say so
+  # and an empty array cannot. A run whose scope could not be worked out found
+  # no undocumented sources in the same sense that an unopened book contains no
+  # words, and the warning below that says as much goes to stderr — which is
+  # exactly the stream a caller reading this report with `jq` has thrown away.
+  local scoped=1
+
   local path
   if soft_load_in_scope; then
     for path in ${OKF_SOFT_IN_SCOPE[@]+"${OKF_SOFT_IN_SCOPE[@]}"}; do
@@ -3680,25 +3720,65 @@ cmd_check() {
       fi
     done
   else
+    scoped=0
     warn "the in-scope source listing could not be made — see the message above" \
       "  so no missing concepts are reported by this run" \
       "  drifted and orphan findings are unaffected: neither is read out of scope"
   fi
 
-  # Grouped in the order the repairs are usually worked through: concepts that
-  # describe their source wrongly, then sources described nowhere, then concepts
-  # describing nothing at all. Within a group the bundle's own order, which is
-  # git's, and so `okf list`'s.
-  local finding
-  for finding in ${drifted[@]+"${drifted[@]}"}; do
-    printf 'drifted: %s\n' "$finding"
-  done
-  for finding in ${missing[@]+"${missing[@]}"}; do
-    printf 'missing: %s\n' "$finding"
-  done
-  for finding in ${orphans[@]+"${orphans[@]}"}; do
-    printf 'orphan: %s\n' "$finding"
-  done
+  # The same three sets, spelled either way. `--json` changes nothing about what
+  # was walked, warned about or found — every line above this one runs
+  # identically under both — so the flag is a rendering and not a second report,
+  # and a caller can compare the two and find the same paths under the same
+  # three names.
+  #
+  # One document, not one JSON object per finding: the sets are the answer, and
+  # a stream of objects could not distinguish "no drift" from "the run stopped
+  # before it got there".
+  if [ "$json" -eq 1 ]; then
+    # Emitted whatever was found, including over a bundle with nothing wrong
+    # with it. The plain report's convention is the opposite — a clean bundle
+    # prints nothing, because something to read has to mean something to do —
+    # but that convention is for a person, and the empty output it produces is
+    # not a JSON document. A caller who has asked for JSON is parsing what comes
+    # back, and `jq` given nothing at all fails rather than reporting an empty
+    # bundle.
+    #
+    # The keys are the three labels the plain report prints, spelled exactly the
+    # same way, so `grep '^orphan: '` and `.orphan` name one set and not two
+    # that drifted apart.
+    #
+    # `missing` is null rather than `[]` when scope could not be worked out.
+    # They are different facts — "every in-scope source has a concept" against
+    # "which sources are in scope could not be established" — and the first is
+    # what a dashboard would light up green for. The other two keys are arrays
+    # either way: neither is read out of scope, so both were answered.
+    local missing_json="null"
+    [ "$scoped" -eq 0 ] || missing_json="$(json_string_array ${missing[@]+"${missing[@]}"})"
+
+    jq -n \
+      --argjson drifted "$(json_string_array ${drifted[@]+"${drifted[@]}"})" \
+      --argjson missing "$missing_json" \
+      --argjson orphan "$(json_string_array ${orphans[@]+"${orphans[@]}"})" \
+      '{drifted: $drifted, missing: $missing, orphan: $orphan}' \
+      || die "the drift report could not be rendered as JSON"
+  else
+    # Grouped in the order the repairs are usually worked through: concepts that
+    # describe their source wrongly, then sources described nowhere, then
+    # concepts describing nothing at all. Within a group the bundle's own order,
+    # which is git's, and so `okf list`'s. The JSON above keeps both orders, for
+    # the same reason.
+    local finding
+    for finding in ${drifted[@]+"${drifted[@]}"}; do
+      printf 'drifted: %s\n' "$finding"
+    done
+    for finding in ${missing[@]+"${missing[@]}"}; do
+      printf 'missing: %s\n' "$finding"
+    done
+    for finding in ${orphans[@]+"${orphans[@]}"}; do
+      printf 'orphan: %s\n' "$finding"
+    done
+  fi
 
   # SPEC.md §8's exit statuses, decided here and nowhere else. Explicit, and not
   # left to the loop's own status: the last thing the walk did was a comparison,
