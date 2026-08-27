@@ -31,7 +31,11 @@
 # result, and aborting loudly on one is better than reporting a made-up tally.
 set -uo pipefail
 
-TOOLKIT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# CDPATH cleared for every cd in this file: exported, it makes a relative cd
+# search it first and echo where it landed, which would resolve the repo root
+# to somebody else's directory and print a path into the middle of a captured
+# value.
+TOOLKIT_ROOT="$(CDPATH= cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FIXTURES_DIR="$TOOLKIT_ROOT/tests/fixtures"
 CURRENT_TEST="<none>"
 
@@ -1357,6 +1361,541 @@ FAKE_TOOL
     _pass "no okf invocation in this test tries to reach the network"
   fi
   return 0
+}
+
+# SPEC.md §7's global flags, read back out of its prose the way the subcommand
+# names are: every backticked token in that section that looks like a flag. A
+# third global flag added to the spec then arrives here as a flag with nothing
+# testing it, rather than as one nobody noticed.
+_okf_spec_global_flags() {
+  awk '
+    /^## 7\./ { in_section = 1; next }
+    in_section && /^## / { exit }
+    in_section {
+      n = split($0, part, "`")
+      # Backticks come in pairs, so the quoted spans are the even indices.
+      for (i = 2; i <= n; i += 2) {
+        if (part[i] ~ /^-/) print part[i]
+      }
+    }
+  ' "$TOOLKIT_ROOT/SPEC.md" | sort -u
+}
+
+# bin/okf's own view of one command line: the root it resolved, the config file
+# it would read, the directory it ends up in, and what is left for dispatch.
+#
+# Obtained by sourcing bin/okf and calling parse_globals directly, because none
+# of it is printed anywhere — every subcommand is still a stub, and a flag that
+# printed it would be CLI surface SPEC.md §7 does not define. Sourcing gets the
+# functions without running a command line, which is what the guard around
+# bin/okf's `main` call is for. The names used here — parse_globals, enter_root,
+# OKF_ROOT, OKF_CONFIG, OKF_ARGV — are the contract this item owes every
+# subcommand written after it, so a rename that breaks them should fail loudly.
+_okf_context() { # $1 = directory to run from, $2.. = okf arguments
+  local from="$1"
+  shift
+  local probe="$HARNESS_STATE/okf-context-probe.sh"
+  if [ ! -f "$probe" ]; then
+    cat > "$probe" <<'PROBE'
+#!/usr/bin/env bash
+okf_script="$1"
+shift
+# shellcheck source=/dev/null
+. "$okf_script"
+parse_globals ${1+"$@"}
+enter_root
+printf 'root=%s\n' "$OKF_ROOT"
+printf 'config=%s\n' "$OKF_CONFIG"
+printf 'cwd=%s\n' "$PWD"
+# Bracketed one by one rather than joined: "$OKF_ARGV[*]" would read the same
+# whether an argument with a space in it survived as one argument or was split
+# into two, and surviving as one is the whole point of the quoting in bin/okf.
+args=""
+for arg in ${OKF_ARGV[@]+"${OKF_ARGV[@]}"}; do
+  args="$args[$arg]"
+done
+printf 'args=%s\n' "$args"
+PROBE
+    chmod +x "$probe" || return 1
+  fi
+  (CDPATH= cd "$from" && "$probe" "$TOOLKIT_ROOT/bin/okf" ${1+"$@"}) 2>&1
+}
+
+# The same context, but reached the way a real invocation reaches it: through
+# main, which is the thing that actually has to enter the root and hand what is
+# left of the line to the subcommand. Calling parse_globals directly proves the
+# resolution and nothing about who acts on it.
+#
+# The stub that every unimplemented subcommand shares is replaced, after
+# sourcing, with one that reports instead of dying — so main runs all the way
+# through dispatch and the report is made from inside the subcommand, where the
+# process has finished moving.
+_okf_dispatch_context() { # $1 = directory to run from, $2.. = okf arguments
+  local from="$1"
+  shift
+  local probe="$HARNESS_STATE/okf-dispatch-probe.sh"
+  if [ ! -f "$probe" ]; then
+    cat > "$probe" <<'PROBE'
+#!/usr/bin/env bash
+okf_script="$1"
+shift
+# shellcheck source=/dev/null
+. "$okf_script"
+not_implemented() { # $1 = subcommand name
+  local args="" arg
+  for arg in ${OKF_ARGV[@]+"${OKF_ARGV[@]}"}; do
+    args="$args[$arg]"
+  done
+  printf 'root=%s\n' "$OKF_ROOT"
+  printf 'config=%s\n' "$OKF_CONFIG"
+  printf 'cwd=%s\n' "$PWD"
+  printf 'sub=%s\n' "$1"
+  printf 'args=%s\n' "$args"
+}
+main ${1+"$@"}
+PROBE
+    chmod +x "$probe" || return 1
+  fi
+  (CDPATH= cd "$from" && "$probe" "$TOOLKIT_ROOT/bin/okf" ${1+"$@"}) 2>&1
+}
+
+_okf_context_field() { # $1 = context output, $2 = field name
+  printf '%s\n' "$1" | sed -n "s/^$2=//p"
+}
+
+# SPEC.md §7 defines the two global flags, so the help is checked against the
+# spec rather than against a copy of the flags written out here.
+test_okf_global_flags_are_documented() {
+  local okf="$TOOLKIT_ROOT/bin/okf"
+  if [ ! -x "$okf" ]; then
+    _fail "bin/okf is an executable script" "missing or not executable: $okf"
+    return 1
+  fi
+
+  local -a flags=()
+  local flag
+  while IFS= read -r flag; do
+    [ -n "$flag" ] && flags+=("$flag")
+  done < <(_okf_spec_global_flags)
+  # Guards the extraction: were §7's sentence reworded past it, every check
+  # below would vanish and this test would pass having asserted nothing.
+  # Bailing rather than continuing, because "${flags[@]}" on an empty array
+  # aborts the whole run under `set -u` on bash 3.2.
+  if [ "${#flags[@]}" -eq 0 ]; then
+    _fail "SPEC.md §7 names its global flags" \
+      "extracted no flag names from the CLI surface section"
+    return 1
+  fi
+  assert_eq 2 "${#flags[@]}" "SPEC.md §7 defines 2 global flags"
+
+  local help
+  help="$("$okf" --help)"
+  for flag in "${flags[@]}"; do
+    assert_contains "$help" "$flag" "okf --help documents the global $flag"
+  done
+
+  # The default SPEC.md §7 gives for --config, which is the one thing about
+  # these flags a user cannot work out from the flag name alone.
+  assert_contains "$help" "./okf.json" \
+    "okf --help gives SPEC.md §7's default config path"
+
+  # The usage line, so someone who reads only the first line of the help still
+  # learns that the two exist.
+  local usage_line
+  usage_line="$(printf '%s\n' "$help" | grep '^Usage:')"
+  for flag in "${flags[@]}"; do
+    assert_contains "$usage_line" "${flag%% *}" "okf --help's usage line shows ${flag%% *}"
+  done
+  return 0
+}
+
+# The command-line half: the flags are taken out of the line wherever they
+# appear, and what is left is still dispatched.
+_okf_global_flags_dispatch_probe() {
+  local okf="$TOOLKIT_ROOT/bin/okf" out
+
+  # Absence of a rejection only means anything if a rejection was reachable at
+  # all: were the global-flag parser to exit early on every line, each check
+  # below would silently become one that cannot fail.
+  out="$("$okf" definitely-not-a-subcommand 2>&1)" || true
+  case "$out" in
+    *"unknown subcommand: definitely-not-a-subcommand"*)
+      _pass "an okf invocation in the fixture reaches dispatch"
+      ;;
+    *)
+      _fail "an okf invocation in the fixture reaches dispatch" \
+        "an unknown subcommand was not rejected by name, so nothing below can" \
+        "tell a consumed flag from an early exit:" "$out"
+      return 1
+      ;;
+  esac
+
+  local -a flags=()
+  local flag value
+  while IFS= read -r flag; do
+    [ -n "$flag" ] && flags+=("$flag")
+  done < <(_okf_spec_global_flags)
+  if [ "${#flags[@]}" -eq 0 ]; then
+    _fail "SPEC.md §7 names its global flags" \
+      "extracted no flag names from the CLI surface section"
+    return 1
+  fi
+
+  for flag in "${flags[@]}"; do
+    flag="${flag%% *}"
+    case "$flag" in
+      -C) value="$FIXTURE_DIR" ;;
+      --config) value="okf.json" ;;
+      *)
+        # A global flag SPEC.md §7 has grown since this test was written. Said
+        # out loud rather than skipped: an unexercised flag is how one ships
+        # documented and unimplemented.
+        _fail "tests/toolkit.sh exercises the global $flag" \
+          "no argument is defined here for it, so it goes unchecked"
+        continue
+        ;;
+    esac
+
+    # Before the subcommand and after it, because SPEC.md §7 says *every
+    # subcommand* accepts these. Either way the flag and its argument are gone
+    # by the time dispatch sees the line — if they were not, the offender named
+    # would be the flag or its value rather than the subcommand.
+    out="$("$okf" "$flag" "$value" definitely-not-a-subcommand 2>&1)" || true
+    assert_contains "$out" "unknown subcommand: definitely-not-a-subcommand" \
+      "okf $flag VALUE <subcommand> dispatches the subcommand"
+    out="$("$okf" definitely-not-a-subcommand "$flag" "$value" 2>&1)" || true
+    assert_contains "$out" "unknown subcommand: definitely-not-a-subcommand" \
+      "okf <subcommand> $flag VALUE dispatches the subcommand"
+
+    # A flag with nothing after it would otherwise swallow the subcommand:
+    # `okf -C list` running against a directory called list.
+    assert_exit 1 "$okf" "$flag"
+    out="$(last_output)"
+    assert_contains "$out" "$flag" "okf $flag with no argument says which flag is short one"
+    case "$out" in
+      *"Subcommands:"*)
+        _fail "okf $flag with no argument does not print the whole help" "$out"
+        ;;
+      *) _pass "okf $flag with no argument does not print the whole help" ;;
+    esac
+
+    # Twice is a mistake, and the two values disagree more often than not.
+    assert_exit 1 "$okf" "$flag" "$value" "$flag" "$value" list
+    assert_contains "$(last_output)" "$flag" \
+      "okf refuses a repeated $flag rather than picking one"
+
+    # An empty argument is not the default, and silently treating it as one
+    # would run against $PWD while the caller believed otherwise.
+    assert_exit 1 "$okf" "$flag" "" list
+    assert_contains "$(last_output)" "$flag" \
+      "okf refuses an empty $flag argument"
+  done
+
+  # -C names a directory, and one that is not there is worth saying so about in
+  # the same single line the preflight uses — before dispatch, so no subcommand
+  # has begun work against the wrong tree. "not implemented" is what every
+  # stub says, and its absence is what shows nothing was dispatched.
+  assert_exit 1 "$okf" -C "$FIXTURE_DIR/definitely-not-a-directory" list
+  out="$(last_output)"
+  assert_eq 1 "$(_okf_line_count "$out")" "a -C at a missing directory is one line"
+  assert_contains "$out" "definitely-not-a-directory" "that line names the directory"
+  case "$out" in
+    *"not implemented"*)
+      _fail "a -C at a missing directory stops before dispatch" \
+        "the subcommand ran anyway:" "$out"
+      ;;
+    *) _pass "a -C at a missing directory stops before dispatch" ;;
+  esac
+
+  # A directory that is there but cannot be entered is -C's failure to report,
+  # in the same single line: bash's own cd diagnostic names a line number
+  # inside bin/okf, which tells the caller nothing they can act on.
+  local locked="$FIXTURE_DIR/locked"
+  if ! mkdir -p "$locked" || ! chmod 000 "$locked"; then
+    _fail "an unenterable directory can be made" "mkdir/chmod failed: $locked"
+  elif (cd "$locked") 2> /dev/null; then
+    # root, or a filesystem that does not enforce the mode. There is no
+    # unenterable directory to be had here, so there is nothing to check.
+    _skip "okf -C at an unenterable directory says so in one line" \
+      "this user can enter a chmod 000 directory"
+    chmod 700 "$locked" 2> /dev/null || true
+  else
+    assert_exit 1 "$okf" -C "$locked" list
+    out="$(last_output)"
+    assert_eq 1 "$(_okf_line_count "$out")" \
+      "okf -C at an unenterable directory says so in one line"
+    assert_contains "$out" "locked" "that line names the directory"
+    # Restored so the fixture copy can be removed with everything else.
+    chmod 700 "$locked" 2> /dev/null || true
+  fi
+
+  # A flag where the path should be is the same slip one word later, and
+  # taking it for a filename loses the flag as well as the config.
+  assert_exit 1 "$okf" check --config --strict
+  out="$(last_output)"
+  assert_contains "$out" "--strict" "okf --config --strict says what it was given instead"
+
+  # A dashed word can never be a subcommand, so the useful thing to say about
+  # one is which flags do belong there — `okf -Csrc list` is the -C spelling
+  # okf does not take, and the glued directory is why.
+  assert_exit 1 "$okf" -Csrc list
+  out="$(last_output)"
+  assert_contains "$out" "unknown subcommand: -Csrc" "okf -CDIR is rejected by name"
+  assert_contains "$out" "-C DIR" "and is told how -C is spelled"
+
+  # `okf --config list` is a --config with its path left out, and taking the
+  # subcommand for a filename leaves nothing to run and nothing said about why.
+  assert_exit 1 "$okf" --config list
+  out="$(last_output)"
+  assert_contains "$out" "list" "okf --config <subcommand> names what it was given"
+  case "$out" in
+    *"Subcommands:"*)
+      _fail "okf --config <subcommand> explains itself instead of printing help" "$out"
+      ;;
+    *) _pass "okf --config <subcommand> explains itself instead of printing help" ;;
+  esac
+
+  # A `--` ahead of the subcommand ends the global flags rather than being
+  # taken for a subcommand called `--`, so what follows it is dispatched.
+  out="$("$okf" -- definitely-not-a-subcommand 2>&1)" || true
+  assert_contains "$out" "unknown subcommand: definitely-not-a-subcommand" \
+    "okf -- <subcommand> dispatches the subcommand"
+
+  # ...and on its own it leaves nothing to do, like a bare invocation.
+  assert_exit 1 "$okf" --
+  out="$(last_output)"
+  assert_contains "$out" "Subcommands:" "okf -- on its own prints its help"
+  case "$out" in
+    *"unknown subcommand"*)
+      _fail "okf -- on its own is not read as a subcommand named --" "$out"
+      ;;
+    *) _pass "okf -- on its own is not read as a subcommand named --" ;;
+  esac
+
+  # A root and nothing to do with it is still nothing to do: the same help on
+  # stderr, exiting non-zero, that a bare `okf` prints.
+  local bare_out bare_err="$HARNESS_STATE/okf_globals_stderr"
+  bare_out="$("$okf" -C "$FIXTURE_DIR" 2> "$bare_err")" && true
+  local bare_rc=$?
+  assert_eq 1 "$bare_rc" "okf -C DIR with no subcommand exits 1"
+  assert_eq "" "$bare_out" "okf -C DIR with no subcommand prints nothing on stdout"
+  assert_contains "$(cat "$bare_err")" "Subcommands:" \
+    "okf -C DIR with no subcommand prints its help on stderr"
+  rm -f "$bare_err"
+
+  # ...and asking for help is still asking for help.
+  assert_exit 0 "$okf" -C "$FIXTURE_DIR" --help
+  assert_contains "$(last_output)" "Subcommands:" "okf -C DIR --help still prints help"
+  return 0
+}
+
+test_okf_global_flags_reach_dispatch() {
+  local okf="$TOOLKIT_ROOT/bin/okf"
+  if [ ! -x "$okf" ]; then
+    _fail "bin/okf is an executable script" "missing or not executable: $okf"
+    return 1
+  fi
+  # In a throwaway repo, not the checkout: `okf -C .` on the toolkit itself
+  # would have any implemented subcommand write into the repo under test.
+  with_fixture_repo tiny _okf_global_flags_dispatch_probe
+}
+
+# The resolution half: what -C and --config actually come to. SPEC.md §7 gives
+# -C the repo root every subcommand resolves paths against and --config the
+# override for ./okf.json, and neither is visible from the outside while every
+# subcommand is a stub — so this reads bin/okf's own resolved context.
+_okf_global_flags_context_probe() {
+  local root src ctx
+  root="$(CDPATH= cd "$FIXTURE_DIR" && pwd)" || {
+    _fail "the fixture repo can be entered" "cd failed: $FIXTURE_DIR"
+    return 1
+  }
+  src="$root/src"
+  if [ ! -d "$src" ]; then
+    _fail "the tiny fixture has a src/ subdirectory" "no such directory: $src"
+    return 1
+  fi
+
+  # Guards everything below: if bin/okf cannot be sourced, or these functions
+  # have been renamed, every field read comes back empty and every comparison
+  # below would be against an empty string.
+  ctx="$(_okf_context "$root" list --missing)"
+  case "$ctx" in
+    *"root="*) _pass "bin/okf's resolved context can be read back" ;;
+    *)
+      _fail "bin/okf's resolved context can be read back" \
+        "sourcing bin/okf and calling parse_globals printed no root:" "$ctx"
+      return 1
+      ;;
+  esac
+
+  # No flags at all: the directory okf was invoked in, and SPEC.md §7's default
+  # ./okf.json inside it.
+  assert_eq "$root" "$(_okf_context_field "$ctx" root)" \
+    "without -C the root is the current directory"
+  assert_eq "$root/okf.json" "$(_okf_context_field "$ctx" config)" \
+    "without --config the config is the root's okf.json"
+  assert_eq "[list][--missing]" "$(_okf_context_field "$ctx" args)" \
+    "a line with no global flags reaches dispatch unchanged"
+
+  # -C DIR: the root moves, the process moves with it — a subcommand that runs
+  # `git ls-files` gets the other repo's files without having to know about -C
+  # at all — and the default config moves too, because SPEC.md §6 puts okf.json
+  # at the repo root.
+  ctx="$(_okf_context "$root" -C src list)"
+  assert_eq "$src" "$(_okf_context_field "$ctx" root)" \
+    "-C DIR makes DIR the root, resolved from where okf was invoked"
+  assert_eq "$src" "$(_okf_context_field "$ctx" cwd)" \
+    "-C DIR is entered, so relative paths resolve against it"
+  assert_eq "$src/okf.json" "$(_okf_context_field "$ctx" config)" \
+    "-C DIR moves the default okf.json to the new root"
+  assert_eq "[list]" "$(_okf_context_field "$ctx" args)" \
+    "-C DIR and its argument are taken out of the line"
+
+  # An absolute -C from somewhere else entirely, which is the form a caller
+  # scripting okf against another checkout will use.
+  ctx="$(_okf_context "$src" -C "$root" list)"
+  assert_eq "$root" "$(_okf_context_field "$ctx" root)" "an absolute -C is used as given"
+
+  # --config PATH overrides the default. Relative to the root, not to the
+  # caller: -C sets what `.` means for the run, and SPEC.md §7's default is
+  # `./okf.json`, so `-C other --config okf.ci.json` reads the other repo's CI
+  # config. An absolute path is how to point outside the root.
+  ctx="$(_okf_context "$root" --config okf.ci.json list)"
+  assert_eq "$root/okf.ci.json" "$(_okf_context_field "$ctx" config)" \
+    "--config PATH overrides the default okf.json"
+  assert_eq "[list]" "$(_okf_context_field "$ctx" args)" \
+    "--config and its argument are taken out of the line"
+  ctx="$(_okf_context "$root" -C src --config okf.ci.json list)"
+  assert_eq "$src/okf.ci.json" "$(_okf_context_field "$ctx" config)" \
+    "a relative --config resolves against the -C root"
+  ctx="$(_okf_context "$src" --config "$root/elsewhere.json" list)"
+  assert_eq "$root/elsewhere.json" "$(_okf_context_field "$ctx" config)" \
+    "an absolute --config is used as given"
+
+  # Order-independent, so nobody has to remember which of the two comes first.
+  # The reversed line is pinned to its expected root and config first: on its
+  # own, comparing two context blobs would pass just as happily if both of them
+  # were the same failure.
+  local ordered reversed
+  ordered="$(_okf_context "$root" -C src --config okf.ci.json list)"
+  reversed="$(_okf_context "$root" --config okf.ci.json -C src list)"
+  assert_eq "$src" "$(_okf_context_field "$reversed" root)" \
+    "--config ahead of -C still leaves -C's directory as the root"
+  assert_eq "$src/okf.ci.json" "$(_okf_context_field "$reversed" config)" \
+    "--config ahead of -C still resolves against the -C root"
+  assert_eq "$ordered" "$reversed" \
+    "the two global flags may be given in either order"
+
+  # After the subcommand, and mixed in with its flags: SPEC.md §7 says every
+  # subcommand accepts them, and what is left of the line keeps its order.
+  ctx="$(_okf_context "$root" check --config okf.ci.json --strict)"
+  assert_eq "$root/okf.ci.json" "$(_okf_context_field "$ctx" config)" \
+    "a global flag is honoured after the subcommand too"
+  assert_eq "[check][--strict]" "$(_okf_context_field "$ctx" args)" \
+    "the subcommand keeps its own flags, in order"
+
+  # --config=PATH, the spelling anyone used to the GNU tools will type. Passed
+  # through instead, it would be an okf.json silently not read.
+  ctx="$(_okf_context "$root" --config=okf.ci.json list)"
+  assert_eq "$root/okf.ci.json" "$(_okf_context_field "$ctx" config)" \
+    "--config=PATH is the same as --config PATH"
+  assert_eq "[list]" "$(_okf_context_field "$ctx" args)" \
+    "--config=PATH is taken out of the line too"
+
+  # Its short counterpart is deliberately not a flag: `okf search -Csrc` is a
+  # query, and a scan that glued -C to whatever followed it would swallow the
+  # one argument that subcommand exists to take.
+  ctx="$(_okf_context "$root" search -Csrc)"
+  assert_eq "$root" "$(_okf_context_field "$ctx" root)" \
+    "-CDIR does not re-root the run"
+  assert_eq "[search][-Csrc]" "$(_okf_context_field "$ctx" args)" \
+    "-CDIR reaches the subcommand as the operand it looks like"
+
+  # Past a `--` the same words are the subcommand's own arguments — a query for
+  # `okf search` is free to contain --config — and the root and config are the
+  # defaults, untouched.
+  ctx="$(_okf_context "$root" search -- --config /tmp/nope -C /tmp)"
+  assert_eq "$root/okf.json" "$(_okf_context_field "$ctx" config)" \
+    "a --config past -- is query text, not a flag"
+  assert_eq "$root" "$(_okf_context_field "$ctx" root)" \
+    "a -C past -- is query text, not a flag"
+  assert_eq "[search][--][--config][/tmp/nope][-C][/tmp]" "$(_okf_context_field "$ctx" args)" \
+    "everything past -- reaches the subcommand unchanged"
+
+  # Through main, and all the way into the subcommand: the resolution above is
+  # only worth anything if the invocation acts on it. A -C that resolved
+  # perfectly and then dispatched from the directory the caller happened to be
+  # standing in would pass every check above it.
+  ctx="$(_okf_dispatch_context "$root" -C src list --missing)"
+  case "$ctx" in
+    *"cwd="*) _pass "a real okf invocation reports where it got to" ;;
+    *)
+      _fail "a real okf invocation reports where it got to" \
+        "main printed no context from inside the subcommand:" "$ctx"
+      return 1
+      ;;
+  esac
+  assert_eq "$src" "$(_okf_context_field "$ctx" cwd)" \
+    "okf -C DIR dispatches from inside DIR"
+  assert_eq "$src" "$(_okf_context_field "$ctx" root)" \
+    "the subcommand is given DIR as the root"
+  assert_eq "$src/okf.json" "$(_okf_context_field "$ctx" config)" \
+    "the subcommand is given the new root's okf.json"
+  assert_eq "list" "$(_okf_context_field "$ctx" sub)" \
+    "the subcommand named after the global flags is the one dispatched"
+  assert_eq "[list][--missing]" "$(_okf_context_field "$ctx" args)" \
+    "it keeps its own flags"
+
+  # An argument is one argument however many spaces are inside it, and a glob
+  # in one is a glob the subcommand receives rather than a directory listing.
+  # This is what every ${1+"$@"} and ${arr[@]+"..."} in bin/okf is for, and
+  # nothing else here would notice their loss: a line that came apart into more
+  # arguments than it started with still dispatches, and still reads the right
+  # config.
+  ctx="$(_okf_context "$root" search "two words" --k 5)"
+  assert_eq "[search][two words][--k][5]" "$(_okf_context_field "$ctx" args)" \
+    "an argument with a space in it stays one argument"
+  ctx="$(_okf_context "$root" fanin '*' --config okf.ci.json)"
+  assert_eq "[fanin][*]" "$(_okf_context_field "$ctx" args)" \
+    "an argument that is a glob reaches the subcommand unexpanded"
+
+  # CDPATH makes a relative cd search it before the current directory, and echo
+  # where it landed. Exported — and it is exported, in plenty of shell profiles
+  # — an okf that read it would resolve `-C src` to a stranger's src.
+  local decoy="$root/decoy"
+  if ! mkdir -p "$decoy/src"; then
+    _fail "a CDPATH decoy can be made" "mkdir failed: $decoy/src"
+  else
+    ctx="$(
+      export CDPATH="$decoy"
+      _okf_context "$root" -C src list
+    )"
+    assert_eq "$src" "$(_okf_context_field "$ctx" root)" \
+      "an exported CDPATH does not redirect a relative -C"
+    assert_eq "$src" "$(_okf_context_field "$ctx" cwd)" \
+      "an exported CDPATH does not redirect the directory okf enters"
+    rm -rf "$decoy"
+  fi
+
+  # Ahead of the subcommand the same `--` is this parser's own end-of-flags
+  # marker: there is no subcommand yet for it to belong to, so it is consumed
+  # and dispatch sees the word after it.
+  ctx="$(_okf_context "$root" -- -C /tmp list)"
+  assert_eq "$root" "$(_okf_context_field "$ctx" root)" \
+    "a -C after a leading -- is not a flag"
+  assert_eq "[-C][/tmp][list]" "$(_okf_context_field "$ctx" args)" \
+    "a leading -- is consumed, and what follows it is dispatched"
+  return 0
+}
+
+test_okf_global_flags_resolve_the_root_and_config() {
+  local okf="$TOOLKIT_ROOT/bin/okf"
+  if [ ! -x "$okf" ]; then
+    _fail "bin/okf is an executable script" "missing or not executable: $okf"
+    return 1
+  fi
+  with_fixture_repo tiny _okf_global_flags_context_probe
 }
 
 # --- add new test_* functions above this line ------------------------------

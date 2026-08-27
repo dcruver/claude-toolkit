@@ -37,12 +37,9 @@ OKF_SUBCOMMANDS=(init list hash fanin check index verify chunk embed search)
 #
 # Nothing here reads okf.json or the repo: help is the one thing that must
 # print the same for every caller, in any directory, whatever the bundle
-# contains. SPEC.md §3's preflight still runs ahead of it.
-#
-# SPEC.md §7's global -C DIR and --config PATH are deliberately absent: they
-# are not built yet, and help that lists a flag dispatch would reject as an
-# unknown subcommand is worse than help that omits it. The PLAN.md item adding
-# them adds their lines here.
+# contains. SPEC.md §3's preflight still runs ahead of it, and so does -C's own
+# check that the directory it names is there: an invocation okf cannot carry
+# out is better answered with the reason than with a page of help.
 usage() {
   # Printed with printf rather than a here-document into `cat`: what bin/okf
   # needs is SPEC.md §3's list and nothing besides. A `cat` here would be a
@@ -51,7 +48,7 @@ usage() {
   printf '%s\n' \
     'okf — OKF code knowledge for a repository.' \
     '' \
-    'Usage: okf <subcommand> [flags]' \
+    'Usage: okf [-C DIR] [--config PATH] <subcommand> [flags]' \
     '' \
     'Subcommands:' \
     '  init [--force]                       write okf.json + the bundle-root index.md' \
@@ -65,7 +62,16 @@ usage() {
     '  embed [--all]                        embed and upsert to Qdrant' \
     '  search <query> [--hyde-prompt] [--k N] [--repo R] [--type T]' \
     '' \
+    'Global flags:' \
+    '  -C DIR                               resolve every path against DIR' \
+    '                                       instead of the current directory' \
+    '  --config PATH                        read settings from PATH, itself' \
+    '                                       relative to the root (default:' \
+    '                                       ./okf.json)' \
     '  -h, --help                           print this help' \
+    '' \
+    '-C and --config may be given before or after the subcommand; -h is asked' \
+    'for on its own.' \
     '' \
     'chunk, embed and search are Tier B: each needs an `index` block in okf.json.' \
     '' \
@@ -169,8 +175,9 @@ require_tools() { # $1 = trailing clause for the message, may be empty; $2.. = t
 # subcommands that would every one of them fail.
 #
 # Takes no arguments on purpose. What it checks does not depend on what was
-# asked for, so it cannot be thrown off by the global flags SPEC.md §7 still
-# has to grow: `okf -C some/repo list` preflights exactly as `okf list` does.
+# asked for, so the SPEC.md §7 global flags cannot throw it off: `okf -C
+# some/repo list` preflights exactly as `okf list` does, and does so before
+# anything looks at -C's directory.
 preflight() {
   require_tools "" "${OKF_REQUIRED_TOOLS[@]}"
 }
@@ -178,8 +185,8 @@ preflight() {
 # The Tier B half of the same check, for the tools SPEC.md §3 needs only there.
 # Called from dispatch rather than from main, because that is where the
 # subcommand is a name that was matched against OKF_SUBCOMMANDS rather than
-# whatever happened to be the first argument — which, once -C DIR and --config
-# PATH exist, is as likely to be a flag as a subcommand.
+# whatever happened to be the first argument — which, with -C DIR and --config
+# PATH in the language, is as likely to be a flag as a subcommand.
 http_preflight() { # $1 = the subcommand being dispatched, $2.. = its arguments
   local sub="$1" name arg
   shift
@@ -213,6 +220,188 @@ http_preflight() { # $1 = the subcommand being dispatched, $2.. = its arguments
     return 0
   done
   return 0
+}
+
+# ---------------------------------------------------------------------------
+# Global flags (SPEC.md §7)
+# ---------------------------------------------------------------------------
+
+# The two things every subcommand needs before it can resolve a single path:
+# where the repo root is, and which settings file describes it. Filled in by
+# parse_globals ahead of dispatch, so a subcommand reads these rather than
+# reaching for $PWD or the string "okf.json" on its own — the one place -C and
+# --config would otherwise have to be honoured ten times over.
+OKF_ROOT=""
+OKF_CONFIG=""
+
+# SPEC.md §7's default, `./okf.json`, and SPEC.md §6's "okf.json (repo root)":
+# the same file named twice. Relative to the root, so -C moves it too.
+OKF_CONFIG_DEFAULT="okf.json"
+
+# What is left of the command line once the global flags are taken out of it —
+# the subcommand and its own arguments, in their original order.
+OKF_ARGV=()
+
+# Reads the SPEC.md §7 global flags out of the whole command line and leaves
+# the rest in OKF_ARGV.
+#
+# Scanned across the entire line rather than only its head, because SPEC.md §7
+# says *every subcommand* accepts these two: `okf check -C ../other` is as
+# valid as `okf -C ../other check`. Doing it here, once, is also what keeps
+# them out of every future subcommand's own argument parser.
+#
+# Both values are resolved after the whole line has been read, so the flags are
+# order-independent: `okf --config ci.json -C repo list` and `okf -C repo
+# --config ci.json list` are the same invocation. Repeating either one is an
+# error rather than a last-wins race, because a silently ignored -C is a run
+# against the wrong repository.
+parse_globals() { # $1.. = the command line, minus the program name
+  local dir="" config="" seen_dir=0 seen_config=0 flag
+  local -a rest=()
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --)
+        # Past `--` the same word is an argument and not a flag of ours,
+        # however much it looks like one.
+        #
+        # Which side of the subcommand it falls on decides whose marker it is.
+        # Ahead of the subcommand there is nothing yet for it to belong to, so
+        # it is this parser's — consumed, leaving `okf -- list` to run list
+        # rather than to look for a subcommand called `--`. After it, it is the
+        # subcommand's own end-of-flags marker — `okf search -- --hyde-prompt`
+        # is a query that begins with a dash — and is passed along untouched.
+        if [ "${#rest[@]}" -eq 0 ]; then
+          shift
+        fi
+        rest+=(${1+"$@"})
+        break
+        ;;
+      -C | --config)
+        flag="$1"
+        shift
+        # An option whose value is missing swallows whatever follows it, and
+        # what follows it here is usually the subcommand: `okf -C list` would
+        # otherwise run against a directory named "list", or against no
+        # subcommand at all.
+        [ $# -gt 0 ] || die "$flag needs an argument"
+        # A value that is itself a flag is the same slip one argument later:
+        # `okf check --config --strict` is a --config whose path was left out,
+        # and taking --strict for a filename loses the flag and reads a config
+        # that is not there. A file whose name really does begin with a dash is
+        # reachable as ./-name, which is how every other tool spells it too.
+        case "$1" in
+          -*)
+            die "$flag needs an argument, but the next word is a flag: $1" \
+              "spell it ./$1 if that really is the name"
+            ;;
+        esac
+        if [ "$flag" = -C ]; then
+          [ "$seen_dir" -eq 0 ] || die "-C given more than once"
+          seen_dir=1
+          dir="$1"
+        else
+          [ "$seen_config" -eq 0 ] || die "--config given more than once"
+          # `okf --config list` is a --config that lost its path, not a request
+          # to read settings from a file called "list". -C catches the same
+          # slip for free, because no such directory exists; --config would
+          # otherwise take the subcommand, find nothing left to run, and answer
+          # a typo with a page of help.
+          local known
+          for known in "${OKF_SUBCOMMANDS[@]}"; do
+            [ "$1" = "$known" ] || continue
+            die "--config needs a path, but was given the subcommand: $1" \
+              "spell it ./$1 if that really is the settings file"
+          done
+          seen_config=1
+          config="$1"
+        fi
+        ;;
+      # `--config=PATH` is accepted because it is what anyone used to the GNU
+      # tools will type, and left to fall through it would be an okf.json
+      # silently not read. Its short counterpart `-CDIR` is deliberately *not*
+      # accepted: SPEC.md §7 spells the flag `-C DIR`, and two subcommands take
+      # free-form text — `okf search <query>`, `okf fanin <Name>` — which a
+      # scan that glued -C to whatever followed it would quietly eat. Left
+      # alone, `okf search -Csrc` searches for "-Csrc", and `okf -Csrc list`
+      # is rejected by name rather than acted on.
+      --config=*)
+        [ "$seen_config" -eq 0 ] || die "--config given more than once"
+        seen_config=1
+        config="${1#--config=}"
+        ;;
+      *)
+        rest+=("$1")
+        ;;
+    esac
+    shift
+  done
+
+  if [ "$seen_dir" -eq 1 ]; then
+    [ -n "$dir" ] || die "-C needs a directory, not an empty argument"
+    # Checked here rather than left to the cd below, so the message names -C
+    # and the directory the caller typed instead of reporting a failure from
+    # somewhere in the middle of a subcommand.
+    [ -d "$dir" ] || die "-C: no such directory: $dir"
+    # Made absolute now, while the process is still where the caller invoked
+    # it: a relative -C is relative to that directory and to nothing else, and
+    # a root that is still relative once entered would resolve differently for
+    # any subcommand that itself changes directory.
+    # CDPATH is cleared for the cd, not inherited: with it set, a relative -C
+    # is looked up along it before the current directory, so `okf -C src` would
+    # silently run against someone else's src — and cd would echo the directory
+    # it picked into this command substitution on top of it.
+    #
+    # cd's own diagnostic is silenced for the same reason: it names a line
+    # number inside this script, and arrives ahead of the line below that
+    # actually says which flag and which directory the caller has to do
+    # something about.
+    OKF_ROOT="$(CDPATH= cd -- "$dir" 2> /dev/null && pwd)" \
+      || die "-C: cannot enter directory: $dir"
+  else
+    OKF_ROOT="$PWD"
+  fi
+
+  # An explicit empty path is a mistake — `--config ""` — and not a request for
+  # the default, so it is caught before the resolution below turns it into one.
+  if [ "$seen_config" -eq 1 ] && [ -z "$config" ]; then
+    die "--config needs a path, not an empty argument"
+  fi
+
+  case "$config" in
+    "")
+      # Not given. SPEC.md §7's default, which is the root's okf.json.
+      OKF_CONFIG="$OKF_ROOT/$OKF_CONFIG_DEFAULT"
+      ;;
+    /*)
+      OKF_CONFIG="$config"
+      ;;
+    *)
+      # Relative to the root, not to the caller's directory. -C sets what `.`
+      # means for the run — the default config is `./okf.json` in the root — so
+      # `okf -C ../other --config okf.ci.json` reads the other repo's CI
+      # config, which is the one a caller pairing the two flags means. An
+      # absolute path, handled above, is the way to point somewhere else.
+      OKF_CONFIG="$OKF_ROOT/$config"
+      ;;
+  esac
+
+  # ${rest[@]+"..."} rather than "${rest[@]}": an empty array expanded under
+  # `set -u` is an unbound variable on bash 3.2, which is still what macOS
+  # ships, and empty is exactly the case of a bare `okf -C somewhere`.
+  OKF_ARGV=(${rest[@]+"${rest[@]}"})
+}
+
+# Enters the root, so that every relative path a subcommand touches — and every
+# `git ls-files` it runs — resolves against it without that subcommand having
+# to remember to. Split from parse_globals so the resolution can be reasoned
+# about, and tested, without a process changing directory underneath it.
+enter_root() {
+  # CDPATH cleared as above. OKF_ROOT is absolute by the time it gets here, so
+  # nothing should consult CDPATH at all — but a cd that reads it is one
+  # relative path away from entering the wrong tree, and it also prints where
+  # it went, which nothing calling this expects on stdout.
+  CDPATH= cd -- "$OKF_ROOT" || die "cannot enter the repo root: $OKF_ROOT"
 }
 
 # ---------------------------------------------------------------------------
@@ -258,14 +447,24 @@ cmd_search() { not_implemented search; }
 # ---------------------------------------------------------------------------
 
 main() {
-  # SPEC.md §3: on every invocation, before anything else. The tools Tier B
-  # needs on top of these are checked at dispatch, where the subcommand asked
-  # for is known — a caller who typed `okf list` is not told to install curl.
+  # SPEC.md §3: on every invocation, before anything else — including before
+  # the global flags are read, so a machine missing rg is told about rg rather
+  # than about the -C directory it also mistyped. The tools Tier B needs on top
+  # of these are checked at dispatch, where the subcommand asked for is known —
+  # a caller who typed `okf list` is not told to install curl.
   preflight
+
+  # SPEC.md §7's -C DIR and --config PATH, taken out of the line here so that
+  # everything below — the bare-invocation check, dispatch, the subcommand's
+  # own flags — sees only what the caller asked okf to *do*.
+  parse_globals ${1+"$@"}
+  enter_root
+  set -- ${OKF_ARGV[@]+"${OKF_ARGV[@]}"}
 
   # No subcommand at all: the same help, but on stderr and exiting 1. A caller
   # that reached here with an empty argument asked for nothing and got nothing
-  # done, and exiting 0 would let it mistake that for success.
+  # done, and exiting 0 would let it mistake that for success. `okf -C repo`
+  # lands here too — a root and nothing to do with it.
   if [ $# -eq 0 ]; then
     usage >&2
     return 1
@@ -298,7 +497,25 @@ main() {
     return $?
   done
 
+  case "$sub" in
+    -*)
+      # Nothing beginning with a dash was ever going to be a subcommand, so the
+      # useful thing to say is which flags do belong here — `okf -Csrc list` is
+      # a -C whose directory was glued to it.
+      die "unknown subcommand: $sub" \
+        "the flags accepted here are -C DIR, --config PATH and --help" \
+        "expected one of: ${OKF_SUBCOMMANDS[*]}"
+      ;;
+  esac
   die "unknown subcommand: $sub" "expected one of: ${OKF_SUBCOMMANDS[*]}"
 }
 
-main ${1+"$@"}
+# Guarded so that sourcing bin/okf yields its functions without also running a
+# command line. Executed — installed on $PATH, or run from the checkout — the
+# two are the same path and main runs as always; sourced, $0 is the sourcing
+# shell's and it does not. That is what lets tests/toolkit.sh call
+# parse_globals directly and read back the root and config path it resolved,
+# which no subcommand prints and none should have to.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main ${1+"$@"}
+fi
