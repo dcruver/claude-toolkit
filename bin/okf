@@ -82,11 +82,21 @@ usage() {
     '  3  `check --strict` found drift'
 }
 
-die() { # $1.. = message lines
+# One or more lines on stderr, each prefixed so a line of okf's is telling apart
+# from a line of whatever it shelled out to. stderr and not stdout because a
+# subcommand's stdout is its answer — a listing a caller pipes into something —
+# and a warning mixed into it becomes a path that names no file.
+warn() { # $1.. = message lines
   local line
   for line in "$@"; do
     printf 'okf: %s\n' "$line" >&2
   done
+}
+
+# The same lines, and then no further work. Every exit here is SPEC.md §7's
+# 1 — an error, or a missing prerequisite.
+die() { # $1.. = message lines
+  warn "$@"
   exit 1
 }
 
@@ -1429,6 +1439,90 @@ has_concept() { # $1 = a bundle-relative source path
   for reserved in "${OKF_RESERVED_CONCEPT_NAMES[@]}"; do
     [ ! "$dir$stem.md" -ef "$dir$reserved" ] || return 1
   done
+  return 0
+}
+
+# The file a concept documents, resolved to a bundle-relative path this bundle
+# can go and look at, left in OKF_CONCEPT_RESOURCE. Returns 1 — with
+# OKF_CONCEPT_RESOURCE emptied — when the concept names no resource this bundle
+# answers for.
+#
+# Takes the `resource` field rather than reading it, so that a caller which has
+# already read the concept's frontmatter for its own reasons does not open the
+# file a second time, and so that nothing here depends on which read_frontmatter
+# call last ran. load_bundle_globs must have run, which is the one thing it does
+# reach for.
+#
+# Shared by `okf list --orphans` and `okf check`, which ask the same question of
+# the same files and must not answer it differently: a concept counted as this
+# bundle's when drift is measured and as some other bundle's when orphans are
+# listed is one that can be reported drifted forever and never cleaned up.
+#
+# What it enforces, in order:
+#
+#   * A concept that declares no `resource` is not resolvable. okf has not been
+#     told what it documents, so it cannot find out anything about that thing.
+#   * SPEC.md §4 puts path-valued fields in bundle-absolute form — a leading `/`
+#     that means the bundle root and not the filesystem's. okf is standing in
+#     the root, so dropping it makes the path one this can test directly. A
+#     `resource` written without the leading `/` is read the same way rather
+#     than refused: the two spellings name one file, and §4's form is a
+#     recommendation about surviving file moves, not a gate on being read.
+#   * SPEC.md §5's co-location, asked as a directory and not as a filename: the
+#     concept lives beside its source, so a `resource` naming a file in some
+#     other directory is not one this concept documents by §5's rules. The
+#     filename is deliberately not derived — §5 gives a file's additional
+#     top-level types the spelling `<stem>.<TypeName>.md`, which no source is
+#     ever named — so the directory is as much as can be checked, and it is the
+#     part that matters.
+#
+#     What it is really guarding is the bundle boundary. A vendored or nested
+#     repository with its own okf.json is its own bundle, and its concepts write
+#     `resource` bundle-absolute against *its* root: read from out here,
+#     `/src/util/helper.ts` is a file that was never in this repository, and
+#     every concept it has would be answered for by this bundle.
+#   * SPEC.md §6's `include` and `exclude`, asked of the source and not of the
+#     concept. Both settings are written about sources, and one written
+#     `src/**/*.py` matches no `.md` in the repository at all. Co-location above
+#     has already made this the concept's directory, so what the two spellings
+#     differ over is only the filename, which is exactly the part these globs are
+#     entitled to have an opinion about.
+#
+#     `extensions` is deliberately not asked. It says what kind of file gets
+#     documented, and a concept that exists is evidence one already was:
+#     narrowing `extensions` to `["java"]` today does not make yesterday's
+#     TypeScript concept stop being this bundle's to answer for.
+#
+# Whether the file is *there* is deliberately not asked. That is the difference
+# between the two callers — gone is what `--orphans` reports, and present is
+# what `okf check` hashes — and answering it here would leave neither able to
+# tell an unresolvable concept from a resolved one whose source has been
+# deleted.
+OKF_CONCEPT_RESOURCE=""
+concept_resource() { # $1 = a bundle-relative concept path, $2 = its `resource` field
+  local concept="$1" resource="$2" resource_dir concept_dir
+  OKF_CONCEPT_RESOURCE=""
+
+  [ -n "$resource" ] || return 1
+  resource="${resource#/}"
+  # A `resource` of nothing but `/` names the bundle root, which is a directory
+  # and not a source. Asked again after the strip, because that is where a value
+  # that was only ever a leading slash becomes empty.
+  [ -n "$resource" ] || return 1
+
+  case "$resource" in
+    */*) resource_dir="${resource%/*}/" ;;
+    *) resource_dir="" ;;
+  esac
+  case "$concept" in
+    */*) concept_dir="${concept%/*}/" ;;
+    *) concept_dir="" ;;
+  esac
+  [ "$resource_dir" = "$concept_dir" ] || return 1
+
+  in_bundle_globs "$resource" || return 1
+
+  OKF_CONCEPT_RESOURCE="$resource"
   return 0
 }
 
@@ -2817,12 +2911,13 @@ cmd_list() {
     # it. `resource` is where the concept says what it documents, and it is the
     # only thing here that survives §5's naming rules.
     #
-    # A concept that declares no `resource` is left off. okf has not been told
-    # what it documents, so it cannot have found out that thing is gone, and
-    # this listing is one a caller acts on by deleting files: a wrong name on it
-    # costs a concept somebody wrote, where a missing one costs a stale file
-    # that stays until `resource` is filled in.
-    local resource resource_dir concept_dir
+    # A concept that declares no `resource` is left off, and so is one whose
+    # `resource` this bundle does not answer for — see concept_resource, which
+    # holds the whole of that reasoning because `okf check` asks the same
+    # question of the same files. This listing is one a caller acts on by
+    # deleting files: a wrong name on it costs a concept somebody wrote, where a
+    # missing one costs a stale file that stays until `resource` is filled in.
+    local resource
     load_concepts
     load_bundle_globs
     for path in ${OKF_CONCEPTS[@]+"${OKF_CONCEPTS[@]}"}; do
@@ -2831,56 +2926,14 @@ cmd_list() {
       # list, so a read that fails here is one the file stopped being readable
       # between the two — not a fact about what it documents.
       read_frontmatter "$path" || continue
-      resource="$OKF_FM_RESOURCE"
-      [ -n "$resource" ] || continue
-      # §4 puts path-valued fields in bundle-absolute form — a leading `/` that
-      # means the bundle root and not the filesystem's. okf is standing in the
-      # root, so dropping it makes the path one this can test directly. A
-      # `resource` written without the leading `/` is read the same way rather
-      # than refused: the two spellings name one file, and §4's form is a
-      # recommendation about surviving file moves, not a gate on being read.
-      resource="${resource#/}"
+      concept_resource "$path" "$OKF_FM_RESOURCE" || continue
+      resource="$OKF_CONCEPT_RESOURCE"
 
-      # SPEC.md §5's co-location, asked as a directory and not as a filename:
-      # the concept lives beside its source, so a `resource` naming a file in
-      # some other directory is not one this concept documents by §5's rules.
-      # The filename is deliberately not derived — §5 gives a file's additional
-      # top-level types the spelling `<stem>.<TypeName>.md`, which no source is
-      # ever named — so the directory is as much as can be checked, and it is
-      # the part that matters.
-      #
-      # What it is really guarding is the bundle boundary. A vendored or
-      # nested repository with its own okf.json is its own bundle, and its
-      # concepts write `resource` bundle-absolute against *its* root: read from
-      # out here, `/src/util/helper.ts` is a file that was never in this
-      # repository, and every concept it has would be reported as this bundle's
-      # orphan. This listing is acted on by deleting files, so that is the
-      # expensive direction — and §5 is what tells a nested bundle's concept
-      # from one of this bundle's own.
-      case "$resource" in
-        */*) resource_dir="${resource%/*}/" ;;
-        *) resource_dir="" ;;
-      esac
-      case "$path" in
-        */*) concept_dir="${path%/*}/" ;;
-        *) concept_dir="" ;;
-      esac
-      [ "$resource_dir" = "$concept_dir" ] || continue
-
-      # SPEC.md §6's `include` and `exclude`, asked of the source and not of the
-      # concept. Both settings are written about sources, and one written
-      # `src/**/*.py` matches no `.md` in the repository at all — asked of a
-      # concept's own path it would report a bundle full of leftovers as having
-      # none. Co-location above has already made this the concept's directory,
-      # so what the two spellings differ over is only the filename, which is
-      # exactly the part these globs are entitled to have an opinion about.
-      #
-      # `extensions` is deliberately not asked. It says what kind of file gets
-      # documented, and a concept that exists is evidence one already was:
-      # narrowing `extensions` to `["java"]` today does not make yesterday's
-      # TypeScript concept stop being a leftover when its source goes.
-      in_bundle_globs "$resource" || continue
-
+      # `-e` and not `-f`: what is asked is whether anything is there under that
+      # name, not whether it is something okf could go on to hash. A resource
+      # replaced by a directory is a concept pointing at something broken, which
+      # is a different complaint from the one this listing makes — and this is
+      # the listing acted on by deleting files.
       [ ! -e "$resource" ] || continue
       printf '%s\n' "$path"
     done
@@ -2899,6 +2952,92 @@ cmd_list() {
     fi
     printf '%s\n' "$path"
   done
+}
+
+# One file's `sha256:…` digest, left in OKF_FILE_DIGEST, returning 1 with the
+# reason in OKF_FILE_DIGEST_ERROR when there is no digest to be had.
+#
+# Its own function rather than the body of cmd_hash because SPEC.md §8's drift
+# rule is a comparison between two of these, and `okf check` computes one per
+# concept in the bundle: a second transcription of the same three lines is a
+# second chance to get the prefix or the validation subtly different, and the
+# two would then disagree about whether a file had drifted — with `okf hash`
+# printing the value a slash command goes on to store.
+#
+# The reason comes back in a variable rather than being printed, because the
+# two callers do different things with it. `okf hash` was asked about one file
+# and dies naming it; `okf check` was asked about a bundle, cannot answer for
+# this one concept, and must still answer for the rest — SPEC.md §8 has plain
+# `okf check` always exiting 0, so it warns and carries on.
+OKF_FILE_DIGEST=""
+OKF_FILE_DIGEST_ERROR=""
+file_digest() { # $1 = a path to a regular, readable file
+  local path="$1" digest
+  OKF_FILE_DIGEST=""
+  OKF_FILE_DIGEST_ERROR=""
+
+  # Fed on stdin rather than named as an argument. sha256sum echoes the name it
+  # was given beside the digest, and escapes one containing a backslash or a
+  # newline by prefixing the whole line with `\` — so the digest is not reliably
+  # where the first field is — while a name beginning with a dash would be read
+  # as an option before the file was ever opened. Redirected in, there is no
+  # name in the output to work around and none on the command line to be
+  # misread, and the shell has already opened the file by the time sha256sum
+  # runs.
+  if ! digest="$(sha256sum < "$path")"; then
+    OKF_FILE_DIGEST_ERROR="could not hash: $path"
+    return 1
+  fi
+  digest="${digest%% *}"
+
+  # Checked rather than trusted, because everything downstream of this compares
+  # the string and never reads it: a truncated or decorated digest stored as a
+  # `content_hash` would not look wrong in frontmatter, and would report drift
+  # on every `okf check` from then on — against a file nobody had touched.
+  case "$digest" in
+    "" | *[!0-9a-f]*)
+      OKF_FILE_DIGEST_ERROR="sha256sum did not print a digest for $path: $digest"
+      return 1
+      ;;
+  esac
+  if [ "${#digest}" -ne 64 ]; then
+    OKF_FILE_DIGEST_ERROR="sha256sum printed ${#digest} hex characters for $path, not a sha256's 64: $digest"
+    return 1
+  fi
+
+  # The `sha256:` prefix is part of the value and not a label on it — see
+  # cmd_hash below — so it goes on here, where the digest is made, rather than
+  # at each place one is printed or compared.
+  OKF_FILE_DIGEST="sha256:$digest"
+  return 0
+}
+
+# The shape SPEC.md §4 writes a `code.content_hash` in, and the shape
+# file_digest produces: `sha256:` and 64 lowercase hex characters. Asked of a
+# *stored* value, which okf did not write and cannot vouch for.
+#
+# A stored value of any other shape is not a digest this can compare against.
+# Reporting it drifted would be a file named for editing that nobody had
+# touched; ignoring it would leave a concept that can never be checked looking
+# checked. Its callers say so instead, which is why this only answers the
+# question and does not decide what to do about it.
+#
+# Lower case only, deliberately, and the reason is what the callers say rather
+# than what they check: sha256sum prints lower case, `okf hash` prints what
+# sha256sum printed, and SPEC.md §4's example is lower case — so the only value
+# okf has ever written into this field is one this accepts. An upper-case digest
+# is the same number spelled differently and is refused all the same, because
+# case-folding it here would be okf inventing a second spelling of its own
+# output. What it gets instead is the warning naming the spelling to restore,
+# which is a line somebody can act on with `okf hash`.
+is_content_hash() { # $1 = a stored code.content_hash value
+  local hex="${1#sha256:}"
+  [ "$hex" != "$1" ] || return 1
+  [ "${#hex}" -eq 64 ] || return 1
+  case "$hex" in
+    *[!0-9a-f]*) return 1 ;;
+  esac
+  return 0
 }
 
 # okf hash <file> — sha256:… of one file
@@ -2986,32 +3125,14 @@ cmd_hash() {
   [ -f "$path" ] || die "hash takes a regular file, but $path is not one"
   [ -r "$path" ] || die "cannot read: $path"
 
-  # Fed on stdin rather than named as an argument. sha256sum echoes the name it
-  # was given beside the digest, and escapes one containing a backslash or a
-  # newline by prefixing the whole line with `\` — so the digest is not reliably
-  # where the first field is — while a name beginning with a dash would be read
-  # as an option before the file was ever opened. Redirected in, there is no
-  # name in the output to work around and none on the command line to be
-  # misread, and the shell has already opened the file by the time sha256sum
-  # runs.
-  local digest
-  digest="$(sha256sum < "$path")" || die "could not hash: $path"
-  digest="${digest%% *}"
+  # The digest, its validation and its `sha256:` prefix all live in file_digest,
+  # which `okf check` uses to compute the other half of SPEC.md §8's comparison.
+  # What is left here is the part that is this subcommand's own: a file okf was
+  # asked about and could not hash is a failure, so the reason is printed and
+  # okf exits 1 rather than printing a digest of nothing.
+  file_digest "$path" || die "$OKF_FILE_DIGEST_ERROR"
 
-  # Checked rather than trusted, because everything downstream of this compares
-  # the string and never reads it: a truncated or decorated digest stored as a
-  # `content_hash` would not look wrong in frontmatter, and would report drift
-  # on every `okf check` from then on — against a file nobody had touched.
-  case "$digest" in
-    "" | *[!0-9a-f]*)
-      die "sha256sum did not print a digest for $path: $digest"
-      ;;
-  esac
-  if [ "${#digest}" -ne 64 ]; then
-    die "sha256sum printed ${#digest} hex characters for $path, not a sha256's 64: $digest"
-  fi
-
-  printf 'sha256:%s\n' "$digest"
+  printf '%s\n' "$OKF_FILE_DIGEST"
 }
 
 # okf fanin <Name> — whole-word reference count across in-scope files
@@ -3264,7 +3385,171 @@ cmd_fanin() {
 }
 
 # okf check [--strict] [--stamp] [--json] — drift, missing and orphan concepts
-cmd_check() { not_implemented check; }
+#
+# SPEC.md §8's drift rule, and nothing more than it: "stored `code.content_hash`
+# differs from the current sha256 of `resource`". Computed on demand from the
+# two files, with no cache under `.okf/` to invalidate — the whole point of
+# storing a digest is that the comparison needs nothing else kept in step.
+#
+# Two promises SPEC.md §8 makes about plain `okf check`, both load-bearing:
+#
+#   * It never mutates a file. Not the concept, not the source, not a cache.
+#     `--stamp` is the flag that writes, and it is a separate one precisely so
+#     that the run a hook or a CI job makes on every commit cannot dirty a work
+#     tree. Nothing below this line opens a file for writing.
+#   * It always exits 0. "CI warns, never gates" — drift is the ordinary state
+#     of a repository between a refactor and the doc refresh that follows it,
+#     and a check that failed the build for it would be turned off within a
+#     week. `--strict` is the opt-in that exits 3.
+#
+#     Exiting 0 is about what the *check found*, not about okf being able to run
+#     at all: a bundle okf cannot read — no git work tree, an okf.json that will
+#     not parse — is SPEC.md §7's exit 1 like anywhere else, because that run
+#     did not find no drift, it found nothing.
+#
+# One line per finding on stdout, `drifted: <concept>`, so a caller pipes it
+# into `cut -d' ' -f2` or greps it by kind. The kind is on the line rather than
+# implied by a section header because the sets this grows — missing sources,
+# orphan concepts — are paths of different kinds, and a listing whose meaning
+# depends on how far down it a line appears is one a filter destroys.
+#
+# A clean bundle prints nothing at all, which is `okf list --orphans`'s
+# convention and the one a warning should keep: something to read means
+# something to do.
+#
+# Which concepts are walked is load_concepts', and so git's: a `.md` written and
+# never added is not in the bundle yet. That is the same rule `okf list
+# --orphans` follows and the same one that keeps gitignored files off `okf
+# list` — scope is read out of git throughout — so the two subcommands cannot
+# disagree about which concepts exist. It does mean a concept `/okf-generate`
+# has just written is not compared until it is staged, which costs nothing in
+# practice: a concept written from its source this minute stores that source's
+# current digest and has no drift to find. `git add` is enough; no commit is
+# needed. Note that this is a stricter rule than has_concept's, which asks the
+# filesystem — `okf list --missing` counts an unstaged concept as covering its
+# source. The two answer different questions, and the difference is git's index.
+cmd_check() {
+  local strict=0 stamp=0 json=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --strict) strict=1 ;;
+      --stamp) stamp=1 ;;
+      --json) json=1 ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        die "check: unknown flag: $1" \
+          "usage: okf check [--strict] [--stamp] [--json]"
+        ;;
+      *) break ;;
+    esac
+    shift
+  done
+
+  [ $# -eq 0 ] || die "check takes no arguments, but was given: $1" \
+    "usage: okf check [--strict] [--stamp] [--json]"
+
+  # Recognised here so that the flag is answered by the subcommand that owns it
+  # rather than by "unknown flag", which would send a caller looking for a
+  # typo — and refused, because each of the three changes what a run *means*.
+  # `--strict` changes the exit status a CI job branches on, `--json` the shape
+  # of what is parsed, `--stamp` whether files are written; accepting any of
+  # them and quietly doing the plain thing would be answering a different
+  # question than the one asked, in a way the caller cannot see.
+  [ "$strict" -eq 0 ] || not_implemented "check --strict"
+  [ "$stamp" -eq 0 ] || not_implemented "check --stamp"
+  [ "$json" -eq 0 ] || not_implemented "check --json"
+
+  load_concepts
+  load_bundle_globs
+
+  local concept resource stored
+  for concept in ${OKF_CONCEPTS[@]+"${OKF_CONCEPTS[@]}"}; do
+    # A concept that stopped being readable between load_concepts and here is
+    # left off rather than reported: nothing was compared, so there is nothing
+    # to say about whether it drifted.
+    read_frontmatter "$concept" || continue
+
+    # No stored hash is not drift. A concept written by hand, or one a slash
+    # command has not stamped yet, has never claimed to describe a particular
+    # version of its source — and §8's rule is a comparison between two values,
+    # not a demand that both exist. The concept still shows up as a draft to
+    # whoever is reading `status`, and `okf verify` is what settles its trust.
+    stored="$OKF_FM_CODE_CONTENT_HASH"
+    [ -n "$stored" ] || continue
+
+    # Which concepts this bundle answers for at all — see concept_resource. The
+    # same rule `okf list --orphans` uses, deliberately: a concept inside a
+    # nested bundle, or one whose `resource` is not co-located with it, is not
+    # this run's to have an opinion about in either direction.
+    concept_resource "$concept" "$OKF_FM_RESOURCE" || continue
+    resource="$OKF_CONCEPT_RESOURCE"
+
+    # A resource that is not there is an orphan, which is a different finding
+    # with a different repair — the concept goes, or its `resource` is
+    # corrected — and reporting it as drift would send someone to re-read a file
+    # that does not exist. It is reported by `okf list --orphans` today, and by
+    # a later PLAN.md item as part of this same run. `-e` and not `-f`, so that
+    # this and that listing agree on what "gone" means; a dangling symlink is
+    # gone to both.
+    [ -e "$resource" ] || continue
+
+    # Present, but not something a sha256 can be taken of: a resource replaced
+    # by a directory, or one that is a fifo — which would hang here waiting on a
+    # writer that is never coming — or a device, whose bytes are nobody's file
+    # contents. Neither listing would otherwise mention it: `--orphans` sees
+    # something there and this run cannot read it, so it falls between the two
+    # and the concept is never checked again.
+    if [ ! -f "$resource" ]; then
+      warn "$concept: $resource is not a regular file, so it cannot be checked for drift"
+      continue
+    fi
+
+    # The stored value is checked for shape before it is compared, because the
+    # comparison cannot tell a digest that differs from a value that was never a
+    # digest. Both would print the same line, and the repair for the second one
+    # — fix what is written in the concept — is not the repair the line implies.
+    if ! is_content_hash "$stored"; then
+      warn "$concept: code.content_hash is not \`sha256:\` and 64 lower-case hex characters, so there is nothing to compare it with: $stored" \
+        "  restore it with: okf hash $resource"
+      continue
+    fi
+
+    # Said out loud rather than skipped in silence, in both of the next two
+    # cases. A source okf cannot hash is a concept that will never be reported
+    # drifted again, and a check that quietly stops checking things is worse
+    # than one that finds nothing. stderr, so it stays out of the listing a
+    # caller is parsing, and the run still exits 0: this is a fact about one
+    # file, not a finding about the bundle.
+    if [ ! -r "$resource" ]; then
+      warn "$concept: cannot read $resource, so it cannot be checked for drift"
+      continue
+    fi
+
+    if ! file_digest "$resource"; then
+      # file_digest's own reason, and not a paraphrase of it: a read that failed
+      # part way through and a sha256sum that answered with something which was
+      # not a digest are different things to go and look at, and only the first
+      # is about the file. Passing the reason back in a variable is what that
+      # function does it for.
+      warn "$concept: $OKF_FILE_DIGEST_ERROR" \
+        "  so it cannot be checked for drift"
+      continue
+    fi
+
+    [ "$OKF_FILE_DIGEST" != "$stored" ] || continue
+    printf 'drifted: %s\n' "$concept"
+  done
+
+  # Explicit, and not left to the loop's own status. SPEC.md §8's "always exits
+  # 0" is this line: the last thing the loop did was a comparison, and under
+  # `set -e` a final concept that turned out not to have drifted would otherwise
+  # be the status the whole run came back with.
+  return 0
+}
 
 # okf index — regenerate the per-directory index.md files
 cmd_index() { not_implemented index; }

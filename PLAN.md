@@ -36,7 +36,7 @@ there). Items are ordered so none depends on a later one. Every item verifies wi
 
 ## Phase 5 — Tier A: drift and trust
 
-- [ ] Implement okf check in bin/okf to report concepts whose stored code.content_hash differs from the current sha256 of their resource, always exiting 0 and never mutating a file, per SPEC.md §8 (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
+- [x] Implement okf check in bin/okf to report concepts whose stored code.content_hash differs from the current sha256 of their resource, always exiting 0 and never mutating a file, per SPEC.md §8 (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Extend okf check in bin/okf to also report in-scope sources having no concept and orphan concepts whose resource is gone (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Add --strict to okf check in bin/okf, exiting 3 when drift exists and leaving every other outcome exiting 0 (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Add --json to okf check in bin/okf, emitting the drifted, missing and orphan sets as one JSON document (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh

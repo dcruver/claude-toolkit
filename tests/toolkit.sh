@@ -5030,6 +5030,417 @@ test_okf_frontmatter_writer_refuses_what_it_must() {
   with_fixture_repo concepts _okf_writer_refuses_what_it_must
 }
 
+# ---------------------------------------------------------------------------
+# okf check (SPEC.md §8)
+# ---------------------------------------------------------------------------
+
+# okf check's stdout, its stderr and its exit status, kept apart rather than
+# folded into one stream. SPEC.md §8 gives each of the three a job — findings on
+# stdout, a status that is always 0, and warnings that must stay out of both —
+# and a helper that ran them together could not tell a finding from a warning
+# about a file it could not read.
+OKF_CHECK_OUT=""
+OKF_CHECK_ERR=""
+OKF_CHECK_RC=0
+_okf_check() { # $1.. = okf arguments
+  local stderr="$HARNESS_STATE/okf-check-stderr"
+  : > "$stderr"
+  OKF_CHECK_OUT="$("$TOOLKIT_ROOT/bin/okf" "$@" 2> "$stderr")"
+  OKF_CHECK_RC=$?
+  OKF_CHECK_ERR="$(cat "$stderr" 2> /dev/null)"
+  return 0
+}
+
+# okf check exits 0 and its stdout is exactly this.
+#
+# The status is asserted on every call rather than once at the end, because
+# SPEC.md §8's "always exits 0" is the promise a CI job branches on: it has to
+# hold over a clean bundle, a drifted one, and every state in between that these
+# probes put the fixture into.
+#
+# Exactly, and not a substring: `drifted: src/route/Legacy.md` contains nothing
+# of `drifted: src/route/RouteRegistry.md`, but a listing checked by substring
+# passes on a run that reported three concepts when one had changed — and a
+# check whose whole use is naming the files to re-read cannot be allowed to name
+# extra ones.
+_okf_assert_check() { # $1 = expected stdout, $2 = description, $3.. = okf arguments
+  local expected="$1" what="$2"
+  shift 2
+  _okf_check "$@"
+  if [ "$OKF_CHECK_RC" -ne 0 ]; then
+    local -a detail=("okf $* exited $OKF_CHECK_RC" \
+      "SPEC.md §8: plain okf check always exits 0 — CI warns, never gates" "stderr:")
+    local line
+    while IFS= read -r line; do detail+=("$line"); done < <(_detail_lines "$OKF_CHECK_ERR")
+    _fail "$what" "${detail[@]}"
+    return 1
+  fi
+  assert_eq "$expected" "$OKF_CHECK_OUT" "$what"
+}
+
+# SPEC.md §8's drift rule over tests/fixtures/concepts, whose concepts are all
+# committed carrying the true sha256 of the sources beside them.
+_okf_check_drift_probe() {
+  local registry="drifted: src/route/RouteRegistry.md"
+  local legacy="drifted: src/route/Legacy.md"
+  local boundaries="drifted: src/route/Boundaries.md"
+
+  # Nothing has been touched, so nothing has drifted. An empty listing exiting
+  # 0, not an error and not a "0 drifted" line: a bundle in step with its
+  # sources is the ordinary state, and something to read has to mean something
+  # to do.
+  #
+  # It is also where three ways of reading a concept wrongly would show up at
+  # once, each of which reports drift in a bundle that has none:
+  #
+  #   * src/route/Boundaries.md carries a `code.supersedes.content_hash` of all
+  #     zeroes, one level deeper than SPEC.md §4's extraction rule reaches, and
+  #     its real `content_hash` line ends in a trailing `# regenerate after the
+  #     refactor` comment.
+  #   * src/route/Interrupted.md opens a frontmatter block it never closes and
+  #     puts an all-zero hash in it. It is not a concept, and a reader that took
+  #     it for one would report a file nobody can act on.
+  #   * src/route/Legacy.md is written with CRLF line endings and a UTF-8 BOM,
+  #     and quotes every value.
+  _okf_assert_check '' "a bundle whose concepts all match their sources prints nothing, exiting 0" \
+    check
+
+  # One source changed, one concept named. The other four concepts in the
+  # directory are the check that this is a comparison per concept and not a
+  # verdict on the bundle.
+  printf '// touched\n' >> src/route/RouteRegistry.java
+  _okf_assert_check "$registry" \
+    "a source whose bytes have changed drifts its concept, and only its concept" \
+    check
+  git checkout -q -- src/route/RouteRegistry.java
+  _okf_assert_check '' "and stops being drifted when the source goes back" check
+
+  # Content and not mtime, which is the whole reason SPEC.md §4 stores a digest
+  # rather than a timestamp: a checkout, a `cp -R` or a rebase rewrites every
+  # mtime in the tree without changing a byte, and a check built on them would
+  # report the entire bundle drifted after any of the three. Every fixture copy
+  # gets here through `cp -R`, so this is also the check that the whole suite is
+  # not passing by accident.
+  touch src/route/RouteRegistry.java
+  _okf_assert_check '' "a source touched but not edited has not drifted" check
+
+  # The same rule reaching the two concepts written to be hard to read. Legacy.md
+  # is CRLF-with-a-BOM and quotes its `content_hash`; Boundaries.md hides its
+  # behind a trailing comment and a same-named decoy. Both were clean above,
+  # which only says they were not misread into drift — this says they are read
+  # at all, rather than skipped and so clean whatever happens to their source.
+  printf '// touched\n' >> src/route/Legacy.java
+  _okf_assert_check "$legacy" \
+    "a concept written with CRLF, a BOM and quoted values is compared like any other" \
+    check
+  printf '// touched\n' >> src/route/Boundaries.java
+  _okf_assert_check "$boundaries
+$legacy" \
+    "and so is one whose content_hash carries a trailing comment" check
+
+  # Every drifted concept, in git's order, which is the order `okf list` prints
+  # its own listing in. One line per finding and no summary: a caller reads this
+  # with `while read`, and a total on the end would be a path that names no file.
+  printf '// touched\n' >> src/route/RouteRegistry.java
+  _okf_assert_check "$boundaries
+$legacy
+$registry" \
+    "every drifted concept is named, one per line, in the bundle's order" check
+
+  # Twice, with nothing in between. SPEC.md §8 computes drift on demand from the
+  # two files, so there is no cache to go stale and no first run that primes a
+  # second — and a check that answered differently the second time would be one
+  # nobody could act on.
+  _okf_assert_check "$boundaries
+$legacy
+$registry" \
+    "and the same run repeated says the same thing" check
+
+  git checkout -q -- src/route/
+  _okf_assert_check '' "restoring every source clears every finding" check
+  return 0
+}
+
+test_okf_check_reports_drifted_concepts() {
+  with_fixture_repo concepts _okf_check_drift_probe
+}
+
+# The concepts a drift check has nothing to say about. Each one is a way of
+# manufacturing a finding out of a comparison that was never made — which is the
+# expensive direction here, because every line of this listing is a file
+# somebody is going to be sent to re-read.
+_okf_check_silence_probe() {
+  # A concept with no `code.content_hash` has never claimed to describe a
+  # particular version of its source, so there is nothing for SPEC.md §8 to
+  # compare. src/route/RouteSource.md declares almost nothing — no hash, no
+  # `generated`, no `verified` — and its source is edited here to prove the
+  # silence is the missing field and not an unchanged file.
+  printf '// touched\n' >> src/route/RouteSource.java
+  _okf_assert_check '' \
+    "a concept that stores no content_hash is not drift, whatever its source does" \
+    check
+  git checkout -q -- src/route/RouteSource.java
+
+  # A resource that is gone is an orphan, which is a different finding with a
+  # different repair — the concept goes, or its `resource` is corrected — and
+  # naming it here would send somebody to re-read a file that is not there.
+  # Checked against `okf list --orphans`, so this says the concept is accounted
+  # for somewhere rather than only that check is quiet about it.
+  rm -f src/route/RouteRegistry.java
+  _okf_assert_check '' "a concept whose resource has been deleted is not drift" check
+  _okf_assert_listing 'src/route/RouteRegistry.md' \
+    "it is an orphan, which is where okf accounts for it" list --orphans
+  git checkout -q -- src/route/RouteRegistry.java
+
+  # SPEC.md §5 co-locates a concept beside its source, and concept_resource is
+  # where okf decides which concepts this bundle answers for at all. A concept
+  # naming a file in another directory is a nested bundle's, read from out
+  # here — its `resource` is bundle-absolute against a root that is not this
+  # one — so a hash that cannot match must still produce nothing.
+  printf -- '---\ntype: Class\nresource: /README.md\ncode:\n  content_hash: "sha256:%s"\n---\n' \
+    "0000000000000000000000000000000000000000000000000000000000000000" \
+    > src/route/Elsewhere.md
+  _okf_stage src/route/Elsewhere.md || return 1
+  _okf_assert_check '' \
+    "a concept whose resource is not co-located with it is not this bundle's to check" \
+    check
+  rm -f src/route/Elsewhere.md
+  git rm -q --cached src/route/Elsewhere.md > /dev/null 2>&1
+
+  # SPEC.md §6's `exclude`, asked of the source. A concept inside an excluded
+  # tree is not this bundle's either, and the same run before and after the
+  # setting is what says the listing moved because of the setting.
+  printf '// touched\n' >> src/route/RouteRegistry.java
+  _okf_assert_check 'drifted: src/route/RouteRegistry.md' \
+    "the drifted concept is reported while nothing excludes it" check
+  printf '{"bundle": {"exclude": ["**/route/**"]}}\n' > okf.json
+  _okf_assert_check '' "and drops out when exclude covers its resource" check
+  printf '{"bundle": {"include": ["lib/**"]}}\n' > okf.json
+  _okf_assert_check '' "and when include no longer reaches it" check
+  rm -f okf.json
+  _okf_assert_check 'drifted: src/route/RouteRegistry.md' \
+    "and comes back with the settings taken away again" check
+  git checkout -q -- src/route/RouteRegistry.java
+
+  # A concept written and never added is not in the bundle yet, which is the
+  # rule `okf list --orphans` is already held to: scope is read out of git
+  # throughout okf, and the two subcommands must not disagree about which
+  # concepts exist. Pinned here as a decision rather than left as an accident,
+  # because it is the one place `okf check` is stricter than `okf list
+  # --missing`, whose has_concept asks the filesystem.
+  #
+  # `git add` is enough — no commit — which is what keeps the cost of the rule
+  # at nothing: a concept written from its source this minute stores that
+  # source's current digest and has no drift to find anyway.
+  printf -- '---\ntype: Class\nresource: /src/route/RouteSource.java\ncode:\n  content_hash: "sha256:%s"\n---\n' \
+    "0000000000000000000000000000000000000000000000000000000000000000" \
+    > src/route/Untracked.md
+  _okf_assert_check '' "an unstaged concept is not in the bundle yet, so it is not checked" \
+    check
+  _okf_stage src/route/Untracked.md || return 1
+  _okf_assert_check 'drifted: src/route/Untracked.md' \
+    "and is compared as soon as it is staged, with no commit needed" check
+  rm -f src/route/Untracked.md
+  git rm -q --cached src/route/Untracked.md > /dev/null 2>&1
+
+  # A markdown file with no frontmatter is prose and not a concept, and one
+  # whose block is never closed is a half-written concept — src/route/README.md
+  # and src/route/Interrupted.md respectively. Neither is on any listing above,
+  # which is only worth stating because Interrupted.md carries an all-zero
+  # `content_hash` beside a `resource` that exists: read as a concept it would
+  # be drifted on every run of every one of these checks.
+  _okf_assert_check '' "the bundle is clean again once every source is restored" check
+  return 0
+}
+
+test_okf_check_stays_silent_about_what_it_cannot_compare() {
+  with_fixture_repo concepts _okf_check_silence_probe
+}
+
+# What okf cannot compare, it says so about — on stderr, and still exiting 0.
+# A check that quietly stopped checking a concept would leave it looking checked
+# for as long as nobody opened it, which is the one failure a drift report exists
+# to prevent.
+_okf_check_warning_probe() {
+  local zeroes="0000000000000000000000000000000000000000000000000000000000000000"
+
+  # A stored value that is not one of `okf hash`'s digests. It cannot be
+  # compared, so it is not a finding; it is also not nothing, because the
+  # concept it is written in can never be reported drifted until somebody fixes
+  # it. Three spellings, each one somebody would plausibly write by hand.
+  local bad
+  for bad in "not-a-digest" "$zeroes" "sha256:deadbeef" "SHA256:$zeroes"; do
+    printf -- '---\ntype: Class\nresource: /src/route/RouteSource.java\ncode:\n  content_hash: "%s"\n---\n' \
+      "$bad" > src/route/Bad.md
+    _okf_stage src/route/Bad.md || return 1
+    _okf_assert_check '' "[$bad] is not compared, so it is not reported as drift" check
+    assert_contains "$OKF_CHECK_ERR" "src/route/Bad.md" \
+      "[$bad] is warned about on stderr, naming the concept"
+    assert_contains "$OKF_CHECK_ERR" "okf hash src/route/RouteSource.java" \
+      "[$bad] and the warning says how to put a real digest there"
+  done
+
+  # An upper-case digest of the very file the concept documents. It is the same
+  # number spelled a way okf never writes, so it is warned about rather than
+  # compared: case-folding it would be okf inventing a second spelling of its
+  # own output, and comparing it as written would report the concept drifted on
+  # every run against a source nobody had touched.
+  local real upper
+  real="$("$TOOLKIT_ROOT/bin/okf" hash src/route/RouteSource.java)"
+  upper="sha256:$(printf '%s' "${real#sha256:}" | tr 'a-f' 'A-F')"
+  printf -- '---\ntype: Class\nresource: /src/route/RouteSource.java\ncode:\n  content_hash: "%s"\n---\n' \
+    "$upper" > src/route/Bad.md
+  _okf_assert_check '' "an upper-case digest is warned about, not reported as drift" check
+  assert_contains "$OKF_CHECK_ERR" "src/route/Bad.md" \
+    "and the warning names the concept to restore"
+
+  # The same concept, the same file, spelled the way `okf hash` prints it: clean,
+  # and silent. Without this every check above would also pass on a reader that
+  # had stopped comparing anything at all.
+  printf -- '---\ntype: Class\nresource: /src/route/RouteSource.java\ncode:\n  content_hash: "%s"\n---\n' \
+    "$real" > src/route/Bad.md
+  _okf_assert_check '' "the same concept carrying okf hash's own digest is clean" check
+  assert_eq "" "$OKF_CHECK_ERR" "and okf says nothing on stderr about it"
+
+  # A resource that is there but is not a regular file falls between the two
+  # listings — `okf list --orphans` sees something under that name, and this run
+  # cannot take a sha256 of it — so it has to be said out loud here or not at
+  # all.
+  #
+  # src/route/Bad.md is left in place carrying the digest above, because it is
+  # the only concept in the fixture that stores one for RouteSource.java:
+  # RouteSource.md stores none, and a concept with nothing to compare is quiet
+  # about its resource whatever state the file is in.
+  rm -f src/route/RouteSource.java
+  if mkdir src/route/RouteSource.java > /dev/null 2>&1; then
+    _okf_assert_check '' "a resource that has become a directory is not reported as drift" check
+    assert_contains "$OKF_CHECK_ERR" "is not a regular file" \
+      "it is warned about instead, so the concept is not silently skipped"
+    rmdir src/route/RouteSource.java
+  else
+    _fail "a directory can be made in the fixture copy" "mkdir src/route/RouteSource.java failed"
+  fi
+  git checkout -q -- src/route/RouteSource.java
+
+  # And a resource whose permissions have been taken away. Same reasoning: it is
+  # there, so it is not an orphan, and okf cannot read it, so it cannot be
+  # compared.
+  if chmod 000 src/route/RouteSource.java > /dev/null 2>&1 \
+    && [ ! -r src/route/RouteSource.java ]; then
+    _okf_assert_check '' "a resource that cannot be read is not reported as drift" check
+    assert_contains "$OKF_CHECK_ERR" "cannot read src/route/RouteSource.java" \
+      "it is warned about too, naming the file okf could not open"
+  else
+    # root reads anything, so the check cannot be made to hold there.
+    _skip "a resource that cannot be read is warned about" \
+      "chmod 000 does not make a file unreadable here"
+  fi
+  chmod 644 src/route/RouteSource.java > /dev/null 2>&1
+  return 0
+}
+
+test_okf_check_warns_about_what_it_cannot_compare() {
+  with_fixture_repo concepts _okf_check_warning_probe
+}
+
+# SPEC.md §8's two promises about plain `okf check`, asserted as the properties
+# they are rather than as a consequence of one particular run: it never mutates
+# a file, and it always exits 0.
+_okf_check_promises_probe() {
+  local marker=".okf-check-marker" before_status after_status touched
+
+  # Drift in the bundle, plus a concept okf can only warn about, so the run has
+  # every reason it will ever have to want to write something down — a stamp, a
+  # cache, a repaired hash.
+  printf '// touched\n' >> src/route/RouteRegistry.java
+  printf -- '---\ntype: Class\nresource: /src/route/RouteSource.java\ncode:\n  content_hash: "not-a-digest"\n---\n' \
+    > src/route/Bad.md
+  _okf_stage src/route/Bad.md || return 1
+
+  local before_registry before_bad
+  before_registry="$(_okf_concept_bytes src/route/RouteRegistry.md)"
+  before_bad="$(_okf_concept_bytes src/route/Bad.md)"
+
+  # The marker is made last, so every file already in the copy is older than it
+  # and anything `find -newer` turns up afterwards was written by the run under
+  # test. `.git` is pruned: git's own index is refreshed by the `git status`
+  # below, which is this probe's doing and not okf's.
+  : > "$marker"
+  before_status="$(git status --porcelain)"
+
+  _okf_assert_check 'drifted: src/route/RouteRegistry.md' \
+    "a bundle with drift in it and a concept okf can only warn about" check
+
+  after_status="$(git status --porcelain)"
+  assert_eq "$before_status" "$after_status" \
+    "okf check leaves the work tree exactly as it found it"
+  touched="$(find . -path ./.git -prune -o -type f -newer "$marker" -print | sort)"
+  assert_eq "" "$touched" "and not one file in the copy was written to"
+  assert_eq "$before_registry" "$(_okf_concept_bytes src/route/RouteRegistry.md)" \
+    "the drifted concept is byte for byte as it was — no stale_after was stamped"
+  assert_eq "$before_bad" "$(_okf_concept_bytes src/route/Bad.md)" \
+    "and the concept okf warned about was not repaired behind the caller's back"
+
+  # "Always exits 0" over every state these probes can put the bundle in. Drift
+  # is the ordinary state of a repository between a refactor and the doc refresh
+  # that follows it: a check that failed the build for it would be turned off
+  # within a week, which is what SPEC.md §8's "CI warns, never gates" is about.
+  local okf="$TOOLKIT_ROOT/bin/okf"
+  assert_exit 0 "$okf" check
+  rm -f src/route/RouteSource.java
+  assert_exit 0 "$okf" check
+  git checkout -q -- src/route/RouteSource.java
+  git checkout -q -- src/route/RouteRegistry.java
+  rm -f src/route/Bad.md
+  git rm -q --cached src/route/Bad.md > /dev/null 2>&1
+  assert_exit 0 "$okf" check
+  assert_eq "" "$(last_output)" "and a clean bundle's run prints nothing at all"
+  return 0
+}
+
+test_okf_check_never_writes_and_always_exits_zero() {
+  with_fixture_repo concepts _okf_check_promises_probe
+}
+
+# The flags SPEC.md §7 gives `okf check`, and what it does with a line it cannot
+# carry out. Nothing here is about what the flags *do* — three later PLAN.md
+# items own that — only that check is the subcommand answering for them, so a
+# caller is never sent looking for a typo in a flag that is spelled right.
+_okf_check_flag_probe() {
+  local okf="$TOOLKIT_ROOT/bin/okf" flag out
+
+  for flag in --strict --stamp --json; do
+    out="$("$okf" check "$flag" 2>&1)" || true
+    case "$out" in
+      *"unknown flag"*)
+        _fail "okf check $flag is a flag check knows about" \
+          "check rejected it as unknown, which sends the caller looking for a" \
+          "typo in a flag SPEC.md §7 spells exactly that way:" "$out"
+        ;;
+      *) _pass "okf check $flag is a flag check knows about" ;;
+    esac
+  done
+
+  assert_exit 1 "$okf" check --nope
+  assert_contains "$(last_output)" "check: unknown flag: --nope" \
+    "a flag that is not one of the three is refused by name"
+  assert_contains "$(last_output)" "usage: okf check" \
+    "and the refusal says what check does take"
+
+  # A path is not an argument to check: SPEC.md §7 gives it none, and a caller
+  # who typed one meant something — one concept, one directory — that this
+  # cannot do. Answering with a whole-bundle report instead would be a run they
+  # did not ask for.
+  assert_exit 1 "$okf" check src/route/RouteRegistry.md
+  assert_contains "$(last_output)" "check takes no arguments" \
+    "a stray argument is refused rather than silently ignored"
+  return 0
+}
+
+test_okf_check_answers_for_its_own_flags() {
+  with_fixture_repo concepts _okf_check_flag_probe
+}
+
 # --- add new test_* functions above this line ------------------------------
 
 # ---------------------------------------------------------------------------
