@@ -1898,6 +1898,213 @@ test_okf_global_flags_resolve_the_root_and_config() {
   with_fixture_repo tiny _okf_global_flags_context_probe
 }
 
+# SPEC.md §6 is where okf.json's defaults are decided, so they are read back out
+# of its JSON block rather than restated here: a default changed there without
+# bin/okf following then fails as a mismatch instead of quietly never being
+# checked against anything.
+_okf_spec_config_json() {
+  awk '
+    /^## 6\./ { in_section = 1; next }
+    in_section && /^## / { exit }
+    in_section && /^```json$/ { in_block = 1; next }
+    in_block && /^```$/ { exit }
+    in_block { print }
+  ' "$TOOLKIT_ROOT/SPEC.md"
+}
+
+# The two things the init checks need before they can mean anything: a bin/okf
+# to run, and the jq SPEC.md §3 makes a hard requirement of it. jq is not an
+# extra dependency taken on here — a machine without it cannot run okf at all,
+# so there would be nothing for these checks to read back.
+_okf_init_preconditions() {
+  local okf="$TOOLKIT_ROOT/bin/okf"
+  if [ ! -x "$okf" ]; then
+    _fail "bin/okf is an executable script" "missing or not executable: $okf"
+    return 1
+  fi
+  if ! command -v jq > /dev/null 2>&1; then
+    _fail "jq is installed" \
+      "SPEC.md §3 makes jq a hard requirement of bin/okf, so okf could not have" \
+      "run here at all — install jq before reading anything into this failure"
+    return 1
+  fi
+  return 0
+}
+
+_okf_init_defaults_probe() {
+  local okf="$TOOLKIT_ROOT/bin/okf" spec expected actual
+
+  spec="$(_okf_spec_config_json)"
+  # Guards the extraction: were §6's block retitled or its fence changed past
+  # this, every comparison below would be against an empty string.
+  if [ -z "$spec" ]; then
+    _fail "SPEC.md §6 shows the okf.json defaults" \
+      "extracted no JSON block from the okf.json section"
+    return 1
+  fi
+  # §6's `index` block is dropped from both sides: SPEC.md §1 calls Tier B
+  # opt-in and §6 defines an exit 2 for a config without one, so a freshly
+  # initialised repo has to be without it. That it stays absent is asserted
+  # separately below — this comparison alone could not see it arrive.
+  if ! expected="$(printf '%s\n' "$spec" | jq -S 'del(.index)' 2>&1)"; then
+    _fail "SPEC.md §6's JSON block parses" "$expected"
+    return 1
+  fi
+
+  # The fixture is a source tree, not an initialised bundle. Were an okf.json
+  # already sitting here, init would refuse and everything below would be
+  # reading a file it never wrote.
+  if [ -e okf.json ]; then
+    _fail "the fixture repo starts without an okf.json" "already present under $PWD"
+    return 1
+  fi
+
+  assert_exit 0 "$okf" init
+  assert_contains "$(last_output)" "okf.json" "okf init says what it wrote"
+
+  if [ ! -f okf.json ]; then
+    _fail "okf init writes okf.json in the repo root" "no okf.json under $PWD"
+    return 1
+  fi
+  _pass "okf init writes okf.json in the repo root"
+
+  if ! actual="$(jq -S 'del(.index)' okf.json 2>&1)"; then
+    _fail "okf init writes parseable JSON" "$actual"
+    return 1
+  fi
+  assert_eq "$expected" "$actual" "okf init writes SPEC.md §6's defaults"
+  assert_eq "null" "$(jq -c '.index' okf.json)" \
+    "okf init writes no index block, so Tier B stays something to opt into"
+
+  # SPEC.md §7 gives every subcommand --config PATH, init included: it writes
+  # where it was told the settings live rather than to a hard-coded okf.json.
+  assert_exit 0 "$okf" --config okf.ci.json init
+  if [ ! -f okf.ci.json ]; then
+    _fail "okf --config PATH init writes PATH" "no okf.ci.json under $PWD"
+  else
+    assert_eq "$expected" "$(jq -S 'del(.index)' okf.ci.json)" \
+      "okf --config PATH init writes the same defaults to PATH"
+  fi
+
+  # ...and -C DIR, which has already moved the default okf.json to that root.
+  if ! mkdir -p sub; then
+    _fail "a subdirectory can be made in the fixture" "mkdir failed: $PWD/sub"
+  else
+    assert_exit 0 "$okf" -C sub init
+    if [ -f sub/okf.json ]; then
+      _pass "okf -C DIR init writes DIR's okf.json"
+    else
+      _fail "okf -C DIR init writes DIR's okf.json" "no sub/okf.json under $PWD"
+    fi
+  fi
+
+  # A mistyped flag is answered rather than acted on: `okf init --fore` must
+  # not be an init that quietly skipped the --force it was asked for. Both of
+  # these would exit 1 anyway on this now-initialised repo, so it is the named
+  # offender and not the status that tells the two refusals apart.
+  assert_exit 1 "$okf" init --fore
+  assert_contains "$(last_output)" "--fore" "okf init names a flag it does not know"
+  assert_exit 1 "$okf" init extra
+  assert_contains "$(last_output)" "extra" "okf init names an argument it does not take"
+  return 0
+}
+
+_okf_init_force_probe() {
+  local okf="$TOOLKIT_ROOT/bin/okf" before out
+
+  assert_exit 0 "$okf" init
+  # Replaced with something nobody would mistake for what init writes, so an
+  # overwrite below is seen rather than inferred.
+  printf '{"okf_version": "hand-edited"}\n' > okf.json
+  before="$(cat okf.json)"
+
+  assert_exit 1 "$okf" init
+  out="$(last_output)"
+  assert_contains "$out" "okf.json" "the refusal names the file in the way"
+  assert_contains "$out" "--force" "the refusal says how to overwrite it anyway"
+  assert_eq "$before" "$(cat okf.json)" "a refused init leaves the file exactly as it was"
+
+  # Existence is what the refusal turns on, not content: okf cannot tell a
+  # config somebody tuned by hand from one it wrote itself, and an empty file
+  # is still somebody's.
+  : > okf.json
+  assert_exit 1 "$okf" init
+  if [ -f okf.json ] && [ ! -s okf.json ]; then
+    _pass "an empty okf.json is still an okf.json"
+  else
+    _fail "an empty okf.json is still an okf.json" \
+      "okf init wrote over it, or removed it"
+  fi
+
+  # --force is the caller saying they know which of the two it is.
+  printf '{"okf_version": "hand-edited"}\n' > okf.json
+  assert_exit 0 "$okf" init --force
+  assert_eq "0.2" "$(jq -r '.okf_version // empty' okf.json 2>/dev/null)" \
+    "okf init --force overwrites what was there"
+
+  # ...and on a repo with no okf.json at all it is just init.
+  rm -f okf.json
+  assert_exit 0 "$okf" init --force
+  assert_eq "0.2" "$(jq -r '.okf_version // empty' okf.json 2>/dev/null)" \
+    "okf init --force also writes an okf.json that is not there yet"
+
+  # A symlinked okf.json is refused both ways, --force included: a redirection
+  # writes through the link, so the file destroyed would be the one it points
+  # at — somewhere else entirely, and outside the repo as often as not.
+  local shared="$FIXTURE_DIR/shared.json" was
+  was='{"okf_version": "pointed-at"}'
+  printf '%s\n' "$was" > "$shared"
+  rm -f okf.json
+  if ! ln -s "$shared" okf.json; then
+    _fail "a symlinked okf.json can be made in the fixture" "ln -s failed"
+  else
+    assert_exit 1 "$okf" init
+    assert_contains "$(last_output)" "link" "okf init says a symlinked okf.json is a link"
+    assert_exit 1 "$okf" init --force
+    assert_contains "$(last_output)" "link" \
+      "okf init --force says so too, rather than writing through it"
+    assert_eq "$was" "$(cat "$shared")" \
+      "okf init --force does not write through a symlinked okf.json"
+    if [ -L okf.json ]; then
+      _pass "and does not quietly replace the link either"
+    else
+      _fail "and does not quietly replace the link either" "the symlink is gone"
+    fi
+    rm -f okf.json
+  fi
+  rm -f "$shared"
+
+  # An error okf cannot avoid is still okf's to report: bash's own diagnostic
+  # names a line number inside bin/okf, which tells the caller nothing they can
+  # act on, and it arrives first.
+  if ! mkdir okf.json; then
+    _fail "a directory can be made where okf.json goes" "mkdir failed: $PWD/okf.json"
+  else
+    assert_exit 1 "$okf" init --force
+    out="$(last_output)"
+    assert_eq 1 "$(_okf_line_count "$out")" \
+      "a write okf cannot do is reported in one line, not in two"
+    assert_contains "$out" "okf.json" "and that line names the file"
+    rmdir okf.json
+  fi
+  return 0
+}
+
+# SPEC.md §6 defines okf.json's contents and §7 makes writing it `okf init`.
+test_okf_init_writes_the_spec_defaults() {
+  _okf_init_preconditions || return 1
+  # In a throwaway repo, not the checkout: `okf init` here would drop an
+  # okf.json into the toolkit itself.
+  with_fixture_repo tiny _okf_init_defaults_probe
+}
+
+# The other half of the same PLAN.md item: an existing okf.json is not
+# overwritten without --force.
+test_okf_init_refuses_to_overwrite_without_force() {
+  _okf_init_preconditions || return 1
+  with_fixture_repo tiny _okf_init_force_probe
+}
+
 # --- add new test_* functions above this line ------------------------------
 
 # ---------------------------------------------------------------------------

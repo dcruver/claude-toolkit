@@ -18,7 +18,7 @@ there). Items are ordered so none depends on a later one. Every item verifies wi
 
 ## Phase 2 — Tier A: bundle initialisation
 
-- [ ] Implement okf init in bin/okf to write okf.json containing the SPEC.md §6 defaults, refusing to overwrite an existing okf.json without --force (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
+- [x] Implement okf init in bin/okf to write okf.json containing the SPEC.md §6 defaults, refusing to overwrite an existing okf.json without --force (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Extend okf init in bin/okf to also write the bundle-root index.md with type Codebase carrying the only legal okf_version key, refusing to overwrite an existing bundle-root index.md without --force (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 
 ## Phase 3 — Tier A: scope and metrics
