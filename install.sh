@@ -207,4 +207,5 @@ esac
 echo
 echo "Done. Verify with: ralph --help and okf --help"
 echo "And in Claude Code: /onboard, /ralph-spec, /tdd-audit, /tdd-plan, /tdd-generate, /adversarial-pair,"
-echo "/clarify, /explain, /critique, /tighten, /okf-init, /okf-generate should now be available."
+echo "/clarify, /explain, /critique, /tighten, /okf-init, /okf-generate, /okf-refresh"
+echo "should now be available."

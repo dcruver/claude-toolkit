@@ -9611,6 +9611,354 @@ test_okf_generate_command_authors_tiered_concepts() {
     "it hands confirming the drafts on to /okf-verify"
 }
 
+# Rewrites one frontmatter field of a concept in place, the way an Edit would:
+# the named line replaced whole, every other byte carried across. Used by the
+# probes below to act out what commands/okf-refresh.md tells the reader to
+# write, so what is checked is the outcome of following the document rather
+# than the document's wording.
+_okf_rewrite_field() { # $1 = concept path, $2 = the line's leading spaces + key, $3 = the new value
+  local concept="$1" prefix="$2" value="$3" tmp="$concept.rewrite"
+  awk -v prefix="$prefix" -v value="$value" '
+    !done && index($0, prefix ": ") == 1 { print prefix ": " value; done = 1; next }
+    { print }
+    END { exit done ? 0 : 1 }
+  ' "$concept" > "$tmp" || {
+    rm -f "$tmp"
+    return 1
+  }
+  mv "$tmp" "$concept"
+}
+
+# Grounds the whole of commands/okf-refresh.md's step 4 against bin/okf: that a
+# changed source really is reported on the `drifted:` line the document reads
+# its work list from, that storing `okf hash`'s output verbatim and quoted is
+# what clears it, and that the line-at-a-time write the document prescribes
+# leaves the `verified` block — the one thing §8 says is never removed —
+# exactly where it was.
+_okf_refresh_drift_probe() {
+  local okf="$TOOLKIT_ROOT/bin/okf"
+  local concept="src/route/RouteRegistry.md" source="src/route/RouteRegistry.java"
+
+  # The fixture ships in step, so anything reported below is the edit and not
+  # the fixture. Without this a fixture that had drifted all along would make
+  # every check here pass for the wrong reason.
+  if printf '%s\n' "$("$okf" check 2> /dev/null)" | grep -Fq "drifted: $concept"; then
+    _fail "the concepts fixture starts in step with its sources" \
+      "$concept is already drifted before this probe changed anything"
+    return 1
+  fi
+  _pass "the concepts fixture starts in step with its sources"
+
+  # Every bail below records a failure before it returns. with_fixture_repo's
+  # status is discarded at the call site — as it is for every probe in this
+  # file — so a `return 1` that recorded nothing would leave the checks after
+  # it unrun on a suite that still prints PASS.
+  if ! printf '\n// a line the concept says nothing about\n' >> "$source" \
+    || ! git add -A > /dev/null 2>&1 \
+    || ! git commit -qm 'a source change the concept has not caught up with' \
+      > /dev/null 2>&1; then
+    _fail "the fixture source can be changed and committed" \
+      "could not write and commit $source under $PWD"
+    return 1
+  fi
+
+  local out
+  out="$("$okf" check 2> /dev/null)"
+  assert_contains "$out" "drifted: $concept" \
+    "okf check reports a changed source as drifted: <concept>"
+
+  # SPEC.md §8 defines drift as the stored digest against the source's current
+  # one, so the repair is the digest okf itself prints — stored verbatim, with
+  # the quotes the frontmatter contract asks for and no other edit to the file.
+  local fresh
+  if ! fresh="$("$okf" hash "$source")"; then
+    _fail "okf hash prints the changed source's digest" \
+      "okf hash $source failed, so there is no digest to store"
+    return 1
+  fi
+  _okf_rewrite_field "$concept" "  content_hash" "\"$fresh\"" || {
+    _fail "the concept's code.content_hash line can be rewritten in place" \
+      "no '  content_hash: ' line in $concept"
+    return 1
+  }
+
+  out="$("$okf" check 2> /dev/null)"
+  if printf '%s\n' "$out" | grep -Fq "drifted: $concept"; then
+    _fail "okf hash's output stored verbatim clears the drift" \
+      "$concept is still reported drifted after storing $fresh" \
+      "the confirming re-run in commands/okf-refresh.md step 5 would never pass"
+  else
+    _pass "okf hash's output stored verbatim clears the drift"
+  fi
+
+  # The rule the rest of the document is built around: a refresh restamps the
+  # hash and leaves the history of who read this concept alone.
+  assert_eq "1" "$(grep -c 'by: human:dcruver' "$concept")" \
+    "the human verified entry survives the restamp"
+  assert_eq "1" "$(grep -c 'by: process:okf/0.2' "$concept")" \
+    "the machine verified entry survives the restamp"
+
+  # And why step 1 tells the reader to keep stderr: a stored hash that is not a
+  # digest is warned about and left off the drifted list, so a run reading only
+  # stdout never learns that this concept has stopped being checkable at all.
+  if ! _okf_rewrite_field "$concept" "  content_hash" '"sha256:not-a-digest"'; then
+    _fail "the concept's code.content_hash line can be rewritten in place" \
+      "no '  content_hash: ' line in $concept"
+    return 1
+  fi
+  local err="$HARNESS_STATE/okf-refresh-check-stderr"
+  out="$("$okf" check 2> "$err")"
+  if printf '%s\n' "$out" | grep -Fq "drifted: $concept"; then
+    _fail "a malformed code.content_hash is not reported as drift" \
+      "bin/okf now puts $concept on the drifted list without comparing anything," \
+      "so commands/okf-refresh.md should read it off stdout like any other"
+  else
+    _pass "a malformed code.content_hash is not reported as drift"
+  fi
+  assert_contains "$(cat "$err")" "$concept" \
+    "okf check warns about the unreadable code.content_hash on stderr"
+  return 0
+}
+
+# Grounds the trust-tier paragraph in step 4: moving `generated.at` past an
+# existing `human:` review is what drops a concept from Human-reviewed to
+# Machine-confirmed, and the entry has to still be there for either answer to
+# be computable. `okf verify` is what prints the tier, so it is what is asked —
+# with a `process:` actor, so the appended entry cannot itself earn the tier
+# and what is read back is the fixture's own human review.
+_okf_refresh_trust_probe() {
+  local okf="$TOOLKIT_ROOT/bin/okf"
+  local concept="src/route/RouteRegistry.md"
+
+  local out
+  out="$("$okf" verify "$concept" --by process:okf/0.2 2>&1)"
+  assert_contains "$out" "trust: Human-reviewed" \
+    "a human review no older than generated.at earns Human-reviewed"
+
+  # What step 4 does to that concept: the prose is rewritten now, so
+  # generated.at moves to now — here, to any instant after the fixture's
+  # review at 2026-08-26T16:40:00Z.
+  _okf_rewrite_field "$concept" "  at" "2026-08-27T00:00:00Z" || {
+    _fail "the concept's generated.at line can be rewritten in place" \
+      "no '  at: ' line in $concept"
+    return 1
+  }
+  out="$("$okf" verify "$concept" --by process:okf/0.2 2>&1)"
+  assert_contains "$out" "trust: Machine-confirmed" \
+    "a generated.at moved past the review degrades it to Machine-confirmed"
+  assert_eq "1" "$(grep -c 'by: human:dcruver' "$concept")" \
+    "and the review it is measured against is still in the file"
+  return 0
+}
+
+# SPEC.md §11 once more, for the command that edits concepts somebody may
+# already have reviewed. What is pinned is the seam it sits on: `okf check` for
+# the work list, `okf hash` for the digest that closes it, `okf fanin` for the
+# tier, and SPEC.md §8's two rules that make a refresh safe — the pair of
+# fields that move together, and the `verified` entries that never move at all.
+#
+# The frontmatter of the document itself is checked for every command file by
+# test_commands_have_frontmatter_description; only what is specific to this one
+# is asserted here.
+test_okf_refresh_command_reauthors_drifted_concepts() {
+  local doc="$TOOLKIT_ROOT/commands/okf-refresh.md"
+  if [ ! -f "$doc" ]; then
+    _fail "commands/okf-refresh.md exists" "no such file: $doc"
+    return 1
+  fi
+  _okf_preconditions || return 1
+
+  local body_text
+  body_text="$(_command_body "$doc")"
+  if [ -z "$body_text" ]; then
+    _fail "commands/okf-refresh.md has a body below its frontmatter" \
+      "nothing follows the frontmatter block in $doc"
+    return 1
+  fi
+
+  # It narrows its run with $ARGUMENTS, and SPEC.md §11 asks for an
+  # argument-hint from any command that takes arguments — it is what Claude
+  # Code shows the user at the prompt, so an undocumented argument is an
+  # invisible one. CR stripped first, as the sibling frontmatter check does.
+  if grep -q '\$ARGUMENTS' "$doc"; then
+    if awk '{ sub(/\r$/, "") }
+            NR == 1 && $0 != "---" { exit 1 }
+            NR > 1 && $0 == "---" { exit 1 }
+            NR > 1 && /^argument-hint:[[:space:]]*[^[:space:]]/ { found = 1; exit 0 }
+            END { exit found ? 0 : 1 }' "$doc"; then
+      _pass "commands/okf-refresh.md documents its arguments with an argument-hint"
+    else
+      _fail "commands/okf-refresh.md documents its arguments with an argument-hint" \
+        "it takes \$ARGUMENTS but its frontmatter has no non-empty" \
+        "argument-hint line"
+    fi
+  fi
+
+  # The three shell calls this command sits on: what has drifted, the ranking
+  # signal that re-tiers it, and the digest that closes the drift.
+  assert_contains "$body_text" 'okf check' \
+    "it takes its work list from okf check"
+  assert_contains "$body_text" 'okf hash' \
+    "it restamps code.content_hash from okf hash"
+  assert_contains "$body_text" 'okf fanin' \
+    "it re-reads the ranking signal with okf fanin"
+
+  # Every subcommand it names has to be one bin/okf actually dispatches, and
+  # one that is not still a stub. Same collection rule as the sibling command
+  # checks: only backticked `okf <name>` mentions, in either voice, because a
+  # prohibition written as code is still a name a reader may go and run.
+  local -a named=()
+  local sub
+  while IFS= read -r sub; do
+    [ -n "$sub" ] && named+=("$sub")
+  done < <(printf '%s\n' "$body_text" | grep -oE '`okf [a-z][a-z-]*' |
+    awk '{print $2}' | sort -u)
+  if [ "${#named[@]}" -eq 0 ]; then
+    _fail "commands/okf-refresh.md names the okf subcommands it runs" \
+      "no 'okf <subcommand>' mention found in the document"
+    return 1
+  fi
+  local okf="$TOOLKIT_ROOT/bin/okf"
+  local dispatched
+  dispatched="$(_okf_dispatch_subcommands)"
+  if [ -z "$dispatched" ]; then
+    _fail "bin/okf lists the subcommands it dispatches" \
+      "no OKF_SUBCOMMANDS array in bin/okf, or it is empty"
+    return 1
+  fi
+  for sub in "${named[@]}"; do
+    if ! printf '%s\n' "$dispatched" | grep -Fqx -- "$sub"; then
+      _fail "commands/okf-refresh.md names a working subcommand: okf $sub" \
+        "bin/okf's OKF_SUBCOMMANDS does not list $sub, so dispatch would" \
+        "reject it as an unknown subcommand"
+    elif ! grep -qE "^cmd_$sub\(\)" "$okf"; then
+      _fail "commands/okf-refresh.md names a working subcommand: okf $sub" \
+        "bin/okf has no cmd_$sub function, so this document tells the reader" \
+        "to run a subcommand that does not exist"
+    elif grep -qE "(^|[^_[:alnum:]])not_implemented[[:space:]]+$sub([^_[:alnum:]]|\$)" "$okf"; then
+      _fail "commands/okf-refresh.md names a working subcommand: okf $sub" \
+        "cmd_$sub in bin/okf is still a not_implemented stub" \
+        "if the mention is not an instruction to run it, name it as a bare" \
+        "word — only backticked 'okf <name>' mentions are collected"
+    else
+      _pass "commands/okf-refresh.md names a working subcommand: okf $sub"
+    fi
+  done
+
+  # The item's own two fields, named as SPEC.md §4 spells them. They are one
+  # write: a hash advanced past a body nobody re-read makes the concept report
+  # itself clean for ever, and a generated.at moved without the hash leaves it
+  # drifted while claiming a rewrite.
+  assert_contains "$body_text" 'code.content_hash' \
+    "it restamps code.content_hash"
+  assert_contains "$body_text" 'generated.at' \
+    "it restamps generated.at"
+  assert_contains "$body_text" 'generated.by' \
+    "it says who the refreshed prose is attributed to"
+
+  # SPEC.md §8: verified entries are historical facts and are never stripped.
+  # This is the one command that rewrites a body somebody may have reviewed, so
+  # the prohibition has to be in it in words.
+  if printf '%s\n' "$body_text" | grep -qiE 'verified.{0,80}never|never.{0,80}verified' \
+    || printf '%s\n' "$body_text" | grep -qiE 'verified: .{0,60}(never|not) (removed|edited)'; then
+    _pass "commands/okf-refresh.md says a verified entry is never removed"
+  else
+    _fail "commands/okf-refresh.md says a verified entry is never removed" \
+      "SPEC.md §8 calls verified entries historical facts that are never" \
+      "stripped, and nothing in this document states it"
+  fi
+
+  # And the consequence of restamping generated.at, which SPEC.md §8 computes
+  # and this document has to own rather than work around: the concept drops out
+  # of Human-reviewed until somebody reads it again.
+  local tier
+  for tier in "Human-reviewed" "Machine-confirmed"; do
+    assert_contains "$body_text" "$tier" \
+      "it says what the restamp does to SPEC.md §8's $tier tier"
+  done
+
+  # `stale_after` is okf check --stamp's mark at the instant drift was
+  # detected, and this run resolves that drift. Left behind it ships fresh
+  # prose marked stale — and a stamp already in the past is never moved again.
+  assert_contains "$body_text" 'stale_after' \
+    "it says what to do with the stale_after a stamped check left behind"
+
+  # SPEC.md §5's tier rules are decided against okf.json's thresholds. A
+  # refresh re-tiers, so it reads the same keys /okf-generate does — a tier
+  # recomputed from remembered defaults ignores every repo that tuned them.
+  local -a thresholds=()
+  local key
+  while IFS= read -r key; do
+    [ -n "$key" ] && thresholds+=("$key")
+  done < <(_okf_spec_tier_threshold_keys)
+  if [ "${#thresholds[@]}" -eq 0 ]; then
+    _fail "SPEC.md §6 declares the tier thresholds" \
+      "extracted no keys from the tiers block of §6's okf.json"
+    return 1
+  fi
+  local value
+  for key in "${thresholds[@]}"; do
+    assert_contains "$body_text" "$key" \
+      "it re-tiers against okf.json's $key"
+    # Written out in full for the same reason /okf-generate writes it out:
+    # SPEC.md ships with claude-toolkit and not with the repo the command runs
+    # in, so a threshold retuned in §6 and not here re-tiers every bundle
+    # without a `tiers` block against the old number.
+    value="$(_okf_spec_config_json | jq -r --arg k "$key" '.tiers[$k]')"
+    # Matched to the end of the number, not as a substring: `tier0_max_loc: 15`
+    # is a prefix of `tier0_max_loc: 150`, so a plain contains would pass on
+    # exactly the retuned-and-not-copied value this check exists to catch.
+    if printf '%s\n' "$body_text" | grep -qE "$key: $value([^0-9]|\$)"; then
+      _pass "and it writes $key's default out as SPEC.md §6 has it"
+    else
+      _fail "and it writes $key's default out as SPEC.md §6 has it" \
+        "SPEC.md §6 sets $key to $value and the document does not write that" \
+        "value out — every bundle without a tiers block would re-tier against" \
+        "whatever it says instead"
+    fi
+  done
+
+  # The three kinds of line `okf check` prints. Two of them are not this
+  # command's, and a document that does not name them is one whose reader
+  # silently invents a repair for an orphan — which is a deletion, and takes a
+  # verified history with it.
+  # Matched with the colon okf check prints them with: a bare `missing` is
+  # satisfied by any sentence about a missing tool or by `okf list --missing`,
+  # and the check would then hold for a document that never names the finding.
+  local kind
+  for kind in drifted missing orphan; do
+    assert_contains "$body_text" "$kind: " \
+      "it says what it does with okf check's \"$kind: \" findings"
+  done
+
+  # The house-style pair from commands/onboard.md.
+  if printf '%s\n' "$body_text" | grep -qi 'stop there'; then
+    _pass "commands/okf-refresh.md has an explicit stopping point"
+  else
+    _fail "commands/okf-refresh.md has an explicit stopping point" \
+      "no 'Stop there' in the document — SPEC.md §11 asks every okf-* command" \
+      "for one, in the style of commands/onboard.md"
+  fi
+  if printf '%s\n' "$body_text" | grep -qi 'non-goal'; then
+    _pass "commands/okf-refresh.md states its non-goals explicitly"
+  else
+    _fail "commands/okf-refresh.md states its non-goals explicitly" \
+      "the words 'non-goal' appear nowhere in the document"
+  fi
+
+  # The two handoffs that keep this command from growing into the others:
+  # authoring a concept from nothing is /okf-generate's, and confirming one is
+  # /okf-verify's — which is where every concept this run restamped ends up.
+  assert_contains "$body_text" '/okf-generate' \
+    "it hands authoring a missing concept on to /okf-generate"
+  assert_contains "$body_text" '/okf-verify' \
+    "it hands confirming the refreshed prose on to /okf-verify"
+
+  # And the seam itself, against bin/okf rather than against the prose.
+  with_fixture_repo concepts _okf_refresh_drift_probe
+  with_fixture_repo concepts _okf_refresh_trust_probe
+}
+
 # --- add new test_* functions above this line ------------------------------
 
 # ---------------------------------------------------------------------------
