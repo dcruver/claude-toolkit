@@ -75,7 +75,7 @@ there). Items are ordered so none depends on a later one. Every item verifies wi
 
 - [x] Implement okf embed in bin/okf to request embeddings from the OpenAI-shaped /v1/embeddings endpoint configured in okf.json using curl, with tests driving a fake curl placed on PATH and asserting the request body, never touching the network per SPEC.md §10 (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [x] Extend okf embed in bin/okf to create the Qdrant collection over its REST API with cosine distance and embedding_dim when it does not already exist, asserted against a fake curl on PATH (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
-- [ ] Extend okf embed in bin/okf to upsert one point per chunk carrying the SPEC.md §9 payload and a deterministic UUIDv5-shaped point id, asserted against a fake curl on PATH (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
+- [x] Extend okf embed in bin/okf to upsert one point per chunk carrying the SPEC.md §9 payload and a deterministic UUIDv5-shaped point id, asserted against a fake curl on PATH (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Implement okf search in bin/okf to embed the query text and search Qdrant over REST with a --k limit, driven by a fake curl placed on PATH (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Add the optional --repo and --type payload filters to okf search in bin/okf, asserted against the request body sent to a fake curl on PATH (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Extend okf search in bin/okf to group hits by concept_id so a method hit returns its parent concept alongside it, showing each result's trust tier (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh

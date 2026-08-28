@@ -9403,6 +9403,9 @@ test_okf_chunk_gives_every_method_chunk_its_own_symbol() {
 #   OKF_FAKE_CURL_COLLECTION_DISTANCE  what it measures with (default Cosine)
 #   OKF_FAKE_CURL_QDRANT_STATUS  the status every Qdrant request answers with
 #   OKF_FAKE_CURL_CREATE_STATUS  the status the creating PUT answers with
+#   OKF_FAKE_CURL_POINTS_STATUS  the status an upsert to /points answers with
+#   OKF_FAKE_CURL_VECTOR_MARK    number the vectors, so a point can be shown to
+#                                carry the vector of its own chunk
 #   OKF_FAKE_CURL_QDRANT_BODY    a canned Qdrant response body
 #   OKF_FAKE_CURL_QDRANT_EXIT    fail the way an unreachable Qdrant fails
 OKF_FAKE_CURL_BIN=""
@@ -9477,12 +9480,23 @@ if [ "$kind" = "qdrant" ]; then
     exit "$code"
   fi
 
+  # An upsert is a PUT to the points endpoint, and the collection itself is a
+  # PUT to the path above it — told apart by the path, because the method alone
+  # cannot tell them apart and a run that took an upsert for a creation would
+  # answer 409 to the second concept in the bundle.
+  points=0
+  case "$url" in
+    */points | */points\?*) points=1 ;;
+  esac
+
   # A collection the run has already created is there for the rest of it, the
   # way a real Qdrant would have it — so a second GET in one run cannot answer
   # 404 to a collection okf just made.
   status="${OKF_FAKE_CURL_QDRANT_STATUS:-}"
   if [ -z "$status" ]; then
-    if [ "$method" = "PUT" ]; then
+    if [ "$points" -eq 1 ]; then
+      status="${OKF_FAKE_CURL_POINTS_STATUS:-200}"
+    elif [ "$method" = "PUT" ]; then
       status="${OKF_FAKE_CURL_CREATE_STATUS:-200}"
     elif [ "${OKF_FAKE_CURL_COLLECTION:-missing}" = "present" ] \
       || [ -e "$dir/collection-created" ]; then
@@ -9491,12 +9505,18 @@ if [ "$kind" = "qdrant" ]; then
       status="404"
     fi
   fi
-  [ "$method" = "PUT" ] && case "$status" in 2??) : > "$dir/collection-created" ;; esac
+  if [ "$points" -eq 0 ] && [ "$method" = "PUT" ]; then
+    case "$status" in 2??) : > "$dir/collection-created" ;; esac
+  fi
 
   if [ -n "${OKF_FAKE_CURL_QDRANT_BODY+set}" ]; then
     printf '%s' "$OKF_FAKE_CURL_QDRANT_BODY"
   elif [ "$status" = "404" ]; then
     printf '%s' '{"status": {"error": "Not found: Collection does not exist!"}, "time": 0.0}'
+  elif [ "$points" -eq 1 ]; then
+    # What Qdrant answers an upsert it has applied — `completed` and not
+    # `acknowledged`, which is the difference `?wait=true` buys.
+    printf '%s' '{"result": {"operation_id": 0, "status": "completed"}, "status": "ok", "time": 0.0}'
   elif [ "$method" = "GET" ]; then
     # What Qdrant answers about a collection it has: the config it was created
     # with, which is where its width and distance are fixed for good.
@@ -9524,12 +9544,18 @@ fi
 if [ -n "${OKF_FAKE_CURL_BODY+set}" ]; then
   printf '%s' "$OKF_FAKE_CURL_BODY"
 else
-  printf '%s' "$body" | jq -c --argjson dim "${OKF_FAKE_CURL_DIM:-4}" '
+  # With OKF_FAKE_CURL_VECTOR_MARK set, each vector's first component is the
+  # position of the text it came back for, so a test can show that a point
+  # carries the vector of its own chunk rather than of a sibling. Off by
+  # default: every other test wants vectors it does not have to think about.
+  printf '%s' "$body" | jq -c --argjson dim "${OKF_FAKE_CURL_DIM:-4}" \
+    --arg mark "${OKF_FAKE_CURL_VECTOR_MARK:-}" '
     {object: "list",
      model: .model,
      data: [ .input | to_entries[]
              | {object: "embedding", index: .key,
-                embedding: [range(0; $dim) | 0.25]} ]}'
+                embedding: (if $mark == "" then [range(0; $dim) | 0.25]
+                            else [.key] + [range(1; $dim) | 0.25] end)} ]}'
 fi
 [ -n "$wout" ] && [ -z "${OKF_FAKE_CURL_NO_STATUS:-}" ] && printf '\n%s' "${OKF_FAKE_CURL_STATUS:-200}"
 exit 0
@@ -9639,6 +9665,68 @@ _okf_embed_kind_count() { # $1 = qdrant or embeddings
 # The recorded request number of the nth request to one endpoint, from 1.
 _okf_embed_nth_of_kind() { # $1 = qdrant or embeddings, $2 = which, from 1
   _okf_embed_requests_of_kind "$1" | sed -n "$2p"
+}
+
+# How many of that run's requests went to one exact URL — which is how a check
+# about the collection stays a check about the collection now that the upserts
+# beneath it are Qdrant requests too.
+_okf_embed_url_count() { # $1 = the URL
+  local url n=0
+  while IFS= read -r url; do
+    [ "$url" = "$1" ] && n=$((n + 1))
+  done < <(_okf_embed_urls)
+  printf '%s\n' "$n"
+}
+
+# The request numbers of the upserts a run made, in order: the Qdrant requests
+# that went to the points endpoint rather than to the collection itself.
+_okf_embed_upserts() {
+  local url n=0
+  while IFS= read -r url; do
+    n=$((n + 1))
+    case "$url" in
+      */points | */points\?*) printf '%s\n' "$n" ;;
+    esac
+  done < <(_okf_embed_urls)
+  return 0
+}
+
+# How many upserts that run made, and the recorded request number of the nth.
+_okf_embed_upsert_count() {
+  _okf_embed_upserts | wc -l | tr -d ' '
+}
+_okf_embed_nth_upsert() { # $1 = which, from 1
+  _okf_embed_upserts | sed -n "$1p"
+}
+
+# Every point ID that run wrote, in the order the points were written.
+_okf_embed_point_ids() {
+  local n
+  while IFS= read -r n; do
+    _okf_embed_request "$n" '.points[].id'
+  done < <(_okf_embed_upserts)
+  return 0
+}
+
+# SPEC.md §9's point ID, worked out here from §9's own sentence rather than read
+# back out of okf: "a UUIDv5-shaped digest of
+# `{repo}|{concept_id}|{chunk_kind}|{symbol}`". Written out a second time on
+# purpose — an assertion that took the ID from the request it is checking would
+# agree with whatever okf happened to send. What this cannot check is the shape
+# itself, since it lays the digest out the same way; that is asserted separately
+# against a pattern.
+_okf_expected_point_id() { # $1 = repo, $2 = concept_id, $3 = chunk_kind, $4 = symbol
+  local digest variant
+  digest="$(printf '%s|%s|%s|%s' "$1" "$2" "$3" "$4" | sha256sum)" || return 1
+  digest="${digest%% *}"
+  case "${digest:16:1}" in
+    0 | 4 | 8 | c) variant=8 ;;
+    1 | 5 | 9 | d) variant=9 ;;
+    2 | 6 | a | e) variant=a ;;
+    *) variant=b ;;
+  esac
+  printf '%s-%s-5%s-%s%s-%s\n' "${digest:0:8}" "${digest:8:4}" "${digest:13:3}" \
+    "$variant" "${digest:17:3}" "${digest:20:12}"
 }
 
 # The `chunks` fixture's concepts, in the order `okf embed` walks them — which
@@ -9757,6 +9845,17 @@ _okf_embed_settings_probe() {
   _okf_index_block . '{"embedding_dim": 0}' || return 1
   _okf_embed || return 1
   assert_eq "1" "$OKF_EMBED_RC" "a zero-width embedding_dim is refused too"
+
+  # `index.repo` is a payload field rather than an endpoint setting, so nothing
+  # in the run needs it until the first concept is read — but it is read up
+  # front all the same, because being told it is unusable after a collection
+  # has been created for the run is being told too late.
+  _okf_index_block . '{"repo": 7, "embedding_dim": 4}' || return 1
+  _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "a repo that is not a string is refused"
+  assert_contains "$OKF_EMBED_ERR" "index.repo" "naming the setting"
+  assert_eq "0" "$(_okf_embed_request_count)" \
+    "before Qdrant is so much as asked after, let alone given a collection"
 
   _okf_index_block . '{"embedding_url": 7}' || return 1
   _okf_embed || return 1
@@ -9910,7 +10009,10 @@ _okf_embed_collection_probe() {
   assert_eq "$(printf '%s\n' qdrant qdrant)" \
     "$(_okf_embed_request_kinds | head -2)" \
     "the collection is settled before a single chunk is embedded"
-  assert_eq "2" "$(_okf_embed_kind_count qdrant)" \
+  # Counted over the collection's own path rather than over every Qdrant
+  # request: the upserts that follow go to /points under it, and belong to
+  # _okf_embed_upsert_probe rather than to this item.
+  assert_eq "2" "$(_okf_embed_url_count "$qdrant/collections/$collection")" \
     "and settled once for the run, not once per concept"
 
   # The existence check: a GET to the collection's own REST path, carrying no
@@ -9938,7 +10040,7 @@ _okf_embed_collection_probe() {
   # time would fail on the second run against a working bundle.
   OKF_FAKE_CURL_COLLECTION=present OKF_FAKE_CURL_DIM=4 _okf_embed || return 1
   assert_eq "0" "$OKF_EMBED_RC" "a bundle whose collection exists embeds without incident"
-  assert_eq "1" "$(_okf_embed_kind_count qdrant)" \
+  assert_eq "1" "$(_okf_embed_url_count "$qdrant/collections/$collection")" \
     "an existing collection is asked after and then left alone"
   assert_eq "GET" "$(_okf_embed_method 1)" "with nothing but the question sent"
   assert_eq "4" "$(_okf_embed_kind_count embeddings)" \
@@ -10004,6 +10106,211 @@ _okf_embed_collection_probe() {
 test_okf_embed_creates_the_qdrant_collection_when_it_is_missing() {
   _okf_preconditions || return 1
   with_fixture_repo chunks _okf_embed_collection_probe
+}
+
+# PLAN.md's Phase 10 upsert item, and SPEC.md §9's points: "One collection",
+# one point per chunk, each carrying §9's payload and an ID that is "a
+# UUIDv5-shaped digest of `{repo}|{concept_id}|{chunk_kind}|{symbol}` so upserts
+# are idempotent and deletes targeted".
+#
+# The collection is told to be there already, so that every Qdrant request after
+# the first is an upsert and the arithmetic below is about points rather than
+# about which run created what.
+_okf_embed_upsert_probe() {
+  local qdrant="http://qdrant.invalid:6333" collection="probe_points"
+  local repo="probe-repo" points="$qdrant/collections/probe_points/points?wait=true"
+  _okf_index_block . \
+    "{\"repo\": \"$repo\", \"qdrant_url\": \"$qdrant\", \"collection\": \"$collection\",
+      \"embedding_url\": \"http://embeddings.invalid/v1/embeddings\", \"embedding_dim\": 4}" \
+    || return 1
+
+  OKF_FAKE_CURL_COLLECTION=present OKF_FAKE_CURL_DIM=4 OKF_FAKE_CURL_VECTOR_MARK=1 \
+    _okf_embed || return 1
+  assert_eq "0" "$OKF_EMBED_RC" "okf embed exits 0 having upserted what it embedded"
+
+  # One upsert per concept, and each one right after the request that embedded
+  # that concept — so a run that fell over on its fifth concept has still
+  # stored the four before it.
+  assert_eq "4" "$(_okf_embed_upsert_count)" "one upsert per concept that had chunks"
+  assert_eq "$(printf '%s\n' qdrant embeddings qdrant embeddings qdrant \
+    embeddings qdrant embeddings qdrant)" \
+    "$(_okf_embed_request_kinds)" \
+    "each concept is stored before the next one is embedded"
+
+  # SPEC.md §9 reaches Qdrant over REST, where an upsert is a PUT to the points
+  # endpoint under the collection. `?wait=true` is what makes the 200 mean the
+  # points are stored rather than merely accepted, which is what the run's own
+  # report goes on to claim.
+  local sent_to
+  sent_to="$(_okf_embed_upserts | while IFS= read -r n; do _okf_embed_url "$n"; done)"
+  assert_eq "$(printf '%s\n' "$points" "$points" "$points" "$points")" "$sent_to" \
+    "every upsert goes to the points endpoint of the configured collection"
+  local first
+  first="$(_okf_embed_nth_upsert 1)"
+  assert_eq "PUT" "$(_okf_embed_method "$first")" "an upsert is a PUT, which is Qdrant's upsert"
+  assert_contains "$(_okf_embed_argv "$first")" "Content-Type: application/json" \
+    "declaring a JSON body"
+
+  # One point per chunk, across the whole run: `okf chunk` says nine for this
+  # fixture, and nine is what reaches Qdrant.
+  local written=0 n
+  while IFS= read -r n; do
+    written=$((written + $(_okf_embed_request "$n" '.points | length')))
+  done < <(_okf_embed_upserts)
+  assert_eq "9" "$written" "one point per chunk, and no point without one"
+  assert_contains "$OKF_EMBED_OUT" "upserted 9 points" \
+    "which the report says, in points"
+  assert_contains "$OKF_EMBED_OUT" "collection $collection" "naming the collection they went into"
+  assert_contains "$OKF_EMBED_OUT" "$qdrant" "and the Qdrant it is in"
+
+  # The payload, compared against `okf chunk`'s own output for the same concept
+  # rather than against a copy of the fixture: SPEC.md §9 has one payload, and
+  # the subcommand that prints it and the one that stores it cannot be allowed
+  # to answer differently about what is on it. `heading` and `text` are the two
+  # fields `okf chunk` adds that are not payload — the first tells one method
+  # chunk from its siblings, and the second is what the vector beside it already
+  # is — so they are the two removed here.
+  local expected="" actual="" concept i=0 req
+  while IFS= read -r concept; do
+    i=$((i + 1))
+    req="$(_okf_embed_nth_upsert "$i")"
+    expected="$expected$("$TOOLKIT_ROOT/bin/okf" chunk "$concept" \
+      | jq -c '[.[] | del(.heading, .text)]')"$'\n'
+    actual="$actual$(_okf_embed_request "$req" '[.points[].payload]')"$'\n'
+  done < <(_okf_chunks_fixture_concepts)
+  assert_eq "$expected" "$actual" \
+    "each point carries the SPEC.md §9 payload okf chunk prints for its chunk"
+
+  # And the field list itself, asserted as an ordered list for the reason
+  # _OKF_PAYLOAD_KEYS is: the payload of a Qdrant collection is a schema, and a
+  # field arriving under another name, or not arriving, is a filter that
+  # silently matches nothing.
+  local payload_keys
+  payload_keys="$(printf '%s\n' "$_OKF_PAYLOAD_KEYS" | jq -c 'map(select(. != "heading" and . != "text"))')"
+  while IFS= read -r n; do
+    assert_eq "[$payload_keys]" \
+      "$(_okf_embed_request "$n" '[.points[].payload | keys_unsorted] | unique')" \
+      "request $n's points carry SPEC.md §9's payload fields, in §9's order"
+  done < <(_okf_embed_upserts)
+
+  # The vector each point carries is the one that came back for that point's own
+  # chunk, and not a sibling's: with OKF_FAKE_CURL_VECTOR_MARK on, the endpoint
+  # numbers its vectors by the position of the text it answered, so a point
+  # holding the wrong one says so in its first component.
+  local marks="" want=""
+  while IFS= read -r n; do
+    marks="$marks$(_okf_embed_request "$n" '[.points[].vector[0]] | @json')"$'\n'
+    want="$want$(_okf_embed_request "$n" '[range(0; (.points | length))] | @json')"$'\n'
+  done < <(_okf_embed_upserts)
+  assert_eq "$want" "$marks" \
+    "each point carries the vector that came back for its own chunk, in order"
+
+  # SPEC.md §9's ID: UUID-shaped, version 5, and RFC 4122's variant. Qdrant
+  # takes an unsigned integer or a UUID and nothing else, so a point ID of
+  # another shape is a point Qdrant refuses.
+  local ids id shaped=0 total=0
+  ids="$(_okf_embed_point_ids)"
+  while IFS= read -r id; do
+    total=$((total + 1))
+    case "$id" in
+      [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-5[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+      *)
+        _fail "every point ID is UUIDv5-shaped" "one of them is $id"
+        return 1
+        ;;
+    esac
+    shaped=$((shaped + 1))
+  done <<< "$ids"
+  assert_eq "9" "$total" "there is an ID for every point"
+  assert_eq "$total" "$shaped" "every point ID is UUIDv5-shaped, version 5 and RFC 4122's variant"
+
+  # Targeted, which is §9's other word for it: nine chunks are nine points, and
+  # two chunks sharing an ID would be one point in the collection and a delete
+  # that took the wrong one with it.
+  assert_eq "9" "$(printf '%s\n' "$ids" | sort -u | wc -l | tr -d ' ')" \
+    "no two chunks in the bundle share a point ID"
+
+  # And the ID is the digest of §9's four fields and nothing else, worked out
+  # here from §9's sentence rather than read back out of the request.
+  local kinds symbols expected_ids="" j
+  i=0
+  while IFS= read -r concept; do
+    i=$((i + 1))
+    req="$(_okf_embed_nth_upsert "$i")"
+    kinds="$(_okf_embed_request "$req" '.points[].payload.chunk_kind')"
+    symbols="$(_okf_embed_request "$req" '.points[].payload.symbol')"
+    j=0
+    while IFS= read -r id; do
+      j=$((j + 1))
+      expected_ids="$expected_ids$(_okf_expected_point_id "$repo" "$concept" \
+        "$(printf '%s\n' "$kinds" | sed -n "${j}p")" \
+        "$(printf '%s\n' "$symbols" | sed -n "${j}p")")"$'\n'
+    done < <(_okf_embed_request "$req" '.points[].id')
+  done < <(_okf_chunks_fixture_concepts)
+  assert_eq "$expected_ids" "$ids"$'\n' \
+    "each ID is the digest of {repo}|{concept_id}|{chunk_kind}|{symbol}"
+
+  # Idempotent, which is what §9 asks the ID for: a second run over an unchanged
+  # bundle has to overwrite the points the first one wrote rather than double
+  # them, and Qdrant decides that on the ID alone.
+  local again
+  OKF_FAKE_CURL_COLLECTION=present OKF_FAKE_CURL_DIM=4 OKF_FAKE_CURL_VECTOR_MARK=1 \
+    _okf_embed || return 1
+  again="$(_okf_embed_point_ids)"
+  assert_eq "$ids" "$again" "a second run over an unchanged bundle writes the same IDs"
+
+  # `repo` is on the ID because "every point carries `repo`, so cross-repo search
+  # is a filter change, not a schema change" — two bundles indexing a file at the
+  # same path must not write over each other's points.
+  _okf_index_block . \
+    "{\"repo\": \"other-repo\", \"qdrant_url\": \"$qdrant\", \"collection\": \"$collection\",
+      \"embedding_url\": \"http://embeddings.invalid/v1/embeddings\", \"embedding_dim\": 4}" \
+    || return 1
+  OKF_FAKE_CURL_COLLECTION=present OKF_FAKE_CURL_DIM=4 _okf_embed || return 1
+  local elsewhere
+  elsewhere="$(_okf_embed_point_ids)"
+  assert_eq "0" "$(comm -12 <(printf '%s\n' "$ids" | sort) \
+    <(printf '%s\n' "$elsewhere" | sort) | wc -l | tr -d ' ')" \
+    "a bundle under another repo name writes points of its own, over none of these"
+  assert_eq "other-repo" \
+    "$(_okf_embed_request "$(_okf_embed_nth_upsert 1)" '[.points[].payload.repo] | unique | .[0]')" \
+    "and every one of its points carries that name"
+  return 0
+}
+
+test_okf_embed_upserts_one_point_per_chunk() {
+  _okf_preconditions || return 1
+  with_fixture_repo chunks _okf_embed_upsert_probe
+}
+
+# A Qdrant that cannot take the points is the end of the run, not a report that
+# quietly counts them as stored.
+_okf_embed_upsert_refusal_probe() {
+  local qdrant="http://qdrant.invalid:6333"
+  _okf_index_block . \
+    "{\"qdrant_url\": \"$qdrant\", \"embedding_url\": \"http://embeddings.invalid/v1/embeddings\", \"embedding_dim\": 4}" \
+    || return 1
+
+  OKF_FAKE_CURL_COLLECTION=present OKF_FAKE_CURL_DIM=4 OKF_FAKE_CURL_POINTS_STATUS=500 \
+    _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "an upsert Qdrant refused is a refusal"
+  assert_contains "$OKF_EMBED_ERR" "500" "naming the status that came back"
+  assert_contains "$OKF_EMBED_ERR" "/points" "and the endpoint that answered it"
+  assert_eq "1" "$(_okf_embed_upsert_count)" \
+    "and the run stops there rather than embedding the rest of the bundle"
+  case "$OKF_EMBED_OUT" in
+    *upserted*)
+      _fail "a refused upsert is not reported as stored" \
+        "the report claims points were upserted: $OKF_EMBED_OUT"
+      ;;
+    *) _pass "a refused upsert is not reported as stored" ;;
+  esac
+  return 0
+}
+
+test_okf_embed_refuses_an_upsert_qdrant_would_not_take() {
+  _okf_preconditions || return 1
+  with_fixture_repo chunks _okf_embed_upsert_refusal_probe
 }
 
 # What okf does with a Qdrant it cannot use, and with settings that would build

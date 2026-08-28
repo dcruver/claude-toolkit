@@ -6563,6 +6563,13 @@ index_int() { # $1 = a key inside the index block, $2 = its default
 # computed from the root this run entered.
 OKF_INDEX_REPO=""
 index_repo() {
+  # Read once per invocation and then held, which is embed_settings' rule and
+  # its reason turned to a second use: `okf embed` asks this of every concept in
+  # the bundle, and index_string forks jq over okf.json every time it is called.
+  # The answer is never empty — see the default below — so a value already in
+  # hand is a value this run has already worked out.
+  [ -z "$OKF_INDEX_REPO" ] || return 0
+
   index_string repo ""
   local repo="$OKF_INDEX_STRING"
 
@@ -6904,6 +6911,93 @@ chunk_symbols() { # $1 = code.symbol
   done
 }
 
+# SPEC.md §9's payload for one concept: the eleven fields that are the same on
+# every chunk of it, worked out once and left in the OKF_PAYLOAD_ variables,
+# plus the `code.symbol` the per-chunk symbols are built from. `chunk_kind` and
+# `symbol` are the two names on §9's list that are missing here, because they
+# are the two that differ from one chunk to the next.
+#
+# Shared by `okf chunk`, which prints the payload, and `okf embed`, which stores
+# it. §9 makes that payload a schema in all but name — "cross-repo search is a
+# filter change, not a schema change" is a promise about fields being there
+# under those names — and two builders would be two answers to what a point
+# carries, with nothing but a filter that quietly matches nothing to show for
+# the difference.
+#
+# Returns 1 when the file carries no SPEC.md §4 frontmatter block, which is
+# read_frontmatter's own answer and is left for the caller to interpret: `okf
+# chunk` was handed that file by name and refuses, while `okf embed` walks a
+# whole bundle and passes over it.
+#
+# Asked *through* concept_trust_tier, which reads the frontmatter itself and
+# returns 1 for exactly the reason read_frontmatter does. So the read, the
+# refusal and §9's `trust_tier` come out of one pass over the file, where the
+# obvious two calls would be two passes over every concept in a bundle — and
+# both callers run over all of them.
+#
+# §9's `trust_tier` is computed rather than read: §8 defines it out of the
+# `verified` entries, `generated.at` and whether the concept has drifted, and no
+# field in the file holds the answer. It is the one payload field that opens a
+# second file — the resource, to hash it — and a concept whose source is gone is
+# still gradeable, because §8 makes drift a comparison that was made and came
+# out unequal rather than one that could not be made at all.
+#
+# OKF_TRUST_NOTE is deliberately not warned about here, where `okf verify`
+# prints it. Verify is one person asking about one concept; these two are a
+# subcommand whose stdout somebody is piping into jq and one that walks a
+# bundle, and the tier itself travels on every chunk.
+#
+# The OKF_FM_ variables are left set, as any successful read does, because both
+# callers go on to chunk the body and a body-less concept's summary is built out
+# of the frontmatter this read left behind. Everything §9 wants off that
+# frontmatter is copied out here and now, so that a later edit does not have to
+# know which of the calls below reads the same variables.
+OKF_PAYLOAD_REPO=""
+OKF_PAYLOAD_CONCEPT_ID=""
+OKF_PAYLOAD_PATH=""
+OKF_PAYLOAD_LINES="null"
+OKF_PAYLOAD_LANGUAGE=""
+OKF_PAYLOAD_TYPE=""
+OKF_PAYLOAD_TAGS="[]"
+OKF_PAYLOAD_STATUS=""
+OKF_PAYLOAD_TRUST_TIER=""
+OKF_PAYLOAD_CONTENT_HASH=""
+OKF_PAYLOAD_COMMIT=""
+OKF_PAYLOAD_SYMBOL=""
+concept_payload() { # $1 = a path to a concept file
+  local concept="$1"
+
+  concept_trust_tier "$concept" || return 1
+  OKF_PAYLOAD_TRUST_TIER="$OKF_TRUST_TIER"
+
+  OKF_PAYLOAD_TYPE="$OKF_FM_TYPE"
+  OKF_PAYLOAD_STATUS="$OKF_FM_STATUS"
+  OKF_PAYLOAD_LANGUAGE="$OKF_FM_CODE_LANGUAGE"
+  OKF_PAYLOAD_CONTENT_HASH="$OKF_FM_CODE_CONTENT_HASH"
+  OKF_PAYLOAD_COMMIT="$OKF_FM_CODE_COMMIT"
+  OKF_PAYLOAD_SYMBOL="$OKF_FM_CODE_SYMBOL"
+
+  # `path` is the source the concept documents and not the concept file, which
+  # is what `concept_id` already names. §9 puts `lines` beside it on the same
+  # payload, and a line range is a range in the source.
+  OKF_PAYLOAD_PATH="$OKF_FM_RESOURCE"
+
+  # `tags` and `lines` reach the payload as JSON of their own — a list of
+  # strings, a pair of numbers — rather than as the text §4 spells them in: a
+  # payload field exists to be filtered on, and `"[28, 214]"` is a value no
+  # filter can read.
+  OKF_PAYLOAD_TAGS="$(json_string_array ${OKF_FM_TAGS[@]+"${OKF_FM_TAGS[@]}"})"
+  chunk_lines_json "$OKF_FM_CODE_LINES"
+  OKF_PAYLOAD_LINES="$OKF_CHUNK_LINES_JSON"
+
+  index_repo
+  OKF_PAYLOAD_REPO="$OKF_INDEX_REPO"
+
+  concept_id_of "$concept"
+  OKF_PAYLOAD_CONCEPT_ID="$OKF_CONCEPT_ID"
+  return 0
+}
+
 # okf chunk <concept> — Tier B: emit JSON chunks for one concept
 #
 # Local work, and no HTTP: see OKF_HTTP_SUBCOMMANDS for why this one is Tier B
@@ -6944,65 +7038,18 @@ cmd_chunk() {
   local concept="$OKF_CONCEPT"
 
   # A markdown file is not a concept until it carries SPEC.md §4's block, and
-  # reading that block is how the rest of okf decides. Three things come out of
-  # it here: the refusal below, SPEC.md §9's payload — nine of its thirteen
-  # fields are frontmatter read straight off — and the one case where the
-  # frontmatter is all there is to build a chunk out of, a concept with no body.
-  #
-  # Asked *through* concept_trust_tier, which reads the block itself and returns
-  # 1 for exactly the reason read_frontmatter does: there was no block to read.
-  # So the refusal and §9's `trust_tier` come out of one pass over the file,
-  # where the obvious two calls would be two passes over every concept in a
-  # bundle — and `okf chunk` is the subcommand run over all of them in a loop.
-  # It leaves the OKF_FM_ variables set, as any successful read does; nothing
-  # between here and stub_summary_text below disturbs them.
-  #
-  # §9's `trust_tier` is computed rather than read: §8 defines it out of the
-  # `verified` entries, `generated.at` and whether the concept has drifted, and
-  # no field in the file holds the answer. It is the one payload field that
-  # opens a second file — the resource, to hash it — and a concept whose source
-  # is gone is still gradeable, because §8 makes drift a comparison that was
-  # made and came out unequal rather than one that could not be made at all.
-  #
-  # OKF_TRUST_NOTE is deliberately not warned about here, where `okf verify`
-  # prints it. Verify is one person asking about one concept; this is a
-  # subcommand whose stdout somebody is piping into jq, and the tier itself
-  # travels on every chunk.
-  concept_trust_tier "$concept" \
+  # reading that block is how the rest of okf decides. Two things come out of it
+  # here: the refusal below, and SPEC.md §9's payload — see concept_payload,
+  # which reads the one to build the other and leaves the OKF_FM_ variables set
+  # for the third thing that block is good for, a concept with no body whose
+  # frontmatter is all there is to build a chunk out of.
+  concept_payload "$concept" \
     || die "$concept is not a concept" \
       "a concept opens with --- on line 1 and closes with the next line that is exactly ---" \
       "SPEC.md §4 calls that layout a contract rather than a preference"
-  local p_trust="$OKF_TRUST_TIER"
-
-  # The concept-level half of §9's payload, copied out of the read above rather
-  # than read again — and copied now, so that a later edit does not have to know
-  # that stub_summary_text below reads the same variables.
-  local p_type="$OKF_FM_TYPE" p_status="$OKF_FM_STATUS"
-  local p_path="$OKF_FM_RESOURCE" p_language="$OKF_FM_CODE_LANGUAGE"
-  local p_hash="$OKF_FM_CODE_CONTENT_HASH" p_commit="$OKF_FM_CODE_COMMIT"
-  local base_symbol="$OKF_FM_CODE_SYMBOL"
-
-  # `path` is the source the concept documents and not the concept file, which
-  # is what `concept_id` already names. §9 puts `lines` beside it on the same
-  # payload, and a line range is a range in the source.
-  #
-  # `tags` and `lines` reach the payload as JSON of their own — a list of
-  # strings, a pair of numbers — rather than as the text §4 spells them in: a
-  # payload field exists to be filtered on, and `"[28, 214]"` is a value no
-  # filter can read.
-  local p_tags p_lines
-  p_tags="$(json_string_array ${OKF_FM_TAGS[@]+"${OKF_FM_TAGS[@]}"})"
-  chunk_lines_json "$OKF_FM_CODE_LINES"
-  p_lines="$OKF_CHUNK_LINES_JSON"
-
-  index_repo
-  local p_repo="$OKF_INDEX_REPO"
 
   concept_chunks "$concept" \
     || die "$concept: its body could not be read, so there are no chunks to emit"
-
-  concept_id_of "$concept"
-  local concept_id="$OKF_CONCEPT_ID"
 
   local total="${#OKF_CHUNK_KIND[@]}"
   if [ "$total" -eq 0 ]; then
@@ -7020,7 +7067,7 @@ cmd_chunk() {
   # newlines, and NUL is the one byte `read` cannot have left in it. The
   # concept-level fields go as `--arg` instead, being one value apiece rather
   # than one per chunk.
-  chunk_symbols "$base_symbol"
+  chunk_symbols "$OKF_PAYLOAD_SYMBOL"
 
   local -a fields=()
   local i=0
@@ -7039,17 +7086,17 @@ cmd_chunk() {
   # of each per concept, so neither needs telling apart from a sibling; a method
   # chunk does, and its `## ` line is the signature that does it.
   printf '%s\0' "${fields[@]}" | jq -Rs \
-    --arg repo "$p_repo" \
-    --arg concept_id "$concept_id" \
-    --arg path "$p_path" \
-    --argjson lines "$p_lines" \
-    --arg language "$p_language" \
-    --arg type "$p_type" \
-    --argjson tags "$p_tags" \
-    --arg status "$p_status" \
-    --arg trust_tier "$p_trust" \
-    --arg content_hash "$p_hash" \
-    --arg commit "$p_commit" '
+    --arg repo "$OKF_PAYLOAD_REPO" \
+    --arg concept_id "$OKF_PAYLOAD_CONCEPT_ID" \
+    --arg path "$OKF_PAYLOAD_PATH" \
+    --argjson lines "$OKF_PAYLOAD_LINES" \
+    --arg language "$OKF_PAYLOAD_LANGUAGE" \
+    --arg type "$OKF_PAYLOAD_TYPE" \
+    --argjson tags "$OKF_PAYLOAD_TAGS" \
+    --arg status "$OKF_PAYLOAD_STATUS" \
+    --arg trust_tier "$OKF_PAYLOAD_TRUST_TIER" \
+    --arg content_hash "$OKF_PAYLOAD_CONTENT_HASH" \
+    --arg commit "$OKF_PAYLOAD_COMMIT" '
       split("\u0000")[:-1] as $f
       | [ range(0; ($f | length); 4)
           | { repo: $repo,
@@ -7121,6 +7168,7 @@ embed_settings() {
 OKF_QDRANT_URL=""
 OKF_COLLECTION=""
 OKF_COLLECTION_URL=""
+OKF_POINTS_URL=""
 qdrant_settings() {
   index_string qdrant_url "$OKF_DEFAULT_QDRANT_URL"
   local url="$OKF_INDEX_STRING"
@@ -7183,6 +7231,11 @@ qdrant_settings() {
   # a PUT creates it, and — when the upsert arrives — /points/… hangs off the
   # same path.
   OKF_COLLECTION_URL="$OKF_QDRANT_URL/collections/$OKF_COLLECTION"
+
+  # And the same path with Qdrant's points endpoint on the end, which is where
+  # every upsert goes. `?wait=true` is on it for upsert_points' reason: it is
+  # what makes Qdrant's 200 mean the points are stored rather than accepted.
+  OKF_POINTS_URL="$OKF_COLLECTION_URL/points?wait=true"
 }
 
 # Up to ten lines of a response or a curl complaint, ready to hand to `die` as
@@ -7497,6 +7550,145 @@ ensure_collection() {
     "$OKF_COLLECTION" "$OKF_EMBEDDING_DIM" "$OKF_QDRANT_URL"
 }
 
+# SPEC.md §9's point ID: "a UUIDv5-shaped digest of
+# `{repo}|{concept_id}|{chunk_kind}|{symbol}` so upserts are idempotent and
+# deletes targeted". Left in OKF_POINT_ID.
+#
+# Shaped like a UUIDv5 rather than being one, which is what §9 asks for and is
+# as well: a true v5 is SHA-1 over a namespace UUID, and SPEC.md §3's tool list
+# has no sha1sum on it. sha256sum is on it, and is the digest every other hash
+# in a bundle is taken with. What Qdrant asks of a point ID is that it be an
+# unsigned integer or a UUID; what §9 asks is that the same four fields always
+# give back the same ID and that different ones never collide. Both are met by
+# laying the first 128 bits of the sha256 out in UUID form, with the version
+# nibble set to 5 and the variant bits to RFC 4122's — and a truncated sha256
+# is a stronger digest than the full SHA-1 a real v5 would have used.
+#
+# The four fields are joined with `|` because §9 writes them joined with `|`.
+# None of them can hold one: `repo` and `concept_id` are a directory name and a
+# bundle-relative path, `chunk_kind` is one of three literals, and a `symbol`
+# with a pipe in it would be a method whose signature has one. So the join is
+# unambiguous in the way that matters — two different tuples cannot spell the
+# same string.
+#
+# Idempotence is the whole point: a second `okf embed` over an unchanged bundle
+# has to overwrite the points the first one wrote rather than double them, and
+# Qdrant decides that on the ID alone.
+OKF_POINT_ID=""
+point_id() { # $1 = repo, $2 = concept_id, $3 = chunk_kind, $4 = symbol
+  local digest variant
+
+  # `printf` and not `echo`, and no trailing newline, so what is hashed is
+  # exactly the four fields and the three separators between them.
+  digest="$(printf '%s|%s|%s|%s' "$1" "$2" "$3" "$4" | sha256sum)" \
+    || die "sha256sum could not digest a point ID for $2"
+  # sha256sum writes `<hex>  -` for stdin.
+  digest="${digest%% *}"
+
+  # RFC 4122's variant: the top two bits of the ninth byte are set to 10, which
+  # over the nibble they land in is `(n & 3) | 8` — the four values 8, 9, a, b.
+  case "${digest:16:1}" in
+    0 | 4 | 8 | c) variant=8 ;;
+    1 | 5 | 9 | d) variant=9 ;;
+    2 | 6 | a | e) variant=a ;;
+    *) variant=b ;;
+  esac
+
+  # 8-4-4-4-12, with the digest's 13th nibble replaced by the version 5 and its
+  # 17th by the variant above. Every other nibble is the digest's own.
+  OKF_POINT_ID="${digest:0:8}-${digest:8:4}-5${digest:13:3}-${variant}${digest:17:3}-${digest:20:12}"
+}
+
+# One concept's chunks written to Qdrant as points: SPEC.md §9's "One
+# collection", one point per chunk, each carrying the vector the embedding
+# endpoint just returned and the payload §9 spells out.
+#
+# One request per concept and not one per chunk, which is the unit embed_texts
+# already works in: the vectors arrive grouped by concept, and a request per
+# chunk would be four round trips for a class with three methods. Not one for
+# the whole bundle either, for embed_texts' other reason — a bundle's worth of
+# points in a single body is a request an endpoint may refuse by size, and the
+# failure would take every concept with it.
+#
+# `PUT /collections/<name>/points` is Qdrant's upsert, which is the verb §9
+# names: a point whose ID is already there is replaced rather than added
+# beside it, so a second run over an unchanged bundle leaves the collection
+# exactly as the first left it.
+#
+# `?wait=true` because the report at the end of the run says what was stored.
+# Without it Qdrant answers 200 the moment it has accepted the batch and before
+# it has applied it, and a failure after that is one nobody could see: the run
+# would have printed a count of points that never landed. The wait is what makes
+# the 200 mean what the report claims it means.
+#
+# The payload carries no chunk text, deliberately. §9's field list has none, and
+# the text is what the vector beside it *is* — storing it again would put every
+# concept's prose into the index a second time, at the cost of the memory Qdrant
+# keeps payloads in. A hit names its `concept_id` and its `path`, and the prose
+# is in the bundle, which is the product.
+upsert_points() { # $1 = the concept these chunks came from
+  local concept="$1" total="${#OKF_CHUNK_KIND[@]}" i=0
+  [ "$total" -gt 0 ] || return 0
+
+  # The per-chunk fields flattened into one NUL-separated stream and put back
+  # together by jq, which is cmd_chunk's trick for cmd_chunk's reason: a symbol
+  # is taken from somebody's `## ` heading and may hold quotes, backslashes and
+  # tabs, and NUL is the one byte it cannot hold. The concept-level fields go as
+  # `--arg` instead, being one value apiece rather than one per chunk.
+  #
+  # The vector travels in that same stream, as the JSON text embed_texts left,
+  # and is turned back into an array by `fromjson` below. It is a list of
+  # numbers, so it has no NUL in it either.
+  local -a fields=()
+  while [ "$i" -lt "$total" ]; do
+    point_id "$OKF_PAYLOAD_REPO" "$OKF_PAYLOAD_CONCEPT_ID" \
+      "${OKF_CHUNK_KIND[$i]}" "${OKF_CHUNK_SYMBOLS[$i]}"
+    fields+=("$OKF_POINT_ID" "${OKF_CHUNK_KIND[$i]}" "${OKF_CHUNK_SYMBOLS[$i]}" \
+      "${OKF_EMBED_VECTORS[$i]}")
+    i=$((i + 1))
+  done
+
+  # SPEC.md §9's payload in §9's own order, which is the order `okf chunk`
+  # prints it in — the same fields out of the same concept_payload read, so a
+  # point and the chunk it was built from cannot disagree about either.
+  local request
+  request="$(printf '%s\0' "${fields[@]}" | jq -c -Rs \
+      --arg repo "$OKF_PAYLOAD_REPO" \
+      --arg concept_id "$OKF_PAYLOAD_CONCEPT_ID" \
+      --arg path "$OKF_PAYLOAD_PATH" \
+      --argjson lines "$OKF_PAYLOAD_LINES" \
+      --arg language "$OKF_PAYLOAD_LANGUAGE" \
+      --arg type "$OKF_PAYLOAD_TYPE" \
+      --argjson tags "$OKF_PAYLOAD_TAGS" \
+      --arg status "$OKF_PAYLOAD_STATUS" \
+      --arg trust_tier "$OKF_PAYLOAD_TRUST_TIER" \
+      --arg content_hash "$OKF_PAYLOAD_CONTENT_HASH" \
+      --arg commit "$OKF_PAYLOAD_COMMIT" '
+      split("\u0000")[:-1] as $f
+      | { points:
+          [ range(0; ($f | length); 4)
+            | { id: $f[.],
+                vector: ($f[. + 3] | fromjson),
+                payload:
+                  { repo: $repo,
+                    concept_id: $concept_id,
+                    chunk_kind: $f[. + 1],
+                    symbol: $f[. + 2],
+                    path: $path,
+                    lines: $lines,
+                    language: $language,
+                    type: $type,
+                    tags: $tags,
+                    status: $status,
+                    trust_tier: $trust_tier,
+                    content_hash: $content_hash,
+                    commit: $commit } } ] }
+    ')" || die "$concept: its points could not be rendered as JSON"
+
+  http_request "Qdrant" PUT "$OKF_POINTS_URL" "$request"
+  http_ok_or_die "Qdrant" "$OKF_POINTS_URL"
+}
+
 # `1 chunk`, `2 chunks` — a count and its noun, agreeing. require_tools' `tool`
 # / `tools` written once, because the report below has four of them in it.
 count_noun() { # $1 = a count, $2 = the singular noun
@@ -7548,8 +7740,15 @@ cmd_embed() {
   # Every setting read and checked before a single request is made, so a bundle
   # whose `collection` is unusable is told so rather than after an endpoint has
   # been paid to embed the whole bundle.
+  #
+  # `index.repo` among them, even though nothing here reads OKF_INDEX_REPO: it
+  # is a payload field, so concept_payload asks for it once per concept, and
+  # asking for it first is what keeps a `"repo": 7` from being found out after
+  # ensure_collection has already created a collection for a run that then
+  # refuses. index_repo holds its answer, so the asking below costs nothing.
   embed_settings
   qdrant_settings
+  index_repo
   load_concepts
 
   # And the collection made to exist before the first concept is embedded — see
@@ -7577,6 +7776,19 @@ cmd_embed() {
       fi
     fi
 
+    # SPEC.md §9's payload for the whole concept, and only now that the concept
+    # is one this run will embed. concept_payload reads the frontmatter a second
+    # time, which costs no process at all — read_frontmatter is a `read` loop —
+    # where the payload it builds forks jq and resolves two directories, and a
+    # drifted concept is one none of that would ever be sent for.
+    #
+    # The concept's trust tier is worked out in there, and §8 computes that from
+    # drift for a concept with an earned human review — so those concepts are
+    # hashed a second time. Left as it is: threading this loop's verdict into
+    # concept_trust_tier would change what every one of its callers has to know,
+    # to save one sha256sum on the concepts that have been humanly reviewed.
+    concept_payload "$concept" || continue
+
     concept_chunks "$concept" \
       || die "$concept: its body could not be read, so there is nothing to embed"
 
@@ -7586,12 +7798,25 @@ cmd_embed() {
       continue
     fi
 
+    # The other half of SPEC.md §9's payload, and the half its point IDs turn
+    # on: `symbol` is what tells one method chunk of a concept from the next,
+    # and three methods sharing the type's symbol would be three chunks sharing
+    # one point ID — a concept that collapsed to a single point on upsert.
+    chunk_symbols "$OKF_PAYLOAD_SYMBOL"
+
     # One request per concept rather than one for the whole bundle: a bundle's
     # worth of prose in a single request is a body an endpoint may well refuse
     # by size, and the failure would take every concept with it. Per concept is
     # also the unit the Qdrant upsert works in, so the vectors are already
     # grouped the way the points that carry them will be.
     embed_texts ${OKF_CHUNK_TEXT[@]+"${OKF_CHUNK_TEXT[@]}"}
+
+    # Stored before the next concept is embedded, rather than held to the end.
+    # A run that fell over on its fifth concept has still written the four
+    # before it, and the fifth is the one to re-run — where a batch held to the
+    # end would throw away every embedding the run had paid for.
+    upsert_points "$concept"
+
     concepts=$((concepts + 1))
     chunks=$((chunks + total))
   done
@@ -7610,6 +7835,12 @@ cmd_embed() {
   printf 'embedded %s from %s with %s (%s-dim)\n' \
     "$(count_noun "$chunks" chunk)" "$(count_noun "$concepts" concept)" \
     "$OKF_EMBEDDING_MODEL" "$OKF_EMBEDDING_DIM"
+
+  # One point per chunk, which is why this line does not repeat the count: what
+  # a caller needs to know is *where* they went, and the collection and the
+  # Qdrant are the two settings that decide that.
+  printf 'upserted %s into collection %s at %s\n' \
+    "$(count_noun "$chunks" point)" "$OKF_COLLECTION" "$OKF_QDRANT_URL"
 }
 
 # okf search <query> [--hyde-prompt] [--k N] [--repo R] [--type T]
