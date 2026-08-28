@@ -4,12 +4,60 @@
 set -euo pipefail
 
 TOOLKIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN_DIR="$HOME/.local/bin"
-COMMANDS_DIR="$HOME/.claude/commands"
+
+# Every destination is overridable from the environment. Hard-coding them meant
+# this script could not be exercised without writing into the real ~/.claude,
+# and left no way to install under a different prefix, a staging directory, or
+# an XDG layout. CLAUDE_CONFIG_DIR is Claude Code's own variable: honour it, or
+# the commands land where a user who sets it will never look.
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
+COMMANDS_DIR="${COMMANDS_DIR:-$CLAUDE_DIR/commands}"
+SETTINGS_FILE="${SETTINGS_FILE:-$CLAUDE_DIR/settings.json}"
+
+DRY_RUN=0
+usage() {
+  cat <<'EOF'
+Usage: ./install.sh [-n|--dry-run] [-h|--help]
+
+Installs bin/* to BIN_DIR, commands/*.md to COMMANDS_DIR, and merges
+permissions.json into SETTINGS_FILE. Idempotent; safe to re-run.
+
+  -n, --dry-run   print what would change, write nothing
+
+Environment (each falls back to the default shown):
+  BIN_DIR            $HOME/.local/bin
+  CLAUDE_CONFIG_DIR  $HOME/.claude          Claude Code's own config dir
+  COMMANDS_DIR       $CLAUDE_CONFIG_DIR/commands
+  SETTINGS_FILE      $CLAUDE_CONFIG_DIR/settings.json
+EOF
+}
+for arg in "$@"; do
+  case "$arg" in
+    -n | --dry-run) DRY_RUN=1 ;;
+    -h | --help) usage; exit 0 ;;
+    *)
+      echo "install.sh: unknown option: $arg" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+# Perform a mutation, or describe it. Every write in this script goes through
+# here, so --dry-run cannot drift out of step with what a real run does.
+run() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  would: %s\n' "$*"
+  else
+    "$@"
+  fi
+}
 
 echo "Installing from $TOOLKIT_DIR"
+[ "$DRY_RUN" -eq 1 ] && echo "(dry run — nothing will be written)"
 
-mkdir -p "$BIN_DIR" "$COMMANDS_DIR"
+run mkdir -p "$BIN_DIR" "$COMMANDS_DIR"
 
 # Every temp file this script renames through, removed on every exit path. $$
 # differs on the next run, so a temp left behind by an interrupted or
@@ -45,6 +93,10 @@ install_bin() { # $1 = the script's name in bin/
   # as-yet-unset `name` and abort under `set -u`.
   local tmp="$BIN_DIR/.$name.new.$$"
   INSTALL_TMPS+=("$tmp")
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "  would install: $name -> $BIN_DIR/$name"
+    return 0
+  fi
   cp "$TOOLKIT_DIR/bin/$name" "$tmp"
   # Symbolic, not 755: `+x` is filtered through the umask, so someone running
   # under `umask 077` keeps a private ~/.local/bin instead of having this script
@@ -124,14 +176,15 @@ if [ -n "$MISSING_TIER_B" ]; then
 fi
 
 for f in "$TOOLKIT_DIR"/commands/*.md; do
-  cp "$f" "$COMMANDS_DIR/"
-  echo "  $(basename "$f") -> $COMMANDS_DIR/$(basename "$f")"
+  run cp "$f" "$COMMANDS_DIR/"
+  [ "$DRY_RUN" -eq 1 ] || echo "  $(basename "$f") -> $COMMANDS_DIR/$(basename "$f")"
 done
 
 echo
-SETTINGS_FILE="$HOME/.claude/settings.json"
 PERMISSIONS_FILE="$TOOLKIT_DIR/permissions.json"
-if have_tool jq; then
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "  would merge $PERMISSIONS_FILE into $SETTINGS_FILE"
+elif have_tool jq; then
   # `-s`, not `-f`: a settings.json that exists but is empty is no more
   # mergeable than one that is missing — `jq -s` would slurp a single value and
   # every install would report a parse failure over an empty file.
