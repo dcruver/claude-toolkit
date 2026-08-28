@@ -1527,11 +1527,12 @@ concept_resource() { # $1 = a bundle-relative concept path, $2 = its `resource` 
 }
 
 # One concept's SPEC.md §4 frontmatter, as `read_frontmatter` last left it:
-# every field §4 lists as shell-read, and nothing else. The rest of what a
-# concept carries — `title`, `tags`, `sources`, `code.members` — is Claude's to
-# write and OKF's to define, and a variable here is this script claiming an
-# opinion about a field, so the list stays exactly §4's. SPEC.md §1's division
-# of labour is what that line is drawn from.
+# every field §4 lists as shell-read, plus the few that another section of the
+# spec names outright. The rest of what a concept carries — `tags`, `sources`,
+# `code.members` — is Claude's to write and OKF's to define, and a variable
+# here is this script claiming an opinion about a field, so nothing joins this
+# list that a section of SPEC.md has not asked for by name. SPEC.md §1's
+# division of labour is what that line is drawn from.
 #
 # The names are §4's own field names, mechanically: `OKF_FM_` then the field
 # with its dots turned into underscores, its `[]` dropped and the whole thing
@@ -1550,6 +1551,14 @@ concept_resource() { # $1 = a bundle-relative concept path, $2 = its `resource` 
 # concept has been read would otherwise abort where it should see "absent".
 clear_frontmatter() {
   OKF_FM_TYPE=""
+  # Not on §4's shell-read list, and read for the reason OKF_FM_VERIFIED_BY
+  # below is read: another section asks for them by name. SPEC.md §9 has a Tier
+  # 0 concept with no body yield "exactly one summary chunk built from title,
+  # description, and code.signature", and there is no such chunk to build
+  # without all three. Read here rather than by `okf chunk` alone so that
+  # reading a concept stays the one pass over its block that this function is.
+  OKF_FM_TITLE=""
+  OKF_FM_DESCRIPTION=""
   OKF_FM_RESOURCE=""
   OKF_FM_STATUS=""
   OKF_FM_STALE_AFTER=""
@@ -1559,6 +1568,8 @@ clear_frontmatter() {
   OKF_FM_CODE_TIER=""
   OKF_FM_CODE_SYMBOL=""
   OKF_FM_CODE_LANGUAGE=""
+  # SPEC.md §9's third stub field — see OKF_FM_TITLE.
+  OKF_FM_CODE_SIGNATURE=""
   # A list where the others are scalars, because SPEC.md §8 says verified
   # entries are never stripped: a concept accumulates them, and the last one is
   # not the only one that matters. Document order.
@@ -1711,9 +1722,9 @@ read_frontmatter() { # $1 = a path to a concept file
   # it did — see OKF_FM_VERIFIED_BY, and note that `by:` and `at:` come in
   # either order.
   local by_pending=0 v_by="" v_at=-1
-  local f_type="" f_resource="" f_status="" f_stale_after=""
-  local f_generated_at="" f_generated_by=""
-  local f_content_hash="" f_tier="" f_symbol="" f_language=""
+  local f_type="" f_title="" f_description="" f_resource="" f_status=""
+  local f_stale_after="" f_generated_at="" f_generated_by=""
+  local f_content_hash="" f_tier="" f_symbol="" f_language="" f_signature=""
   local f_verified_count=0
   local -a f_verified_at=() f_verified_by=()
 
@@ -1790,6 +1801,18 @@ read_frontmatter() { # $1 = a path to a concept file
               f_type="$OKF_FRONTMATTER_SCALAR"
             fi
             ;;
+          "title:"*)
+            if [ -z "$f_title" ]; then
+              frontmatter_scalar "${line#"title:"}"
+              f_title="$OKF_FRONTMATTER_SCALAR"
+            fi
+            ;;
+          "description:"*)
+            if [ -z "$f_description" ]; then
+              frontmatter_scalar "${line#"description:"}"
+              f_description="$OKF_FRONTMATTER_SCALAR"
+            fi
+            ;;
           "resource:"*)
             if [ -z "$f_resource" ]; then
               frontmatter_scalar "${line#"resource:"}"
@@ -1850,6 +1873,16 @@ read_frontmatter() { # $1 = a path to a concept file
                 if [ -z "$f_language" ]; then
                   frontmatter_scalar "${line#"  language:"}"
                   f_language="$OKF_FRONTMATTER_SCALAR"
+                fi
+                ;;
+              # Exactly two spaces, as §4's extraction rule has it, and here
+              # that width is the whole of what keeps a member's signature out
+              # of the type's: §4 puts `code.members` entries at four spaces,
+              # and each one carries a `signature:` of its own.
+              "  signature: "*)
+                if [ -z "$f_signature" ]; then
+                  frontmatter_scalar "${line#"  signature:"}"
+                  f_signature="$OKF_FRONTMATTER_SCALAR"
                 fi
                 ;;
             esac
@@ -1996,6 +2029,8 @@ read_frontmatter() { # $1 = a path to a concept file
   fi
 
   OKF_FM_TYPE="$f_type"
+  OKF_FM_TITLE="$f_title"
+  OKF_FM_DESCRIPTION="$f_description"
   OKF_FM_RESOURCE="$f_resource"
   OKF_FM_STATUS="$f_status"
   OKF_FM_STALE_AFTER="$f_stale_after"
@@ -2005,6 +2040,7 @@ read_frontmatter() { # $1 = a path to a concept file
   OKF_FM_CODE_TIER="$f_tier"
   OKF_FM_CODE_SYMBOL="$f_symbol"
   OKF_FM_CODE_LANGUAGE="$f_language"
+  OKF_FM_CODE_SIGNATURE="$f_signature"
   OKF_FM_VERIFIED_AT=(${f_verified_at[@]+"${f_verified_at[@]}"})
   OKF_FM_VERIFIED_BY=(${f_verified_by[@]+"${f_verified_by[@]}"})
   OKF_FM_VERIFIED_COUNT="$f_verified_count"
@@ -5801,8 +5837,10 @@ fence_run() { # $1 = a line, already stripped of its trailing whitespace
 # A chunk whose text is empty once trimmed is dropped rather than recorded, and
 # that is the only thing dropped here. Every kind but the summary carries its
 # own heading line inside its text, so the guard is in practice about the one
-# case that has no heading either: a concept with no body at all, which comes
-# back as `[]` rather than as an empty summary shell.
+# case that has no heading either: a concept with no body at all, whose summary
+# is built out of its frontmatter instead — see stub_summary_text — and which
+# comes back as `[]` rather than as an empty summary shell only when the
+# frontmatter has not got the fields to build one from either.
 #
 # A section that is thin rather than empty — a `# Schema` with nothing yet under
 # it, a `## <signature>` with no prose — is kept, deliberately. Chunks are what
@@ -6004,6 +6042,43 @@ split_concept_body() { # $1 = a path to a concept file
   return 0
 }
 
+# SPEC.md §9's chunk for a concept with no body: "A Tier 0 concept with no body
+# yields exactly one `summary` chunk built from `title`, `description`, and
+# `code.signature`." The text of that chunk, out of the frontmatter
+# read_frontmatter last read, left in OKF_STUB_SUMMARY.
+#
+# Asked of a concept with no chunks rather than of one whose `code.tier` says
+# `0`, and the difference is deliberate. SPEC.md §5 defines Tier 0 as
+# "frontmatter, signature, links only. No prose" — having no body is what being
+# Tier 0 *is*, and the body is the fact while the field is a label that can lag
+# behind it. A concept carrying `tier: 1` and no prose is a Tier 0 file whose
+# label has not caught up, and reading the label would leave it with no chunk at
+# all: no point in the index, and so a concept `okf search` cannot return. §5 is
+# explicit that Tier 0 is "a demotion, never an exclusion", and a concept
+# excluded from the index is excluded whatever its frontmatter claims.
+#
+# The three fields in §9's order, one paragraph each, and nothing else — no
+# labels, no headings, no `code.signature:` prefix. What is being built is text
+# to embed, and the fields around it travel as payload rather than as prose: the
+# scaffolding would be in every stub chunk in the bundle, identical, and so is
+# noise in exactly the comparison the embedding is for.
+#
+# A field the concept has not got is left out entirely rather than written as a
+# blank paragraph, which is the same rule chunk_record applies to a section that
+# trims to nothing. A concept with none of the three leaves this empty, and
+# chunk_record then drops it: `okf chunk` answers `[]`, because a chunk of
+# nothing is a point in the index that matches every query equally.
+OKF_STUB_SUMMARY=""
+stub_summary_text() {
+  local text="" field
+  for field in "$OKF_FM_TITLE" "$OKF_FM_DESCRIPTION" "$OKF_FM_CODE_SIGNATURE"; do
+    [ -n "$field" ] || continue
+    [ -z "$text" ] || text="$text"$'\n\n'
+    text="$text$field"
+  done
+  OKF_STUB_SUMMARY="$text"
+}
+
 # okf chunk <concept> — Tier B: emit JSON chunks for one concept
 #
 # Local work, and no HTTP: see OKF_HTTP_SUBCOMMANDS for why this one is Tier B
@@ -6045,8 +6120,9 @@ cmd_chunk() {
 
   # A markdown file is not a concept until it carries SPEC.md §4's block, and
   # asking read_frontmatter is how the rest of okf decides that. It is asked
-  # here for the refusal rather than for the fields: everything this emits comes
-  # out of the body alone.
+  # here for the refusal and for three fields: a body splits into chunks on its
+  # own, and a concept with no body is the one case where the frontmatter is all
+  # there is to build a chunk out of.
   read_frontmatter "$concept" \
     || die "$concept is not a concept" \
       "a concept opens with --- on line 1 and closes with the next line that is exactly ---" \
@@ -6060,9 +6136,17 @@ cmd_chunk() {
 
   local total="${#OKF_CHUNK_KIND[@]}"
   if [ "$total" -eq 0 ]; then
-    # A body with nothing in it. `[]` and not silence, for the reason
-    # `check --json` spells out at length: a caller parsing this is running jq,
-    # and jq given an empty stream fails rather than reporting an empty answer.
+    # A body with nothing in it, which is SPEC.md §9's Tier 0 concept: the one
+    # summary chunk it yields is built from the frontmatter instead.
+    stub_summary_text
+    chunk_record summary "" "$OKF_STUB_SUMMARY"
+    total="${#OKF_CHUNK_KIND[@]}"
+  fi
+  if [ "$total" -eq 0 ]; then
+    # No body, and no frontmatter to stand in for one. `[]` and not silence,
+    # for the reason `check --json` spells out at length: a caller parsing this
+    # is running jq, and jq given an empty stream fails rather than reporting an
+    # empty answer.
     printf '[]\n'
     return 0
   fi

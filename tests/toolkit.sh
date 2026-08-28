@@ -8545,6 +8545,94 @@ test_okf_chunk_reads_fenced_headings_as_content() {
   with_fixture_repo chunks _okf_chunk_fence_probe
 }
 
+# PLAN.md's Phase 9 stub item: SPEC.md §9's "A Tier 0 concept with no body
+# yields exactly one `summary` chunk built from `title`, `description`, and
+# `code.signature`."
+#
+# tests/fixtures/chunks/src/kitchen/NoSuchRouteException.md is SPEC.md §5's
+# Tier 0 shape exactly — "frontmatter, signature, links only. No prose",
+# `status: draft` — for the type §5 names first, a pure exception that adds no
+# members of its own.
+_okf_chunk_stub_probe() {
+  _okf_chunk_json src/kitchen/NoSuchRouteException || return 1
+
+  assert_eq "0" "$OKF_CHUNK_RC" "okf chunk exits 0 on a Tier 0 concept with no body"
+  assert_eq "" "$OKF_CHUNK_ERR" "and says nothing on stderr"
+
+  # Exactly one, which is the word SPEC.md §9 uses. A stub with no prose has no
+  # method and no schema to invent, and a second chunk here would be a second
+  # point in the index for a concept that says one thing.
+  assert_eq "1" "$(printf '%s\n' "$OKF_CHUNK_JSON" | jq 'length')" \
+    "a Tier 0 concept with no body yields exactly one chunk"
+  assert_eq "summary" "$(_okf_chunk_column chunk_kind)" "and that chunk is the summary"
+  assert_eq "" "$(_okf_chunk_field 0 heading)" \
+    "which is headed by nothing, as every summary chunk is"
+  assert_eq "src/kitchen/NoSuchRouteException" "$(_okf_chunk_field 0 concept_id)" \
+    "and carries the concept ID of the stub it was built from"
+
+  # The three fields SPEC.md §9 names, in the order it names them, and nothing
+  # else: no labels and no headings, because the text is what gets embedded and
+  # scaffolding identical in every stub in the bundle tells the comparison
+  # nothing.
+  local text
+  text="$(_okf_chunk_field 0 text)"
+  assert_eq "$(printf '%s\n\n%s\n\n%s' "NoSuchRouteException" \
+    "Signals that no handler is registered for a request path." \
+    "public final class NoSuchRouteException extends RuntimeException")" \
+    "$text" \
+    "the chunk is title, description and code.signature, one paragraph each"
+
+  # The block itself is not the chunk. A summary carrying `content_hash:` and
+  # `generated:` would embed the bookkeeping instead of the concept.
+  case "$text" in
+    *"content_hash"* | *"---"* | *"resource:"*)
+      _fail "the stub chunk holds none of the frontmatter's own syntax" \
+        "the block was embedded rather than the three fields read out of it" \
+        "text:" "$text"
+      ;;
+    *) _pass "the stub chunk holds none of the frontmatter's own syntax" ;;
+  esac
+  # `code.members` carries a `signature:` of its own, one indent level deeper.
+  # SPEC.md §4's extraction rule is what keeps them apart, and a reader that
+  # took the first `signature:` it saw anywhere under `code:` would describe
+  # this class by its constructor.
+  case "$text" in
+    *"NoSuchRouteException(String)"*)
+      _fail "the stub chunk carries the type's signature, not a member's" \
+        "a code.members entry's signature was read as code.signature" \
+        "text:" "$text"
+      ;;
+    *) _pass "the stub chunk carries the type's signature, not a member's" ;;
+  esac
+
+  # Frontmatter stands in for a body and never joins one. A concept that has
+  # prose has already said what it is, and a description pasted in beside it
+  # would be in two chunks of the same bundle at once.
+  _okf_chunk_json src/kitchen/Router || return 1
+  case "$(_okf_chunk_field 0 text)" in
+    *"Chooses the handler for an inbound request path."*)
+      _fail "a concept with a body is chunked from that body alone" \
+        "the frontmatter description was folded into the summary of a Tier 1 concept" \
+        "summary:" "$(_okf_chunk_field 0 text)"
+      ;;
+    *) _pass "a concept with a body is chunked from that body alone" ;;
+  esac
+
+  # And the empty answer survives: a stub with no body *and* none of the three
+  # fields has nothing to build a chunk out of, and an empty chunk is a point
+  # in the index that matches every query as well as any other.
+  _okf_chunk_json src/kitchen/Unwritten || return 1
+  assert_eq "0" "$OKF_CHUNK_RC" "okf chunk exits 0 on a concept it can build nothing from"
+  assert_eq "[]" "$OKF_CHUNK_JSON" \
+    "a concept with no body and no title, description or signature yields []"
+  return 0
+}
+
+test_okf_chunk_builds_a_bodyless_stub_from_its_frontmatter() {
+  _okf_preconditions || return 1
+  with_fixture_repo chunks _okf_chunk_stub_probe
+}
+
 _okf_chunk_refusal_probe() {
   # A markdown file whose frontmatter block was never closed. Everything below
   # its `---` is unclosed YAML rather than a body, so there is nothing here to
