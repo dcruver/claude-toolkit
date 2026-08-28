@@ -10749,6 +10749,149 @@ test_okf_search_limits_the_results_with_k() {
   with_fixture_repo chunks _okf_search_k_probe
 }
 
+# SPEC.md §9's `--repo` and `--type`, the two optional payload filters — "every
+# point carries `repo`, so cross-repo search is a filter change, not a schema
+# change", and `type` is the payload field beside it.
+#
+# Checked against the request body the fake curl recorded, because the request
+# body is where the narrowing has to happen. A filter okf applied to the hits
+# it got back would look identical from the outside on a small collection and
+# be a different question on a large one: `--k` would have stopped meaning "k
+# results" and started meaning "as many of the top k as happened to match".
+_okf_search_filter_probe() {
+  _okf_search_configured . || return 1
+
+  local hits
+  hits="$(_okf_search_hits src/kitchen/Router)"
+  if [ -z "$hits" ]; then
+    _fail "$CURRENT_TEST can build its canned hits" "okf chunk yielded nothing"
+    return 1
+  fi
+
+  # Neither filter given carries no `filter` key at all, rather than an empty
+  # clause: unfiltered, this is the request `okf search` sent before the flags
+  # existed, and a `{"must": []}` would be a clause Qdrant has to be told to
+  # ignore.
+  OKF_FAKE_CURL_DIM=4 OKF_FAKE_CURL_HITS="$hits" _okf_search "a query" || return 1
+  assert_eq "0" "$OKF_SEARCH_RC" "a search given neither filter exits 0"
+  assert_eq "false" "$(_okf_request 2 'has("filter")')" \
+    "and sends no filter at all, rather than an empty one"
+
+  OKF_FAKE_CURL_DIM=4 OKF_FAKE_CURL_HITS="$hits" \
+    _okf_search "a query" --repo kitchen || return 1
+  assert_eq "0" "$OKF_SEARCH_RC" "okf search --repo R exits 0"
+  assert_eq '{"must":[{"key":"repo","match":{"value":"kitchen"}}]}' \
+    "$(_okf_request 2 '.filter')" \
+    "--repo R reaches Qdrant as a match on the payload's own repo field"
+
+  # The type a concept declares in its SPEC.md §4 frontmatter, which is what
+  # `okf chunk` puts in the payload under the same name.
+  OKF_FAKE_CURL_DIM=4 OKF_FAKE_CURL_HITS="$hits" \
+    _okf_search "a query" --type Record || return 1
+  assert_eq "0" "$OKF_SEARCH_RC" "okf search --type T exits 0"
+  assert_eq '{"must":[{"key":"type","match":{"value":"Record"}}]}' \
+    "$(_okf_request 2 '.filter')" \
+    "--type T reaches Qdrant as a match on the payload's own type field"
+
+  # Both is one corpus and not two, so they are anded under `must`.
+  OKF_FAKE_CURL_DIM=4 OKF_FAKE_CURL_HITS="$hits" \
+    _okf_search "a query" --repo kitchen --type Record || return 1
+  assert_eq "0" "$OKF_SEARCH_RC" "both filters together exit 0"
+  assert_eq '{"must":[{"key":"repo","match":{"value":"kitchen"}},{"key":"type","match":{"value":"Record"}}]}' \
+    "$(_okf_request 2 '.filter')" \
+    "and are anded under must rather than sent as two searches"
+
+  # A filter narrows the search and changes nothing else about it: the same
+  # vector, the same limit, and the payload still asked for.
+  assert_eq "[0.25,0.25,0.25,0.25]" "$(_okf_request 2 '.vector')" \
+    "a filtered search still carries the vector the endpoint answered with"
+  assert_eq "true" "$(_okf_request 2 '.with_payload')" "and still asks for the payload"
+  assert_eq "$(_okf_bin_scalar OKF_DEFAULT_K)" "$(_okf_request 2 '.limit')" \
+    "and still carries the limit --k would have set"
+  assert_eq '["a query"]' "$(_okf_request 1 '.input')" \
+    "and what is embedded is the query, not anything the filters named"
+
+  # `--k` is a limit on the filtered search, which is the whole reason the
+  # filter goes to Qdrant rather than being applied to what came back.
+  OKF_FAKE_CURL_DIM=4 OKF_FAKE_CURL_HITS="$hits" \
+    _okf_search "a query" --k 2 --repo kitchen || return 1
+  assert_eq "2" "$(_okf_request 2 '.limit')" "--k and a filter reach Qdrant together"
+  assert_eq '{"must":[{"key":"repo","match":{"value":"kitchen"}}]}' \
+    "$(_okf_request 2 '.filter')" "in the one request, as one question"
+
+  # The GNU spelling, accepted for the reason `--k=N` is: left to fall through
+  # it would be a filter silently searched for as a query.
+  OKF_FAKE_CURL_DIM=4 OKF_FAKE_CURL_HITS="$hits" \
+    _okf_search --repo=kitchen --type=Record "a query" || return 1
+  assert_eq "0" "$OKF_SEARCH_RC" "--repo=R and --type=T exit 0"
+  assert_eq '{"must":[{"key":"repo","match":{"value":"kitchen"}},{"key":"type","match":{"value":"Record"}}]}' \
+    "$(_okf_request 2 '.filter')" "and say the same thing as the spaced spelling"
+  assert_eq '["a query"]' "$(_okf_request 1 '.input')" \
+    "with the query still the query, wherever the flags were written"
+
+  # A value with a space in it is one value: a repo is a directory name and
+  # SPEC.md §6 lets `index.repo` be anything, so it must not be split.
+  OKF_FAKE_CURL_DIM=4 OKF_FAKE_CURL_HITS="$hits" \
+    _okf_search "a query" --repo "two words" || return 1
+  assert_eq '{"must":[{"key":"repo","match":{"value":"two words"}}]}' \
+    "$(_okf_request 2 '.filter')" "a filter value with a space in it is one value"
+
+  # Past a `--` the same word is query text, which is what the preflight
+  # already assumes when it holds `okf search -- --hyde-prompt` to curl.
+  OKF_FAKE_CURL_DIM=4 _okf_search -- --repo || return 1
+  assert_eq "0" "$OKF_SEARCH_RC" "past a -- a filter-shaped word is the query text"
+  assert_eq '["--repo"]' "$(_okf_request 1 '.input')" "and is embedded as written"
+  assert_eq "false" "$(_okf_request 2 'has("filter")')" "narrowing nothing"
+
+  # Every way a flag that takes a value can be mistyped, and every one of them
+  # refused before the query is embedded — a refusal after the request has gone
+  # is a refusal somebody has already paid for.
+  local flag
+  for flag in --repo --type; do
+    _okf_search "a query" "$flag" || return 1
+    assert_eq "1" "$OKF_SEARCH_RC" "$flag with nothing after it is refused"
+    assert_contains "$OKF_SEARCH_ERR" "usage: okf search" "with SPEC.md §7's usage line"
+    assert_eq "0" "$(_okf_request_count)" "and nothing is sent"
+
+    # A value that is itself a flag is a value that was left out: narrowing to
+    # a repo called `--type` is not what anybody typing this meant.
+    _okf_search "a query" "$flag" --k 2 || return 1
+    assert_eq "1" "$OKF_SEARCH_RC" "$flag followed by a flag is a value left out, and is refused"
+    assert_eq "0" "$(_okf_request_count)" "with nothing sent under it"
+
+    _okf_search "a query" "$flag" "" || return 1
+    assert_eq "1" "$OKF_SEARCH_RC" "$flag given an empty value is refused"
+    assert_eq "0" "$(_okf_request_count)" "rather than sent as a filter matching nothing"
+
+    _okf_search "a query" "$flag=" || return 1
+    assert_eq "1" "$OKF_SEARCH_RC" "$flag= is the same empty value, and is refused too"
+    assert_eq "0" "$(_okf_request_count)" "with nothing sent under it"
+
+    # Two of one filter are two different questions, and picking either is
+    # answering one the caller did not ask.
+    _okf_search "a query" "$flag" one "$flag" two || return 1
+    assert_eq "1" "$OKF_SEARCH_RC" "$flag given twice is refused rather than one of them chosen"
+    assert_eq "0" "$(_okf_request_count)" "with nothing sent under either"
+
+    _okf_search "a query" "$flag=one" "$flag=two" || return 1
+    assert_eq "1" "$OKF_SEARCH_RC" "$flag=V given twice is refused the same way"
+
+    _okf_search "a query" "$flag" one "$flag=two" || return 1
+    assert_eq "1" "$OKF_SEARCH_RC" "and so are the two spellings mixed"
+  done
+
+  # A filter is not a query: the operand is still needed, and still only one.
+  _okf_search --repo kitchen || return 1
+  assert_eq "1" "$OKF_SEARCH_RC" "a filter without a query is still a search with nothing to search for"
+  assert_eq "0" "$(_okf_request_count)" "and nothing is sent"
+  return 0
+}
+
+test_okf_search_filters_by_repo_and_type() {
+  _okf_preconditions || return 1
+  with_fixture_repo chunks _okf_search_filter_probe
+}
+
 # The command lines okf search will not act on, and the answers it cannot use.
 # Each of these would otherwise be a ranking presented as an answer to a
 # question nobody asked.

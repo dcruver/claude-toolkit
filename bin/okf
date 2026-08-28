@@ -7943,8 +7943,10 @@ OKF_SEARCH_RESPONSE_JQ='
 # mistyped `collection` setting with an empty index that looks like a working
 # one.
 cmd_search() {
-  local usage="usage: okf search <query> [--k N]"
+  local usage="usage: okf search <query> [--k N] [--repo R] [--type T]"
   local k="" seen_k=0 endflags=0
+  local filter_repo="" seen_repo=0
+  local filter_type="" seen_type=0
   local -a rest=()
 
   # cmd_verify's loop with `--k` where its `--by` is, and for the same reason:
@@ -7978,6 +7980,40 @@ cmd_search() {
         seen_k=1
         k="${1#--k=}"
         ;;
+      # SPEC.md §7's two payload filters, read by one branch because they are
+      # one flag with two names: each narrows the search to the points whose
+      # payload field equals what was given, and nothing about how either is
+      # written, or refused, differs from the other. Both spellings are taken
+      # here too — see `--k=` above for why the GNU one has to be.
+      --repo | --type | --repo=* | --type=*)
+        local flag="${1%%=*}" value=""
+        case "$1" in
+          *=*) value="${1#*=}" ;;
+          *)
+            shift
+            [ $# -gt 0 ] || die "search: $flag needs a value" "$usage"
+            # A value that is itself a flag is a filter whose value was left
+            # out, and `okf search q --repo --type Class` would otherwise
+            # narrow the search to a repo literally called `--type`.
+            case "$1" in
+              -*) die "search: $flag needs a value, but the next word is a flag: $1" "$usage" ;;
+            esac
+            value="$1"
+            ;;
+        esac
+        case "$flag" in
+          --repo)
+            [ "$seen_repo" -eq 0 ] || die "search: --repo given more than once"
+            seen_repo=1
+            filter_repo="$value"
+            ;;
+          *)
+            [ "$seen_type" -eq 0 ] || die "search: --type given more than once"
+            seen_type=1
+            filter_type="$value"
+            ;;
+        esac
+        ;;
       -*) die "search: unknown flag: $1" "$usage" ;;
       *) rest+=("$1") ;;
     esac
@@ -8002,6 +8038,19 @@ cmd_search() {
   else
     k="$OKF_DEFAULT_K"
   fi
+
+  # An empty filter value is cmd_verify's empty `--by`: a flag typed with its
+  # value left as an empty word. It cannot be honoured as written — no point
+  # SPEC.md §9 wrote carries an empty `repo`, and a concept with no `type` is
+  # not addressable by one — so it would be a filter that quietly matches
+  # nothing, reported as a query the bundle has no answer to.
+  #
+  # It is also what makes the empty string usable below as "this filter was not
+  # given": with both refused here, the two cannot be confused there.
+  [ "$seen_repo" -eq 0 ] || [ -n "$filter_repo" ] \
+    || die "search: --repo needs a repo, not an empty argument" "$usage"
+  [ "$seen_type" -eq 0 ] || [ -n "$filter_type" ] \
+    || die "search: --type needs a type, not an empty argument" "$usage"
 
   local count="${#rest[@]}"
   [ "$count" -gt 0 ] || die "search needs a query to search for" "$usage"
@@ -8033,10 +8082,30 @@ cmd_search() {
   # so a vector of the wrong width is refused here rather than by Qdrant.
   embed_texts "$query"
 
+  # SPEC.md §9's `--repo` and `--type` are a Qdrant payload filter and not a
+  # pass over the hits okf got back: filtered at the collection, `--k` still
+  # means "k results", where filtering afterwards would mean "as many of the
+  # top k as happened to match" — a narrower question answered with a shorter
+  # list rather than a better one.
+  #
+  # `must`, so two filters are an and: SPEC.md §9 gives them different payload
+  # fields, and a caller who names both a repo and a type is naming one corpus
+  # rather than two.
+  #
+  # No `filter` key at all when neither was given, rather than an empty one:
+  # `{"must": []}` is a clause Qdrant has to be told to ignore, and a request
+  # that carries no filter is the request `okf search` sent before this flag
+  # existed.
   local request
   request="$(jq -n -c --argjson vector "${OKF_EMBED_VECTORS[0]}" \
-      --argjson limit "$k" '
-      {vector: $vector, limit: $limit, with_payload: true, with_vector: false}')" \
+      --argjson limit "$k" \
+      --arg repo "$filter_repo" \
+      --arg type "$filter_type" '
+      [ if $repo == "" then empty else {key: "repo", match: {value: $repo}} end,
+        if $type == "" then empty else {key: "type", match: {value: $type}} end ]
+      as $must
+      | {vector: $vector, limit: $limit, with_payload: true, with_vector: false}
+        + (if ($must | length) == 0 then {} else {filter: {must: $must}} end)')" \
     || die "the search request could not be rendered as JSON"
 
   # `with_payload` because the payload is the answer: SPEC.md §9 stores no chunk
