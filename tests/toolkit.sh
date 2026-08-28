@@ -13709,6 +13709,232 @@ test_okf_search_command_answers_the_hyde_prompt_itself() {
   with_fixture_repo chunks _okf_search_command_ranking_probe "$block"
 }
 
+# The `rg …` command lines out of the document's fenced blocks, read the same
+# way and for the same reason as the `okf …` ones: a sentence about sweeping
+# the concepts satisfies any grep for the words and is not a command anybody
+# can run, so what is collected here is the line the reader would paste.
+_okf_search_command_rg_invocations() { # $1 = path to the document
+  awk '{ sub(/\r$/, "") }
+       !in_block && /^```/ { in_block = 1; next }
+       in_block && /^```/ { in_block = 0; next }
+       in_block && /^rg[ \t]/ { print }' "$1"
+}
+
+# Where the ripgrep fallback starts: the line number of the bold heading
+# nearest above the document's first fenced `rg` line. Found from the command
+# line outwards rather than by looking for a heading with "fallback" in it,
+# because the wording of the heading is the document's to choose and the sweep
+# is the thing that has to be there — anchoring on the second is anchoring on
+# what this test is about. Empty when the document has no such command line.
+_okf_search_command_fallback_start() { # $1 = path to the document
+  awk '{ sub(/\r$/, ""); line[NR] = $0 }
+       !in_block && /^```/ { in_block = 1; next }
+       in_block && /^```/ { in_block = 0; next }
+       in_block && !rg_at && /^rg[ \t]/ { rg_at = NR }
+       END {
+         if (!rg_at) exit 0
+         for (i = rg_at; i >= 1; i--)
+           if (line[i] ~ /^\*\*/) { print i; exit 0 }
+       }' "$1"
+}
+
+# That section, heading included, stopping where the numbered steps pick up
+# again — the same boundary _onboard_step_text uses, so a fallback written
+# between two steps is read as its own section rather than as part of one.
+_okf_search_command_fallback_text() { # $1 = path to the document, $2 = start line
+  awk -v start="$2" '{ sub(/\r$/, "") }
+       NR < start { next }
+       NR > start && (/^\*\*[0-9]+\./ || /^\*\*Report\*\*/) { exit }
+       { print }' "$1"
+}
+
+# The sweep run rather than read. A command line in a document is a claim about
+# flags somebody will paste, and both ways it can be wrong are silent on the
+# page: a flag this ripgrep does not accept comes back as nothing found, which
+# reads exactly like a bundle with no answer, and a sweep whose terms match no
+# concept is a fallback that demonstrates nothing. The chunks fixture answers
+# both — its concepts are markdown beside their sources, and its README.md is
+# markdown that is not a concept, which is the case the document's "drop
+# whatever is not a concept" bullet exists for and the one thing a glob over
+# `*.md` cannot do on its own.
+_okf_search_command_sweep_probe() { # $1 = the rg command line from the document
+  local sweep="$1" out rc=0 path first concepts=0 strays=0
+
+  out="$(bash -c "$sweep" 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    _fail "the document's ripgrep sweep runs, and finds something" \
+      "it exited $rc in the chunks fixture — 1 is 'no file matched' and 2 is" \
+      "ripgrep refusing the line itself:" \
+      "$sweep" "$out"
+    return 1
+  fi
+  _pass "the document's ripgrep sweep runs, and finds something"
+
+  # Every path it named, split into the concepts and the markdown that is not
+  # one, by SPEC.md §4's opening `---` — the same test the document tells the
+  # reader to apply, applied to what the document's own line brings back.
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    [ -f "$path" ] || continue
+    first="$(head -n 1 "$path")"
+    first="${first%$'\r'}"
+    if [ "$first" = "---" ]; then
+      concepts=$((concepts + 1))
+    else
+      strays=$((strays + 1))
+    fi
+  done <<< "$out"
+
+  if printf '%s\n' "$out" | grep -qx 'src/kitchen/Router.md'; then
+    _pass "and it names the concept that answers the question it is drawn from"
+  else
+    _fail "and it names the concept that answers the question it is drawn from" \
+      "src/kitchen/Router.md documents the class that chooses a handler for a" \
+      "request path, and the document's terms did not reach it:" \
+      "$out"
+  fi
+  if [ "$concepts" -gt 0 ]; then
+    _pass "the sweep reaches co-located concept files: $concepts of them"
+  else
+    _fail "the sweep reaches co-located concept files" \
+      "none of the files it named opens with SPEC.md §4's --- on line 1, so" \
+      "the fallback sweeps something other than the concepts:" "$out"
+  fi
+  if [ "$strays" -gt 0 ]; then
+    _pass "and brings back markdown that is not a concept, which is what the filter is for"
+  else
+    _fail "and brings back markdown that is not a concept" \
+      "every file it named is a concept in this fixture, so the document's" \
+      "instruction to drop what is not one is a rule about a case that never" \
+      "arises — check the fixture still carries a README.md the terms match"
+  fi
+  return 0
+}
+
+# SPEC.md §6 makes Tier B opt-in, so `okf search` exits 2 on a bundle with no
+# `index` block — and a bundle that never opted in is still a bundle full of
+# concept files. The document's answer to that is a ripgrep sweep over them,
+# and what is pinned here is the three things a rewrite loses one at a time:
+# that the sweep is there as a command line rather than as a description of
+# one, that a reader is sent to it from the exit 2 and told in a note what they
+# are getting instead, and that the line it hands them is one ripgrep accepts
+# and does find a concept with.
+#
+# Kept apart from test_okf_search_command_answers_the_hyde_prompt_itself
+# deliberately: that test is about the seam between okf and the model on the
+# path where Tier B is on, and this is the path where none of it runs.
+test_okf_search_command_falls_back_to_a_ripgrep_sweep() {
+  local doc="$TOOLKIT_ROOT/commands/okf-search.md"
+  if [ ! -f "$doc" ]; then
+    _fail "commands/okf-search.md exists" "no such file: $doc"
+    return 1
+  fi
+  if ! command -v rg > /dev/null 2>&1; then
+    _fail "rg is installed" \
+      "SPEC.md §3 makes rg a hard requirement of bin/okf, and the fallback" \
+      "this test reads is a ripgrep sweep — install ripgrep before reading" \
+      "anything into this failure"
+    return 1
+  fi
+
+  local sweeps sweep
+  sweeps="$(_okf_search_command_rg_invocations "$doc")"
+  sweep="$(printf '%s\n' "$sweeps" | head -1)"
+  if [ -z "$sweep" ]; then
+    _fail "commands/okf-search.md gives the fallback sweep as a command line" \
+      "no fenced block in the document holds a line beginning 'rg ', so a" \
+      "reader stopped by the exit 2 is left with prose about a sweep and no" \
+      "way to run one"
+    return 1
+  fi
+  _pass "commands/okf-search.md gives the fallback sweep as a command line"
+
+  local start fallback before
+  start="$(_okf_search_command_fallback_start "$doc")"
+  if [ -z "$start" ]; then
+    _fail "the sweep sits in a section of its own" \
+      "no '**' heading anywhere above the rg command line in $doc"
+    return 1
+  fi
+  fallback="$(_okf_search_command_fallback_text "$doc" "$start")"
+  # Everything above the section, frontmatter excluded: the description names
+  # the fallback too — it is what the user reads at the prompt — so a `before`
+  # taken over the whole file would answer the pointer check below out of the
+  # frontmatter with every mention in the steps themselves deleted.
+  before="$(awk -v start="$start" '{ sub(/\r$/, "") }
+                                   NR >= start { exit }
+                                   NR == 1 && $0 == "---" { in_front = 1; next }
+                                   in_front && $0 == "---" { in_front = 0; next }
+                                   !in_front' "$doc")"
+
+  # A fallback nobody is sent to is dead prose, and the place a reader is
+  # standing when they need it is the exit 2 in step 1. Asked of the document
+  # above the section rather than of a particular bullet: the house layout puts
+  # a bullet on one long line, and a hard-wrapped rewrite of the same sentence
+  # would still be sending the reader here.
+  if printf '%s\n' "$before" | grep -qiE 'fallback|sweep|ripgrep'; then
+    _pass "step 1 sends the reader to it rather than ending the command"
+  else
+    _fail "step 1 sends the reader to it rather than ending the command" \
+      "nothing above the sweep mentions a fallback at all, so the section is" \
+      "reachable only by reading past the stop that precedes it"
+  fi
+
+  # The note, which is the whole difference between a documented fallback and a
+  # lesser search passed off as the one that was asked for.
+  if printf '%s\n' "$fallback" | grep -qiE 'print[^.]*\bnote\b|\bnote\b[^.]*\bbefore\b'; then
+    _pass "it has the reader print a note saying what ran instead"
+  else
+    _fail "it has the reader print a note saying what ran instead" \
+      "the fallback section never says to print a note, so a sweep is reported" \
+      "to the user in the shape of the vector search they asked for"
+  fi
+  if printf '%s\n' "$fallback" | grep -qiE 'literal|substring|not a (semantic|vector)'; then
+    _pass "and says in what way it is not the search — the matching is literal"
+  else
+    _fail "and says in what way it is not the search — the matching is literal" \
+      "the section never says that the sweep matches text literally, which is" \
+      "the one thing that makes an empty result here mean 'no concept contains" \
+      "these strings' rather than 'this bundle has no answer'"
+  fi
+  # And that the command line makes good on it. Without --fixed-strings every
+  # term ripgrep is handed is a regular expression, which makes the note the
+  # document has the model print false of the line printed beside it: a method
+  # name lifted out of the question matches text that is not it, and one
+  # carrying an unbalanced bracket does not fail to match — ripgrep exits 2 on
+  # it, and a sweep that never ran is then reported as a bundle with nothing in
+  # it. This is the one claim in the section that a flag, rather than a
+  # sentence, has to keep.
+  if printf '%s\n' "$sweep" | grep -qE -- '(^| )(--fixed-strings|-F)( |$)'; then
+    _pass "and the sweep is fixed-string, so the matching really is literal"
+  else
+    _fail "and the sweep is fixed-string, so the matching really is literal" \
+      "the command line carries neither --fixed-strings nor -F, so ripgrep" \
+      "reads every term the question is cut into as a pattern:" "$sweep"
+  fi
+
+  # The tiers, again and by hand. Step 4 has them off the payload `okf embed`
+  # stamped; nothing on this path has a payload, so a section that dropped them
+  # would leave every concept it hands back ungraded — which is the one thing
+  # this command is for. Read out of SPEC.md §8 rather than listed here, as the
+  # sibling check does.
+  local tiers tier
+  tiers="$(_okf_spec_trust_tiers)"
+  if [ -z "$tiers" ]; then
+    _fail "SPEC.md §8 names the trust tiers the fallback grades by" \
+      "no '→ **Tier**' found in the section, so there is nothing to hold the" \
+      "document to"
+  fi
+  while IFS= read -r tier; do
+    [ -n "$tier" ] || continue
+    assert_contains "$fallback" "$tier" \
+      "the fallback grades what it finds by SPEC.md §8's $tier as well"
+  done < <(printf '%s\n' "$tiers")
+
+  # And the line itself, against a bundle rather than against the prose.
+  with_fixture_repo chunks _okf_search_command_sweep_probe "$sweep"
+}
+
 # SPEC.md §11: /onboard gains an OKF step *after* the CLAUDE.md write and the
 # verified baseline build, and skips with a printed note when okf is not
 # installed. Ordering is the load-bearing part and the part prose loses first:
