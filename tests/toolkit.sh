@@ -9408,6 +9408,9 @@ test_okf_chunk_gives_every_method_chunk_its_own_symbol() {
 #                                carry the vector of its own chunk
 #   OKF_FAKE_CURL_QDRANT_BODY    a canned Qdrant response body
 #   OKF_FAKE_CURL_QDRANT_EXIT    fail the way an unreachable Qdrant fails
+#   OKF_FAKE_CURL_SEARCH_STATUS  the status a search answers with (default 200)
+#   OKF_FAKE_CURL_HITS           the points a search matches, as a JSON array of
+#                                Qdrant result entries (default none)
 OKF_FAKE_CURL_BIN=""
 _okf_fake_curl_bin() {
   OKF_FAKE_CURL_BIN="$HARNESS_STATE/fake-curl-bin"
@@ -9489,12 +9492,23 @@ if [ "$kind" = "qdrant" ]; then
     */points | */points\?*) points=1 ;;
   esac
 
+  # A search is a POST one path below the points endpoint, which is why the
+  # patterns above do not catch it: an upsert and a search are both POSTs or
+  # PUTs under /points, and answering one with the other's body would let a
+  # search read back "the upsert was applied" as its top hit.
+  search=0
+  case "$url" in
+    */points/search | */points/search\?*) search=1 ;;
+  esac
+
   # A collection the run has already created is there for the rest of it, the
   # way a real Qdrant would have it — so a second GET in one run cannot answer
   # 404 to a collection okf just made.
   status="${OKF_FAKE_CURL_QDRANT_STATUS:-}"
   if [ -z "$status" ]; then
-    if [ "$points" -eq 1 ]; then
+    if [ "$search" -eq 1 ]; then
+      status="${OKF_FAKE_CURL_SEARCH_STATUS:-200}"
+    elif [ "$points" -eq 1 ]; then
       status="${OKF_FAKE_CURL_POINTS_STATUS:-200}"
     elif [ "$method" = "PUT" ]; then
       status="${OKF_FAKE_CURL_CREATE_STATUS:-200}"
@@ -9513,6 +9527,13 @@ if [ "$kind" = "qdrant" ]; then
     printf '%s' "$OKF_FAKE_CURL_QDRANT_BODY"
   elif [ "$status" = "404" ]; then
     printf '%s' '{"status": {"error": "Not found: Collection does not exist!"}, "time": 0.0}'
+  elif [ "$search" -eq 1 ]; then
+    # What Qdrant answers a search: the points it matched, best first, cut to
+    # the `limit` the request asked for. The cut is the fake honouring the
+    # request rather than the test doing it, so that a check on the number of
+    # results shows --k reaching Qdrant and not only okf printing fewer lines.
+    printf '%s' "$body" | jq -c --argjson hits "${OKF_FAKE_CURL_HITS:-[]}" \
+      '{result: $hits[0:(.limit // ($hits | length))], status: "ok", time: 0.0}'
   elif [ "$points" -eq 1 ]; then
     # What Qdrant answers an upsert it has applied — `completed` and not
     # `acknowledged`, which is the difference `?wait=true` buys.
@@ -9580,27 +9601,64 @@ _okf_index_block() { # $1 = a directory to write okf.json into, $2 = the block, 
 #
 # Every run starts with an empty recording directory, so "no request was sent"
 # is an honestly empty directory rather than the leftovers of the run before.
+#
+# One subcommand run against that fake curl, which is the arrangement both Tier
+# B subcommands that speak HTTP are exercised through: `okf embed` sends the
+# corpus and `okf search` sends a query, and neither of them may reach a socket.
+OKF_FAKE_CURL_OUT=""
+OKF_FAKE_CURL_ERR=""
+OKF_FAKE_CURL_RC=0
+OKF_FAKE_CURL_REQUESTS=""
+_okf_fake_curl_run() { # $1 = the subcommand, $2.. = its arguments
+  local sub="$1"
+  shift
+  _okf_fake_curl_bin || return 1
+  OKF_FAKE_CURL_REQUESTS="$HARNESS_STATE/fake-curl-requests"
+  rm -rf "$OKF_FAKE_CURL_REQUESTS"
+  if ! mkdir -p "$OKF_FAKE_CURL_REQUESTS"; then
+    _fail "$CURRENT_TEST records the requests okf makes" \
+      "could not create $OKF_FAKE_CURL_REQUESTS"
+    return 1
+  fi
+
+  local stderr="$HARNESS_STATE/okf-$sub-stderr"
+  : > "$stderr"
+  OKF_FAKE_CURL_OUT="$(PATH="$OKF_FAKE_CURL_BIN:$PATH" \
+    OKF_FAKE_CURL_DIR="$OKF_FAKE_CURL_REQUESTS" \
+    "$TOOLKIT_ROOT/bin/okf" "$sub" ${1+"$@"} 2> "$stderr")"
+  OKF_FAKE_CURL_RC=$?
+  OKF_FAKE_CURL_ERR="$(cat "$stderr" 2> /dev/null)"
+  return 0
+}
+
+# What the last _okf_fake_curl_run recorded, whichever subcommand made it: how
+# many requests there were, and one request's body, URL or argument vector by
+# its number. The embed-only accessors below add to these rather than replace
+# them — a run that reaches two endpoints in turn needs to tell them apart,
+# where `okf search` makes one request to each and can count.
+_okf_request_count() {
+  cat "$OKF_FAKE_CURL_REQUESTS/count" 2> /dev/null || printf '0\n'
+}
+_okf_request() { # $1 = which request, from 1, $2 = a jq filter
+  jq -c -r "$2" "$OKF_FAKE_CURL_REQUESTS/req-$1.json" 2> /dev/null
+}
+_okf_request_url() { # $1 = which request, from 1
+  sed -n "$1p" "$OKF_FAKE_CURL_REQUESTS/urls" 2> /dev/null
+}
+_okf_request_argv() { # $1 = which request, from 1
+  cat "$OKF_FAKE_CURL_REQUESTS/argv-$1" 2> /dev/null
+}
+
 OKF_EMBED_OUT=""
 OKF_EMBED_ERR=""
 OKF_EMBED_RC=0
 OKF_EMBED_REQUESTS=""
 _okf_embed() { # $1.. = arguments after `embed`
-  _okf_fake_curl_bin || return 1
-  OKF_EMBED_REQUESTS="$HARNESS_STATE/fake-curl-requests"
-  rm -rf "$OKF_EMBED_REQUESTS"
-  if ! mkdir -p "$OKF_EMBED_REQUESTS"; then
-    _fail "$CURRENT_TEST records the requests okf makes" \
-      "could not create $OKF_EMBED_REQUESTS"
-    return 1
-  fi
-
-  local stderr="$HARNESS_STATE/okf-embed-stderr"
-  : > "$stderr"
-  OKF_EMBED_OUT="$(PATH="$OKF_FAKE_CURL_BIN:$PATH" \
-    OKF_FAKE_CURL_DIR="$OKF_EMBED_REQUESTS" \
-    "$TOOLKIT_ROOT/bin/okf" embed ${1+"$@"} 2> "$stderr")"
-  OKF_EMBED_RC=$?
-  OKF_EMBED_ERR="$(cat "$stderr" 2> /dev/null)"
+  _okf_fake_curl_run embed ${1+"$@"} || return 1
+  OKF_EMBED_OUT="$OKF_FAKE_CURL_OUT"
+  OKF_EMBED_ERR="$OKF_FAKE_CURL_ERR"
+  OKF_EMBED_RC="$OKF_FAKE_CURL_RC"
+  OKF_EMBED_REQUESTS="$OKF_FAKE_CURL_REQUESTS"
   return 0
 }
 
@@ -10474,6 +10532,329 @@ test_okf_embed_defaults_are_the_spec_ones() {
       _pass "bin/okf does not reach the network through $way"
     fi
   done
+}
+
+# ---------------------------------------------------------------------------
+# okf search (SPEC.md §9, §10)
+# ---------------------------------------------------------------------------
+
+# okf search's stdout, its stderr and its exit status, kept apart the way
+# _okf_embed keeps embed's apart: the ranking is stdout, "no results" and every
+# refusal is stderr, and the status says which happened.
+#
+# The same fake curl and the same recording directory _okf_embed uses — see
+# _okf_fake_curl_run. A search reaches both endpoints in turn, one request
+# apiece, so the requests are read by number here rather than filtered by which
+# endpoint answered them.
+OKF_SEARCH_OUT=""
+OKF_SEARCH_ERR=""
+OKF_SEARCH_RC=0
+_okf_search() { # $1.. = arguments after `search`
+  _okf_fake_curl_run search ${1+"$@"} || return 1
+  OKF_SEARCH_OUT="$OKF_FAKE_CURL_OUT"
+  OKF_SEARCH_ERR="$OKF_FAKE_CURL_ERR"
+  OKF_SEARCH_RC="$OKF_FAKE_CURL_RC"
+  return 0
+}
+
+# The `index` block the search probes run against: a never-resolvable embedding
+# endpoint and a never-resolvable Qdrant, both RFC 2606 `.invalid` names, so
+# that even a bug getting past the fake curl could not reach anything — SPEC.md
+# §10's rule with a second lock on it.
+OKF_SEARCH_EMBEDDING_URL="http://embeddings.invalid/v1/embeddings"
+OKF_SEARCH_QDRANT_URL="http://qdrant.invalid:6333"
+OKF_SEARCH_COLLECTION="okf_probe"
+_okf_search_configured() { # $1 = a directory to write okf.json into
+  _okf_index_block "$1" \
+    "{\"embedding_url\": \"$OKF_SEARCH_EMBEDDING_URL\",
+      \"embedding_model\": \"probe-embed-3\",
+      \"embedding_dim\": 4,
+      \"qdrant_url\": \"$OKF_SEARCH_QDRANT_URL\",
+      \"collection\": \"$OKF_SEARCH_COLLECTION\"}"
+}
+
+# The points a search matches, built out of `okf chunk`'s own output rather than
+# written by hand: SPEC.md §9 stores a chunk's payload beside its vector, so
+# what Qdrant hands back is exactly what `okf embed` would have put there. A
+# hand-written payload would agree with whatever this test happened to invent.
+#
+# Scored 1, 0.99, 0.98 … in the order the chunks come out, which is Qdrant's
+# contract — best first — and is what lets a check on --k read the top N.
+_okf_search_hits() { # $1 = a concept in the fixture
+  "$TOOLKIT_ROOT/bin/okf" chunk "$1" | jq -c '
+    to_entries
+    | map({id: "00000000-0000-5000-8000-\(100000000000 + .key)",
+           version: 0,
+           score: (1 - (.key / 100)),
+           payload: (.value | del(.heading, .text))})'
+}
+
+# SPEC.md §9's retrieval half, end to end: the query text is embedded at the
+# endpoint okf.json configures, and the vector that comes back goes to Qdrant as
+# a search over the collection okf.json names.
+_okf_search_probe() {
+  _okf_search_configured . || return 1
+
+  local hits
+  hits="$(_okf_search_hits src/kitchen/Router)"
+  if [ -z "$hits" ] || [ "$(printf '%s' "$hits" | jq 'length')" -lt 4 ]; then
+    _fail "$CURRENT_TEST can build its canned hits" \
+      "okf chunk src/kitchen/Router did not yield four chunks to answer with"
+    return 1
+  fi
+
+  # What the bundle looked like before the search, so that "read-only" is
+  # checked against the tree rather than asserted in a comment.
+  local before
+  before="$(git status --porcelain 2>&1)"
+
+  OKF_FAKE_CURL_DIM=4 OKF_FAKE_CURL_HITS="$hits" \
+    _okf_search "how does a request find its handler" || return 1
+  assert_eq "0" "$OKF_SEARCH_RC" "okf search exits 0 on a query it could answer"
+
+  # Two requests and no more: one to embed the query, one to search. A third
+  # would be okf asking Qdrant about the collection, which a read-only
+  # subcommand has no business doing on the way to a search that would have
+  # reported the same 404 itself.
+  assert_eq "2" "$(_okf_request_count)" \
+    "one request embeds the query, one searches Qdrant, and there is no third"
+
+  # The query goes to the embedding endpoint first, on its own: SPEC.md §9 has
+  # the corpus and the query embedded by the same model, or the vector is in a
+  # space the points are not in.
+  assert_eq "$OKF_SEARCH_EMBEDDING_URL" "$(_okf_request_url 1)" \
+    "the query goes to the embedding endpoint okf.json configures"
+  assert_contains "$(_okf_request_argv 1)" "POST" "as a POST"
+  assert_eq "probe-embed-3" "$(_okf_request 1 '.model')" \
+    "naming the model okf.json configures"
+  assert_eq '["how does a request find its handler"]' \
+    "$(_okf_request 1 '.input')" \
+    "and carrying the query text, and nothing else, as its input"
+
+  # And then Qdrant, at SPEC.md §9's REST search endpoint under the collection.
+  assert_eq "$OKF_SEARCH_QDRANT_URL/collections/$OKF_SEARCH_COLLECTION/points/search" \
+    "$(_okf_request_url 2)" \
+    "the vector goes to the search endpoint of the collection okf.json names"
+  assert_contains "$(_okf_request_argv 2)" "POST" "as a POST"
+  assert_contains "$(_okf_request_argv 2)" "Content-Type: application/json" \
+    "declaring a JSON body"
+  assert_eq "[0.25,0.25,0.25,0.25]" "$(_okf_request 2 '.vector')" \
+    "carrying the vector the embedding endpoint just answered with"
+  assert_eq "true" "$(_okf_request 2 '.with_payload')" \
+    "and asking for the payload, which is the whole of what a hit says"
+
+  # The ranking itself, one line per hit in the order Qdrant scored them, each
+  # naming the concept it is in, what kind of chunk it is, its symbol and where
+  # in the source to look.
+  local expected="" i=0 total
+  total="$(printf '%s' "$hits" | jq 'length')"
+  while [ "$i" -lt "$total" ]; do
+    # The score to four places, worked out here rather than read back out of
+    # okf — an expectation taken from the output it is checking would agree
+    # with whatever okf happened to print. Written the short way that only
+    # works for the 0-to-1 scores this probe hands back: five digits, zero
+    # padded, split after the first.
+    expected="$expected$(printf '%s' "$hits" | jq -r --argjson i "$i" '
+      .[$i] as $h
+      | (("0000" + ($h.score * 10000 | round | tostring)) | .[-5:]) as $d
+      | [ "\($d[0:1]).\($d[1:5])",
+          $h.payload.concept_id, $h.payload.chunk_kind, $h.payload.symbol,
+          "\($h.payload.path):\($h.payload.lines[0])-\($h.payload.lines[1])" ]
+      | join("  ")')"$'\n'
+    i=$((i + 1))
+  done
+  # The last separator off, because OKF_SEARCH_OUT came through a command
+  # substitution and has had its own trailing newline stripped already.
+  expected="${expected%$'\n'}"
+  assert_eq "$expected" "$OKF_SEARCH_OUT" \
+    "every hit is one line: score, concept, chunk kind, symbol and where to look"
+  assert_eq "" "$OKF_SEARCH_ERR" "and a search that found something says nothing else"
+
+  # Read-only, which is what permissions.json pre-approves it as.
+  assert_eq "$before" "$(git status --porcelain 2>&1)" \
+    "a search writes nothing into the bundle it searched"
+  return 0
+}
+
+test_okf_search_embeds_the_query_and_searches_qdrant() {
+  _okf_preconditions || return 1
+  with_fixture_repo chunks _okf_search_probe
+}
+
+# SPEC.md §7's `--k N`, which is a limit on the search and not a cut made after
+# it: the number reaches Qdrant in the request body, where it decides what the
+# collection is asked for rather than what okf prints of the answer.
+_okf_search_k_probe() {
+  _okf_search_configured . || return 1
+
+  local hits
+  hits="$(_okf_search_hits src/kitchen/Router)"
+  if [ -z "$hits" ]; then
+    _fail "$CURRENT_TEST can build its canned hits" "okf chunk yielded nothing"
+    return 1
+  fi
+
+  OKF_FAKE_CURL_DIM=4 OKF_FAKE_CURL_HITS="$hits" _okf_search a query || return 1
+  assert_eq "1" "$OKF_SEARCH_RC" "search takes one query, so two are refused"
+  assert_eq "0" "$(_okf_request_count)" "before anything is sent"
+
+  OKF_FAKE_CURL_DIM=4 OKF_FAKE_CURL_HITS="$hits" _okf_search "a query" || return 1
+  assert_eq "$(_okf_bin_scalar OKF_DEFAULT_K)" "$(_okf_request 2 '.limit')" \
+    "with no --k, the request carries bin/okf's own default"
+
+  OKF_FAKE_CURL_DIM=4 OKF_FAKE_CURL_HITS="$hits" _okf_search "a query" --k 2 \
+    || return 1
+  assert_eq "0" "$OKF_SEARCH_RC" "okf search --k 2 exits 0"
+  assert_eq "2" "$(_okf_request 2 '.limit')" "and asks Qdrant for two"
+  assert_eq "2" "$(_okf_line_count "$OKF_SEARCH_OUT")" \
+    "which is how many come back, and how many are printed"
+
+  # The GNU spelling, for the reason `--config=PATH` is accepted: left to fall
+  # through it would be a limit searched for as a query.
+  OKF_FAKE_CURL_DIM=4 OKF_FAKE_CURL_HITS="$hits" _okf_search --k=3 "a query" \
+    || return 1
+  assert_eq "3" "$(_okf_request 2 '.limit')" "--k=N says the same thing as --k N"
+  assert_eq "3" "$(_okf_line_count "$OKF_SEARCH_OUT")" "and is honoured the same way"
+
+  # Leading zeros are a written-out ten and not an octal eight, which is what
+  # bash's own `[` would have made of it.
+  OKF_FAKE_CURL_DIM=4 OKF_FAKE_CURL_HITS="$hits" _okf_search "a query" --k 010 \
+    || return 1
+  assert_eq "10" "$(_okf_request 2 '.limit')" "--k 010 is ten, not bash's octal eight"
+
+  # A flag SPEC.md §7 gives a value is a flag whose value can be left out, given
+  # twice, or written as something that is not a count. Every one of them is
+  # refused before the query is embedded — a refusal after the request has gone
+  # is a refusal somebody has already paid for.
+  local bad
+  for bad in 0 -1 abc 1.5 " " 1234567890123; do
+    OKF_FAKE_CURL_DIM=4 OKF_FAKE_CURL_HITS="$hits" _okf_search "a query" --k "$bad" \
+      || return 1
+    assert_eq "1" "$OKF_SEARCH_RC" "--k $bad is not a number of results, and is refused"
+    assert_eq "0" "$(_okf_request_count)" "with nothing sent under it"
+  done
+
+  _okf_search "a query" --k || return 1
+  assert_eq "1" "$OKF_SEARCH_RC" "--k with nothing after it is refused"
+  assert_contains "$OKF_SEARCH_ERR" "usage: okf search" "with SPEC.md §7's usage line"
+
+  _okf_search "a query" --k 2 --k 3 || return 1
+  assert_eq "1" "$OKF_SEARCH_RC" "--k given twice is refused rather than one of them chosen"
+  assert_eq "0" "$(_okf_request_count)" "with nothing sent under either"
+  return 0
+}
+
+test_okf_search_limits_the_results_with_k() {
+  _okf_preconditions || return 1
+  with_fixture_repo chunks _okf_search_k_probe
+}
+
+# The command lines okf search will not act on, and the answers it cannot use.
+# Each of these would otherwise be a ranking presented as an answer to a
+# question nobody asked.
+_okf_search_refusal_probe() {
+  _okf_search_configured . || return 1
+
+  _okf_search || return 1
+  assert_eq "1" "$OKF_SEARCH_RC" "search needs a query, so a bare invocation is refused"
+  assert_contains "$OKF_SEARCH_ERR" "usage: okf search" "with SPEC.md §7's usage line"
+  assert_eq "0" "$(_okf_request_count)" "and nothing is sent"
+
+  _okf_search "" || return 1
+  assert_eq "1" "$OKF_SEARCH_RC" "an empty query is refused"
+  assert_eq "0" "$(_okf_request_count)" "before an endpoint is paid to embed it"
+
+  _okf_search "   " || return 1
+  assert_eq "1" "$OKF_SEARCH_RC" "and so is one that is only whitespace"
+
+  _okf_search "a query" --everything || return 1
+  assert_eq "1" "$OKF_SEARCH_RC" "a flag SPEC.md §7 does not give it is refused"
+  assert_eq "0" "$(_okf_request_count)" "before anything is sent"
+
+  # Past a `--` the same word is the query, which is what the preflight already
+  # assumes when it holds `okf search -- --hyde-prompt` to curl.
+  OKF_FAKE_CURL_DIM=4 _okf_search -- --k || return 1
+  assert_eq "0" "$OKF_SEARCH_RC" "past a -- a flag-shaped word is the query text"
+  assert_eq '["--k"]' "$(_okf_request 1 '.input')" "and is embedded as written"
+
+  # Nothing matched is an answer, not a failure — and it is said on stderr,
+  # because stdout is the ranking a caller pipes somewhere.
+  OKF_FAKE_CURL_DIM=4 _okf_search "a query nothing answers" || return 1
+  assert_eq "0" "$OKF_SEARCH_RC" "a search that matched nothing still exits 0"
+  assert_eq "" "$OKF_SEARCH_OUT" "printing no ranking at all"
+  assert_contains "$OKF_SEARCH_ERR" "no results" "and saying so on stderr"
+
+  # The embedding endpoint's failures are embed_texts' failures, so only that
+  # the run stops there is checked: a query that was never embedded must not
+  # reach Qdrant as a vector of anything.
+  OKF_FAKE_CURL_STATUS=503 OKF_FAKE_CURL_DIM=4 _okf_search "a query" || return 1
+  assert_eq "1" "$OKF_SEARCH_RC" "an embedding endpoint that refused is a refusal"
+  assert_eq "1" "$(_okf_request_count)" "and Qdrant is never asked"
+
+  OKF_FAKE_CURL_QDRANT_STATUS=500 OKF_FAKE_CURL_DIM=4 _okf_search "a query" \
+    || return 1
+  assert_eq "1" "$OKF_SEARCH_RC" "a Qdrant that answered 500 is a refusal"
+  assert_contains "$OKF_SEARCH_ERR" "500" "naming the status that came back"
+
+  OKF_FAKE_CURL_QDRANT_EXIT=7 OKF_FAKE_CURL_DIM=4 _okf_search "a query" || return 1
+  assert_eq "1" "$OKF_SEARCH_RC" "a Qdrant that could not be reached is a refusal"
+  assert_contains "$OKF_SEARCH_ERR" "curl exited 7" "reported in curl's own terms"
+
+  # A collection that is not there is the one Qdrant status with a plainer
+  # meaning than "the search failed", and the caller's next step is okf embed.
+  OKF_FAKE_CURL_SEARCH_STATUS=404 OKF_FAKE_CURL_DIM=4 _okf_search "a query" \
+    || return 1
+  assert_eq "1" "$OKF_SEARCH_RC" "a collection that is not there is a refusal"
+  assert_contains "$OKF_SEARCH_ERR" "$OKF_SEARCH_COLLECTION" "naming the collection"
+  assert_contains "$OKF_SEARCH_ERR" "okf embed" "and what fills it"
+
+  # An answer of the wrong shape is not an empty result set. Reporting one as
+  # the other would have a Qdrant that answered something else entirely read as
+  # "nothing in the bundle matches".
+  OKF_FAKE_CURL_QDRANT_BODY='<html>not json</html>' OKF_FAKE_CURL_DIM=4 \
+    _okf_search "a query" || return 1
+  assert_eq "1" "$OKF_SEARCH_RC" "a Qdrant answer that is not JSON is a refusal"
+
+  OKF_FAKE_CURL_QDRANT_BODY='{"status": "ok"}' OKF_FAKE_CURL_DIM=4 \
+    _okf_search "a query" || return 1
+  assert_eq "1" "$OKF_SEARCH_RC" "an answer carrying no result is a refusal"
+  assert_eq "" "$OKF_SEARCH_OUT" "and prints no ranking"
+
+  OKF_FAKE_CURL_QDRANT_BODY='{"result": 7, "status": "ok"}' OKF_FAKE_CURL_DIM=4 \
+    _okf_search "a query" || return 1
+  assert_eq "1" "$OKF_SEARCH_RC" "a result that is not an array is a refusal"
+
+  OKF_FAKE_CURL_QDRANT_BODY='{"result": ["a hit"], "status": "ok"}' \
+    OKF_FAKE_CURL_DIM=4 _okf_search "a query" || return 1
+  assert_eq "1" "$OKF_SEARCH_RC" "a hit that is not an object is a refusal"
+
+  # The one malformed answer that could otherwise pass for a good one: jq
+  # answers an empty input with an empty output and a zero status, which is
+  # what a collection holding nothing like the query also looks like.
+  OKF_FAKE_CURL_QDRANT_BODY='' OKF_FAKE_CURL_DIM=4 _okf_search "a query" || return 1
+  assert_eq "1" "$OKF_SEARCH_RC" "a 2xx carrying an empty body is a refusal"
+  case "$OKF_SEARCH_ERR" in
+    *"no results"*)
+      _fail "an unreadable answer is not reported as an empty result set" \
+        "$OKF_SEARCH_ERR"
+      ;;
+    *) _pass "an unreadable answer is not reported as an empty result set" ;;
+  esac
+
+  # A hit whose payload never filled a field in is still a hit — SPEC.md §4
+  # leaves `code.symbol` and `code.lines` optional, so a concept without them
+  # must still be findable rather than dropped from the ranking.
+  OKF_FAKE_CURL_QDRANT_BODY='{"result": [{"id": "x", "score": 0.5, "payload": {"concept_id": "src/kitchen/RouteKey", "chunk_kind": "summary"}}], "status": "ok"}' \
+    OKF_FAKE_CURL_DIM=4 _okf_search "a query" || return 1
+  assert_eq "0" "$OKF_SEARCH_RC" "a hit missing an optional payload field is still a hit"
+  assert_eq "0.5000  src/kitchen/RouteKey  summary  -  -" "$OKF_SEARCH_OUT" \
+    "printed with a - where the payload said nothing, so the columns still line up"
+  return 0
+}
+
+test_okf_search_refuses_what_it_cannot_answer() {
+  _okf_preconditions || return 1
+  with_fixture_repo chunks _okf_search_refusal_probe
 }
 
 # install.sh (PLAN.md Phase 6)

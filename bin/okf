@@ -7169,6 +7169,7 @@ OKF_QDRANT_URL=""
 OKF_COLLECTION=""
 OKF_COLLECTION_URL=""
 OKF_POINTS_URL=""
+OKF_SEARCH_URL=""
 qdrant_settings() {
   index_string qdrant_url "$OKF_DEFAULT_QDRANT_URL"
   local url="$OKF_INDEX_STRING"
@@ -7236,6 +7237,15 @@ qdrant_settings() {
   # every upsert goes. `?wait=true` is on it for upsert_points' reason: it is
   # what makes Qdrant's 200 mean the points are stored rather than accepted.
   OKF_POINTS_URL="$OKF_COLLECTION_URL/points?wait=true"
+
+  # And where a query goes, which is a third path under the same collection.
+  # `/points/search` and not `/points/query`: both are Qdrant's, the second is
+  # the newer of the two, and the first is the one every Qdrant that has this
+  # collection understands. SPEC.md §9 asks for "Qdrant over its **REST** API"
+  # and names no endpoint, so the older spelling is the one that costs a caller
+  # nothing — a bundle indexed by `okf embed` can be searched by an okf running
+  # against whichever Qdrant it finds.
+  OKF_SEARCH_URL="$OKF_COLLECTION_URL/points/search"
 }
 
 # Up to ten lines of a response or a curl complaint, ready to hand to `die` as
@@ -7843,8 +7853,239 @@ cmd_embed() {
     "$(count_noun "$chunks" point)" "$OKF_COLLECTION" "$OKF_QDRANT_URL"
 }
 
+# ---------------------------------------------------------------------------
+# okf search (SPEC.md §9)
+# ---------------------------------------------------------------------------
+
+# How many hits come back when SPEC.md §7's `--k` is left off.
+#
+# Not an okf.json setting, and deliberately not one: SPEC.md §6's `index` block
+# says where the points live, which is a property of the bundle, while how many
+# of them to look at is a property of the question being asked. A caller who
+# wants more says so on the line they are already typing.
+#
+# Ten because the reader is a slash command with a context window: SPEC.md §9
+# has /okf-search hand these results to a model, and a default that filled that
+# window with near-misses would make the good hits harder to find rather than
+# easier.
+OKF_DEFAULT_K=10
+
+# What jq makes of a Qdrant search response: one hit per line, best first, in
+# the order Qdrant scored them.
+#
+# The checks are embed_texts' checks for embed_texts' reason. A response okf
+# cannot read is not an empty result set — an empty result set is a question
+# with no good answer, which is worth printing "no results" for, while a
+# response of the wrong shape is a Qdrant that answered something other than
+# the search and must not be reported as "nothing matched".
+#
+# A payload field that is missing or empty prints as `-` rather than as a gap,
+# so the columns still line up under a hit whose concept never filled one in:
+# a run of two spaces in a fixed-width layout is a field a reader has to count
+# their way back to, and `-` is the field saying it has nothing.
+#
+# The score is rounded to four places because that is more than enough to order
+# hits by and far less than the seventeen a cosine similarity comes back with.
+# It is a ranking, not a measurement. Written out with its trailing zeros rather
+# than left to jq's own rendering, so that a perfect 1 and a near miss of 0.9998
+# are the same width and the column beside them stays a column.
+OKF_SEARCH_RESPONSE_JQ='
+  def shown($v): if ($v | type) == "string" and $v != "" then $v else "-" end;
+  # `length` on a number is its absolute value, which is jq'"'"'s own idiom for it
+  # and is there in every build — the C math functions are not.
+  def score4($s):
+    ($s * 10000 | round) as $n
+    | ($n | length) as $m
+    | (if $n < 0 then "-" else "" end)
+      + "\($m / 10000 | floor).\((($m % 10000) + 10000) | tostring | .[1:])";
+  def located($p):
+    shown($p.path)
+    + (if ($p.lines | type) == "array" and ($p.lines | length) == 2
+         and ($p.lines | all(type == "number"))
+       then ":\($p.lines[0])-\($p.lines[1])" else "" end);
+  if type != "object" then
+    error("the response is not a JSON object but a " + type)
+  else . end
+  | .result as $r
+  | if $r == null then error("the response carries no result")
+    elif ($r | type) != "array" then
+      error("the response carries no array for result but a " + ($r | type))
+    elif any($r[]; type != "object") then
+      error("one of the hits is not an object")
+    else . end
+  | $r[]
+  | (if (.payload | type) == "object" then .payload else {} end) as $p
+  | [ (if (.score | type) == "number" then score4(.score) else "-" end),
+      shown($p.concept_id),
+      shown($p.chunk_kind),
+      shown($p.symbol),
+      located($p) ]
+  | join("  ")
+'
+
 # okf search <query> [--hyde-prompt] [--k N] [--repo R] [--type T]
-cmd_search() { not_implemented search; }
+#
+# SPEC.md §9's retrieval half: the query text goes to the same OpenAI-shaped
+# endpoint `okf embed` sent the corpus to, and the vector that comes back goes
+# to Qdrant as a search over the same collection.
+#
+# The same endpoint and the same collection is the whole of it. A query embedded
+# by a different model, or searched against a collection filled by one, is a
+# vector in a space the points are not in — Qdrant would answer it with nearest
+# neighbours all the same, confidently and wrongly. That is why both halves read
+# their settings from the one okf.json rather than taking either on the command
+# line.
+#
+# Read-only, and named as such in permissions.json: this sends a question and
+# prints the answer. Nothing in the bundle and nothing in Qdrant changes,
+# including the collection — a search against a collection that is not there is
+# reported rather than quietly created, because creating it would answer a
+# mistyped `collection` setting with an empty index that looks like a working
+# one.
+cmd_search() {
+  local usage="usage: okf search <query> [--k N]"
+  local k="" seen_k=0 endflags=0
+  local -a rest=()
+
+  # cmd_verify's loop with `--k` where its `--by` is, and for the same reason:
+  # SPEC.md §7's global -C and --config may follow the query, so flags are read
+  # across the whole line rather than only ahead of the operand.
+  while [ $# -gt 0 ]; do
+    if [ "$endflags" -eq 1 ]; then
+      rest+=("$1")
+      shift
+      continue
+    fi
+    case "$1" in
+      --) endflags=1 ;;
+      --k)
+        shift
+        [ $# -gt 0 ] || die "search: --k needs a number" "$usage"
+        # A value that is itself a flag is a --k whose number was left out, and
+        # `okf search --k --repo x` would otherwise search for nothing at all.
+        case "$1" in
+          -*) die "search: --k needs a number, but the next word is a flag: $1" "$usage" ;;
+        esac
+        [ "$seen_k" -eq 0 ] || die "search: --k given more than once"
+        seen_k=1
+        k="$1"
+        ;;
+      # Accepted for the reason cmd_verify accepts `--by=ACTOR`: it is what
+      # anyone used to the GNU tools will type, and left to fall through it
+      # would be a limit silently searched for as a query.
+      --k=*)
+        [ "$seen_k" -eq 0 ] || die "search: --k given more than once"
+        seen_k=1
+        k="${1#--k=}"
+        ;;
+      -*) die "search: unknown flag: $1" "$usage" ;;
+      *) rest+=("$1") ;;
+    esac
+    shift
+  done
+
+  if [ "$seen_k" -eq 1 ]; then
+    case "$k" in
+      "") die "search: --k needs a number, not an empty argument" "$usage" ;;
+      *[!0-9]*) die "search: --k needs a whole number of results, found $k" "$usage" ;;
+    esac
+    # Leading zeros off before the comparison below, because bash's own
+    # arithmetic reads `010` as octal — `--k 010` is ten to everybody who types
+    # it, and eight to `[`.
+    while [ "${#k}" -gt 1 ] && [ "${k#0}" != "$k" ]; do
+      k="${k#0}"
+    done
+    # Long enough to overflow the shell's arithmetic is not a limit anybody
+    # means, and it would reach jq as a float rather than as a count.
+    [ "${#k}" -le 9 ] || die "search: --k is a limit on the results, and $k is not one" "$usage"
+    [ "$k" -gt 0 ] || die "search: --k needs at least one result, found $k" "$usage"
+  else
+    k="$OKF_DEFAULT_K"
+  fi
+
+  local count="${#rest[@]}"
+  [ "$count" -gt 0 ] || die "search needs a query to search for" "$usage"
+  # One query and not several. Two queries would be two searches, and two
+  # searches printed one after the other are a single ranking that is not one —
+  # a caller who wants both has a loop, and a ranking apiece.
+  [ "$count" -eq 1 ] || die "search takes one query, but was given $count: ${rest[*]}" \
+    "$usage"
+
+  local query="${rest[0]}"
+  # Whitespace and nothing else is not a question. An endpoint would embed it
+  # and Qdrant would rank the whole collection against whatever came back,
+  # which is a top-ten list of nothing in particular presented as an answer.
+  case "$query" in
+    *[![:space:]]*) ;;
+    *) die "search: the query is empty, and an empty query asks Qdrant nothing" "$usage" ;;
+  esac
+
+  # Both halves of the configuration read and checked before anything is sent,
+  # which is cmd_embed's order for cmd_embed's reason: a bundle whose
+  # `collection` is unusable should be told so rather than after an endpoint has
+  # been paid to embed the query.
+  embed_settings
+  qdrant_settings
+
+  # The query through the same endpoint, and the same model, the corpus went
+  # through — see this function's own comment on why that is not negotiable.
+  # embed_texts holds the answer to `embedding_dim` as it does for `okf embed`,
+  # so a vector of the wrong width is refused here rather than by Qdrant.
+  embed_texts "$query"
+
+  local request
+  request="$(jq -n -c --argjson vector "${OKF_EMBED_VECTORS[0]}" \
+      --argjson limit "$k" '
+      {vector: $vector, limit: $limit, with_payload: true, with_vector: false}')" \
+    || die "the search request could not be rendered as JSON"
+
+  # `with_payload` because the payload is the answer: SPEC.md §9 stores no chunk
+  # text beside a vector, so a hit that came back without its payload would name
+  # neither the concept it is in nor the file it documents. `with_vector` off
+  # because okf has nothing to do with the vector it already sent — asking for
+  # it back would put `embedding_dim` floats per hit on the wire for nothing.
+  http_request "Qdrant" POST "$OKF_SEARCH_URL" "$request"
+
+  # A 404 here is the one Qdrant status with a plainer meaning than "the search
+  # failed": there is no such collection. Said in those terms, because the
+  # caller's next step is `okf embed` and not an investigation of their query.
+  case "$OKF_HTTP_STATUS" in
+    404)
+      die "Qdrant at $OKF_QDRANT_URL has no collection called $OKF_COLLECTION, so there is nothing to search" \
+        "\`okf embed\` creates it and fills it from the bundle"
+      ;;
+  esac
+  http_ok_or_die "Qdrant" "$OKF_SEARCH_URL"
+
+  # A 2xx carrying an empty body is no JSON at all, and jq answers an empty
+  # input with an empty output and a zero status — which would come out of the
+  # jq below indistinguishable from a search that matched nothing, and be
+  # printed as "no results". That is exactly the confusion this subcommand must
+  # not make: "the collection holds nothing like your query" and "Qdrant said
+  # nothing okf could read" are different answers, and only one of them is an
+  # answer. embed_texts counts its way to the same guard for the same reason.
+  case "$OKF_HTTP_BODY" in
+    *[![:space:]]*) ;;
+    *)
+      die "Qdrant at $OKF_SEARCH_URL answered $OKF_HTTP_STATUS with an empty body, which is not a search result"
+      ;;
+  esac
+
+  local hits
+  hits="$(printf '%s\n' "$OKF_HTTP_BODY" | jq -r "$OKF_SEARCH_RESPONSE_JQ" 2>&1)" \
+    || die "Qdrant at $OKF_SEARCH_URL answered with something okf cannot use: ${hits#jq: error*: }"
+
+  # Nothing matched, which is an answer rather than a failure — so it exits 0,
+  # and says so on stderr rather than on stdout. stdout is the ranking a caller
+  # pipes somewhere, and a sentence in it would be a hit that names no concept.
+  if [ -z "$hits" ]; then
+    warn "no results for that query in collection $OKF_COLLECTION at $OKF_QDRANT_URL" \
+      "\`okf embed\` is what fills it, and \`okf search --k N\` widens the search"
+    return 0
+  fi
+
+  printf '%s\n' "$hits"
+}
 
 # ---------------------------------------------------------------------------
 # Dispatch
