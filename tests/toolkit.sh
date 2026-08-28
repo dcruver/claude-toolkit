@@ -13263,6 +13263,452 @@ test_okf_verify_command_walks_the_unconfirmed_queue() {
   with_fixture_repo concepts _okf_verify_command_spelling_probe
 }
 
+# SPEC.md §8's trust tiers, by name, read back out of the paragraph that defines
+# them rather than restated here: commands/okf-search.md prints one beside every
+# concept it offers, so a tier renamed in the spec and not in the command is a
+# document naming a grade `okf` never answers with.
+#
+# Anchored on the `→ ` that introduces each one, and not merely on the bold:
+# §8 bolds ordinary words too — its emphatic `**never**` today, and whatever a
+# later edit emphasises — and each of those would otherwise become a phantom
+# tier the command doc is failed for not explaining. The arrow is what makes a
+# bolded word one of §8's answers rather than a word §8 stresses.
+_okf_spec_trust_tiers() {
+  awk '/^## 8\./ { in_section = 1; next }
+       in_section && /^## / { exit }
+       in_section' "$TOOLKIT_ROOT/SPEC.md" |
+    grep -oE '→ \*\*[A-Z][A-Za-z-]*\*\*' | tr -d '*' | sed 's/^→ //' | sort -u
+}
+
+# The document's worked example of a ranking: the first fenced block whose
+# opening line starts at column one and whose next line is indented, which is
+# the shape `okf search` prints and the one no other block in the document has.
+# Found by shape rather than by counting fenced blocks, so a command line added
+# above it does not silently shift which block is checked.
+_okf_search_command_ranking_block() { # $1 = path to the document
+  awk '{ sub(/\r$/, "") }
+       !in_block && /^```/ { in_block = 1; n = 0; next }
+       in_block && /^```/ {
+         in_block = 0
+         if (n >= 2 && line[1] ~ /^[^ `]/ && line[2] ~ /^  [^ ]/) {
+           for (i = 1; i <= n; i++) print line[i]
+           exit
+         }
+         next
+       }
+       in_block { line[++n] = $0 }' "$1"
+}
+
+# The `okf …` command lines out of the document's fenced blocks, which are the
+# invocations it actually tells the reader to run.
+#
+# Read separately from the backticked mentions in the prose, because the two
+# cannot stand in for each other: a sentence saying `okf search` warns on stderr
+# satisfies any grep for the words and is not an instruction to run anything, so
+# a check on the prose alone stays green with both command blocks deleted. What
+# the document owes the reader is the command lines; these are them.
+_okf_search_command_invocations() { # $1 = path to the document
+  awk '{ sub(/\r$/, "") }
+       !in_block && /^```/ { in_block = 1; next }
+       in_block && /^```/ { in_block = 0; next }
+       in_block && /^okf[ \t]/ { print }' "$1"
+}
+
+# One line of that fixed-width layout, split on the two-space separator okf
+# joins its columns with. The indent is stripped first, so a hit line and a
+# header line are counted the same way and a missing indent shows up as a field
+# count that does not match rather than as an empty leading column.
+_okf_search_line_fields() { # $1 = one line of a ranking
+  printf '%s\n' "$1" | sed 's/^  //' | awk -F'  +' '{ print NF; exit }'
+}
+_okf_search_line_field() { # $1 = one line of a ranking, $2 = which field, from 1
+  printf '%s\n' "$1" | sed 's/^  //' | awk -F'  +' -v i="$2" '{ print $i; exit }'
+}
+
+# Step 1's claim about Tier B, which is the one in the document that is easy to
+# write from the spec and get wrong: SPEC.md §6 puts the `index` guard on the
+# subcommand, and bin/okf runs it at dispatch — so it answers `--hyde-prompt`
+# too, and there is no half of the command that works on a bundle that never
+# opted in. A document that promised the prompt anyway would send the reader to
+# compose a query for a search that cannot run.
+_okf_search_command_tier_b_probe() { # $1 = the document's body text
+  local body_text="$1" question="how does a request find its handler"
+
+  # The fixture opts in; this takes that back out, which is every bundle
+  # /okf-init has ever written — `okf init` deliberately writes no index block.
+  if ! printf '{}\n' > okf.json; then
+    _fail "$CURRENT_TEST can un-configure the fixture's index block" \
+      "could not write okf.json"
+    return 1
+  fi
+  _okf_search --hyde-prompt "$question" || return 1
+  assert_eq "2" "$OKF_SEARCH_RC" \
+    "okf search --hyde-prompt exits 2 on a bundle with no index block"
+  assert_eq "0" "$(_okf_request_count)" "having sent nothing"
+  assert_eq "" "$OKF_SEARCH_OUT" "and printed no prompt to answer"
+
+  # And the settings the document spells out are the settings okf asks for.
+  # Read out of both sides rather than listed here, and compared in both
+  # directions: a key the document names that okf does not want is one a reader
+  # would go and write for nothing, and a key okf wants that the document does
+  # not name is one they are left to discover from the error. A list hardcoded
+  # here would be a third opinion, and would go on agreeing with itself while
+  # the other two drifted apart.
+  #
+  # `index.md` is excluded from both sides: it is SPEC.md §4's reserved bundle
+  # file, which four of the five sibling command docs name, and it is not a
+  # setting. Left in, the day this document mentions it would be the day this
+  # check failed saying the document named a key okf never asked for.
+  local doc_keys okf_keys
+  doc_keys="$(printf '%s\n' "$body_text" | grep -oE 'index\.[a-z_]+' |
+    grep -vx 'index.md' | sort -u)"
+  okf_keys="$(printf '%s\n' "$OKF_SEARCH_ERR" | grep -oE 'index\.[a-z_]+' |
+    grep -vx 'index.md' | sort -u)"
+  if [ -z "$okf_keys" ]; then
+    _fail "okf names the index settings it is missing" \
+      "no 'index.<key>' in what okf printed, so there is nothing to hold the" \
+      "document's list to"
+  elif [ -z "$doc_keys" ]; then
+    _fail "commands/okf-search.md names the index settings okf asks for" \
+      "the document spells out no 'index.<key>', so a reader stopped by the" \
+      "exit 2 is told nothing about what to add"
+  elif [ "$doc_keys" = "$okf_keys" ]; then
+    _pass "commands/okf-search.md lists the index settings okf asks for, and only those"
+  else
+    _fail "commands/okf-search.md lists the index settings okf asks for, and only those" \
+      "the document names: $(printf '%s' "$doc_keys" | tr '\n' ' ')" \
+      "okf asks for:        $(printf '%s' "$okf_keys" | tr '\n' ' ')"
+  fi
+  return 0
+}
+
+# Step 4's worked example, against a real ranking rather than against the prose.
+#
+# Only what is this document's own is asserted here. That `okf search
+# --hyde-prompt` exits 0 having sent nothing, and that it refuses `--k`,
+# `--repo` and `--type`, are bin/okf's behaviour and are pinned by
+# test_okf_search_prints_the_hyde_prompt; repeating them here would not make the
+# document any more accurate, and would go on passing after the sentences that
+# describe them had been deleted. What no other test can answer is whether the
+# layout the document shows a reader is the layout `okf search` prints.
+_okf_search_command_ranking_probe() { # $1 = the document's ranking block
+  local block="$1" question="how does a request find its handler"
+  _okf_search_configured . || return 1
+
+  # A ranking spanning a summary and a method of the one concept, which is the
+  # case step 4's example is drawn from: the concept header and hits under it.
+  local router hits
+  router="$(_okf_search_hits src/kitchen/Router)"
+  # The emptiness test first, as the sibling search probes have it: with
+  # `$router` empty the `jq 'length'` is empty too, `[ "" -lt 3 ]` is a bash
+  # error rather than a false, and the `_fail` written for exactly this case
+  # would never be the thing that reported it.
+  if [ -z "$router" ] || [ "$(printf '%s' "$router" | jq 'length')" -lt 3 ]; then
+    _fail "$CURRENT_TEST can build its canned hits" \
+      "okf chunk did not yield the chunks these hits are built from"
+    return 1
+  fi
+  hits="$(jq -n -c --argjson a "$router" '
+    [ ($a[0] | .score = 1), ($a[2] | .score = 0.99) ]')"
+  OKF_FAKE_CURL_DIM=4 OKF_FAKE_CURL_HITS="$hits" _okf_search "$question" || return 1
+  assert_eq "0" "$OKF_SEARCH_RC" "a search over the answer exits 0"
+
+  local real_header real_hit doc_header doc_hit
+  real_header="$(printf '%s\n' "$OKF_SEARCH_OUT" | grep -m1 '^[^ ]' || true)"
+  real_hit="$(printf '%s\n' "$OKF_SEARCH_OUT" | grep -m1 '^  ' || true)"
+  doc_header="$(printf '%s\n' "$block" | grep -m1 '^[^ ]' || true)"
+  doc_hit="$(printf '%s\n' "$block" | grep -m1 '^  ' || true)"
+  if [ -z "$real_header" ] || [ -z "$real_hit" ]; then
+    _fail "okf search prints a concept header with its hits indented under it" \
+      "no grouped ranking came back to check the document's example against"
+    return 1
+  fi
+
+  # Field counts rather than bytes: what the document owes the reader is okf's
+  # layout, not one fixture's ranking, and pinning the example to this repo's
+  # own Router would make every honest rewording of it a failure.
+  assert_eq "$(_okf_search_line_fields "$real_header")" \
+    "$(_okf_search_line_fields "$doc_header")" \
+    "the document's example header carries okf's own columns"
+  assert_eq "$(_okf_search_line_fields "$real_hit")" \
+    "$(_okf_search_line_fields "$doc_hit")" \
+    "and its example hit carries okf's own columns"
+
+  # The column the item exists for. Read out of both the real ranking and the
+  # document's example, and held to SPEC.md §8's vocabulary in both: a document
+  # showing the tier in the wrong column shows a reader a `type` and calls it
+  # trust.
+  local tiers real_tier doc_tier
+  tiers="$(_okf_spec_trust_tiers)"
+  real_tier="$(_okf_search_line_field "$real_header" 4)"
+  doc_tier="$(_okf_search_line_field "$doc_header" 4)"
+  if printf '%s\n' "$tiers" | grep -Fqx -- "$real_tier"; then
+    _pass "okf search prints a SPEC.md §8 trust tier on the concept header: $real_tier"
+  else
+    _fail "okf search prints a SPEC.md §8 trust tier on the concept header" \
+      "the fourth column of $real_header is $real_tier, which is not one of:" \
+      "$(printf '%s' "$tiers" | tr '\n' ' ')"
+  fi
+  if printf '%s\n' "$tiers" | grep -Fqx -- "$doc_tier"; then
+    _pass "the document's example shows the trust tier in that same column"
+  else
+    _fail "the document's example shows the trust tier in that same column" \
+      "its fourth column is $doc_tier, and okf puts a SPEC.md §8 trust tier there"
+  fi
+  return 0
+}
+
+# SPEC.md §9's HyDE half as a command, in commands/onboard.md's house style.
+# The division of labour in §1 puts the numbers on the shell's side and the
+# prose on Claude's, and this is the command where that seam is the whole
+# design: `okf` never calls an LLM, so it prints a prompt, Claude answers it,
+# and the answer — not the question — is what gets embedded and searched with.
+# What is pinned here is that seam and the two ends of it: the `--hyde-prompt`
+# call, the second `okf search` on the body it produced, and the grouped,
+# trust-tiered layout the results are presented in.
+#
+# The frontmatter/description invariant is covered for every command by
+# test_commands_have_frontmatter_description; only what is specific to this one
+# is checked here.
+test_okf_search_command_answers_the_hyde_prompt_itself() {
+  local doc="$TOOLKIT_ROOT/commands/okf-search.md"
+  if [ ! -f "$doc" ]; then
+    _fail "commands/okf-search.md exists" "no such file: $doc"
+    return 1
+  fi
+  # The body, with the frontmatter block cut off. The description summarises
+  # what the command does and names half of what is checked below, so a grep
+  # over the whole file would go on passing with every instruction deleted.
+  local body_text
+  body_text="$(_command_body "$doc")"
+  if [ -z "$body_text" ]; then
+    _fail "commands/okf-search.md has a body below its frontmatter" \
+      "nothing follows the frontmatter block in $doc"
+    return 1
+  fi
+
+  # The question arrives as $ARGUMENTS, and SPEC.md §11 asks for an
+  # argument-hint from any command that takes arguments — it is what Claude
+  # Code shows the user at the prompt, so an undocumented one is invisible.
+  if grep -q '\$ARGUMENTS' "$doc"; then
+    # CR stripped first, as the sibling frontmatter check does: on a CRLF
+    # checkout every line ends in one, and comparing it to "---" unstripped
+    # would report a perfectly good argument-hint as missing.
+    if awk '{ sub(/\r$/, "") }
+            NR == 1 && $0 != "---" { exit 1 }
+            NR > 1 && $0 == "---" { exit 1 }
+            NR > 1 && /^argument-hint:[[:space:]]*[^[:space:]]/ { found = 1; exit 0 }
+            END { exit found ? 0 : 1 }' "$doc"; then
+      _pass "commands/okf-search.md documents its arguments with an argument-hint"
+    else
+      _fail "commands/okf-search.md documents its arguments with an argument-hint" \
+        "it takes \$ARGUMENTS but its frontmatter has no non-empty argument-hint line"
+    fi
+  else
+    _fail "commands/okf-search.md takes the question as \$ARGUMENTS" \
+      "no \$ARGUMENTS in the document, so the question it searches for comes" \
+      "from nowhere the user typed"
+  fi
+
+  # The two calls the command is made of, in that order: ask for the prompt,
+  # then search with the answer. Asked of the document's fenced command lines
+  # and not of its prose — see _okf_search_command_invocations for why a grep
+  # over the prose answers both of these with the command blocks deleted.
+  local invocations
+  invocations="$(_okf_search_command_invocations "$doc")"
+  if [ -z "$invocations" ]; then
+    _fail "commands/okf-search.md shows the reader the command lines to run" \
+      "no fenced block in the document holds a line beginning 'okf '"
+    return 1
+  fi
+  # Where each of the two falls in the document, so that "in that order" above
+  # is a check and not only a comment. The invocations come out in document
+  # order, so comparing line numbers is comparing the order a reader meets them
+  # in — and the order is the technique: a search run before the prompt has
+  # been answered is a search on something that is not the hypothetical body.
+  local hyde_at plain_at
+  hyde_at="$(printf '%s\n' "$invocations" | grep -n -- '^okf search .*--hyde-prompt' |
+    head -1 | cut -d: -f1)"
+  # A second, flagless `okf search` — the one carrying the body back. A document
+  # with only the first call tells the reader to write a document and never
+  # search with it.
+  plain_at="$(printf '%s\n' "$invocations" | grep -n -- '^okf search ' |
+    grep -v -- '--hyde-prompt' | head -1 | cut -d: -f1)"
+
+  if [ -n "$hyde_at" ]; then
+    _pass "it asks okf for the HyDE prompt with okf search --hyde-prompt"
+  else
+    _fail "it asks okf for the HyDE prompt with okf search --hyde-prompt" \
+      "none of the document's command lines is an okf search --hyde-prompt," \
+      "so the prompt this command is built around is never actually run"
+  fi
+  if [ -n "$plain_at" ]; then
+    _pass "it searches a second time with the body it wrote"
+  else
+    _fail "it searches a second time with the body it wrote" \
+      "every 'okf search' command line in the document carries --hyde-prompt," \
+      "so the hypothetical body is never passed back as the query text"
+  fi
+  if [ -n "$hyde_at" ] && [ -n "$plain_at" ]; then
+    if [ "$hyde_at" -lt "$plain_at" ]; then
+      _pass "and it asks for the prompt before it searches with the answer"
+    else
+      _fail "and it asks for the prompt before it searches with the answer" \
+        "the document's plain okf search comes first, so a reader following it" \
+        "in order searches with something other than the hypothetical body"
+    fi
+  fi
+
+  # And that the body is what goes back, rather than the question. This is the
+  # whole of HyDE and the one line of the document a rewrite would lose without
+  # the command visibly breaking.
+  #
+  # Asked of step 3 alone rather than of the whole body: the opening paragraph
+  # already says as much about the technique in general, so a grep over the
+  # document is answered by the introduction with step 3's bullet deleted — and
+  # step 3 is the part a reader is following when they type the command. Read
+  # with the numbered-step helper the onboard checks use; it is general over
+  # `**N.` headings, which is the house layout every command here shares.
+  local step3
+  step3="$(_onboard_step_text "$body_text" 3)"
+  if [ -z "$step3" ]; then
+    _fail "commands/okf-search.md has a numbered step for the search itself" \
+      "no '**3. …' step heading in the document, so there is nowhere for the" \
+      "instruction about what to search with to live"
+  elif printf '%s\n' "$step3" | grep -qiE 'not the question|rather than the question'; then
+    _pass "step 3 says the query text is the body, not the question"
+  else
+    _fail "step 3 says the query text is the body, not the question" \
+      "the step that runs the search never warns against passing the original" \
+      "question to it, which is a working command that throws HyDE away"
+  fi
+
+  # Every subcommand it names has to be one bin/okf actually dispatches, and
+  # one that is not still a stub. Same collection rule as the sibling command
+  # checks: only backticked `okf <name>` mentions, in either voice, because a
+  # prohibition written as code is still a name a reader may go and run.
+  local -a named=()
+  local sub
+  while IFS= read -r sub; do
+    [ -n "$sub" ] && named+=("$sub")
+  done < <({
+    printf '%s\n' "$body_text" | grep -oE '`okf [a-z][a-z-]*' | awk '{print $2}'
+    # And the fenced command lines, which carry no backticks because the fence
+    # already does that job. Without them the one subcommand this document
+    # exists to run is the one nothing validates: renaming step 3's call to
+    # `okf query` would leave every check here green.
+    printf '%s\n' "$invocations" | awk '{print $2}'
+  } | grep -xE '[a-z][a-z-]*' | sort -u)
+  if [ "${#named[@]}" -eq 0 ]; then
+    _fail "commands/okf-search.md names the okf subcommands it runs" \
+      "no 'okf <subcommand>' mention found in the document"
+    return 1
+  fi
+  local okf="$TOOLKIT_ROOT/bin/okf"
+  local dispatched
+  dispatched="$(_okf_dispatch_subcommands)"
+  if [ -z "$dispatched" ]; then
+    _fail "bin/okf lists the subcommands it dispatches" \
+      "no OKF_SUBCOMMANDS array in bin/okf, or it is empty"
+    return 1
+  fi
+  for sub in "${named[@]}"; do
+    if ! printf '%s\n' "$dispatched" | grep -Fqx -- "$sub"; then
+      _fail "commands/okf-search.md names a working subcommand: okf $sub" \
+        "bin/okf's OKF_SUBCOMMANDS does not list $sub, so dispatch would" \
+        "reject it as an unknown subcommand"
+    elif ! grep -qE "^cmd_$sub\(\)" "$okf"; then
+      _fail "commands/okf-search.md names a working subcommand: okf $sub" \
+        "bin/okf has no cmd_$sub function, so this document tells the reader" \
+        "to run a subcommand that does not exist"
+    elif grep -qE "(^|[^_[:alnum:]])not_implemented[[:space:]]+$sub([^_[:alnum:]]|\$)" "$okf"; then
+      _fail "commands/okf-search.md names a working subcommand: okf $sub" \
+        "cmd_$sub in bin/okf is still a not_implemented stub" \
+        "if the mention is not an instruction to run it, name it as a bare" \
+        "word — only backticked 'okf <name>' mentions are collected"
+    else
+      _pass "commands/okf-search.md names a working subcommand: okf $sub"
+    fi
+  done
+
+  # Every tier the results are graded by, named in the document: a reader shown
+  # `Machine-confirmed` beside a concept and given no reading of it has been
+  # told a word rather than what to trust.
+  local tiers tier
+  tiers="$(_okf_spec_trust_tiers)"
+  # Guards the extraction, as the sibling readers of SPEC.md in this test do:
+  # §8 rewrapped so that a `→` and its tier land on different lines would come
+  # back empty, and the loop below would then assert nothing at all while going
+  # on reporting a pass for the test as a whole.
+  if [ -z "$tiers" ]; then
+    _fail "SPEC.md §8 names the trust tiers the results are graded by" \
+      "no '→ **Tier**' found in the section, so there is nothing to hold the" \
+      "document to"
+  fi
+  while IFS= read -r tier; do
+    [ -n "$tier" ] || continue
+    assert_contains "$body_text" "$tier" \
+      "it explains SPEC.md §8's $tier tier the results are graded by"
+  done < <(printf '%s\n' "$tiers")
+
+  # Named is not explained, and `Human-reviewed` is the name that most needs to
+  # be. SPEC.md §8 grants it only to an undrifted concept, but bin/okf also
+  # grants it where drift could not be *checked* — an unreadable resource, a
+  # malformed stored hash — and nothing in the payload records which of the two
+  # a ranking is showing. A document that reduced step 4 to a list of the three
+  # words would keep every check above green while dropping the one caveat that
+  # decides how far a reader should trust the top tier.
+  #
+  # Read over the whole of step 4 rather than line by line: the house layout
+  # puts a bullet on one long line, but a document that hard-wrapped the same
+  # sentences would still be saying the right thing, and a same-line test would
+  # fail it for the wrapping.
+  local step4
+  step4="$(_onboard_step_text "$body_text" 4)"
+  if [ -z "$step4" ]; then
+    _fail "commands/okf-search.md has a numbered step for presenting the results" \
+      "no '**4. …' step heading in the document, so there is nowhere for the" \
+      "trust tiers to be explained"
+  elif printf '%s\n' "$step4" | grep -qF 'Human-reviewed' &&
+    printf '%s\n' "$step4" | grep -qiE 'could not be checked|could not (be )?rule[d]? out'; then
+    _pass "it qualifies Human-reviewed rather than only naming it"
+  else
+    _fail "it qualifies Human-reviewed rather than only naming it" \
+      "step 4 never says that the top tier also covers a concept whose drift" \
+      "bin/okf could not check, which is the one reading of it a reader cannot" \
+      "get from the ranking"
+  fi
+
+  # The house-style pair from commands/onboard.md, which every okf-* command
+  # owes the reader: where it ends, and what it deliberately does not do.
+  if printf '%s\n' "$body_text" | grep -qi 'stop there'; then
+    _pass "commands/okf-search.md has an explicit stopping point"
+  else
+    _fail "commands/okf-search.md has an explicit stopping point" \
+      "no 'Stop there' in the document — SPEC.md §11 asks every okf-* command" \
+      "for one, in the style of commands/onboard.md"
+  fi
+  if printf '%s\n' "$body_text" | grep -qi 'non-goal'; then
+    _pass "commands/okf-search.md states its non-goals explicitly"
+  else
+    _fail "commands/okf-search.md states its non-goals explicitly" \
+      "the words 'non-goal' appear nowhere in the document"
+  fi
+
+  # The seam itself, against bin/okf rather than against the prose.
+  _okf_preconditions || return 1
+  local block
+  block="$(_okf_search_command_ranking_block "$doc")"
+  if [ -z "$block" ]; then
+    _fail "commands/okf-search.md shows the reader a worked ranking" \
+      "no fenced block in the document has a concept header with an indented" \
+      "hit under it, which is the layout okf search prints"
+    return 1
+  fi
+  with_fixture_repo chunks _okf_search_command_tier_b_probe "$body_text"
+  with_fixture_repo chunks _okf_search_command_ranking_probe "$block"
+}
+
 # SPEC.md §11: /onboard gains an OKF step *after* the CLAUDE.md write and the
 # verified baseline build, and skips with a printed note when okf is not
 # installed. Ordering is the load-bearing part and the part prose loses first:
