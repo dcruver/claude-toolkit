@@ -10460,6 +10460,212 @@ test_onboard_command_opens_a_bundle_after_the_baseline_build() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# bin/ralph: the concept docs a checklist item names (SPEC.md §11)
+# ---------------------------------------------------------------------------
+
+# bin/ralph's own answer for one checklist item's text: the concept files it
+# names, one path per line, exactly as item_concept_docs prints them.
+#
+# Obtained by sourcing bin/ralph and calling the helper directly, the way these
+# tests source bin/okf to call read_frontmatter: nothing prints this, and a flag
+# invented to test with would be CLI surface that neither SPEC.md nor `ralph
+# --help` has got. The name item_concept_docs, and the one-path-per-line shape,
+# are the contract this item owes the item that injects them into PROMPT.
+#
+# PATH is replaced rather than prepended to, because "okf is not installed" is
+# only honestly staged by an okf that is on no PATH at all — on a machine where
+# the developer has installed one, prepending would leave it findable and the
+# check could not fail. bash comes along because the probe is run with it;
+# nothing else does, and anything else would hide the helper reaching for a tool
+# ralph has not declared.
+_ralph_item_concepts() { # $1 = with-okf | without-okf, $2 = a checklist item's text
+  local mode="$1" text="$2" bindir probe
+  bindir="$HARNESS_STATE/ralph-$mode-bin"
+  if [ ! -d "$bindir" ]; then
+    _okf_probe_path "$bindir" || _abort "cannot build a probe PATH for bin/ralph"
+    if [ "$mode" = with-okf ]; then
+      ln -sf "$TOOLKIT_ROOT/bin/okf" "$bindir/okf" \
+        || _abort "cannot put okf on bin/ralph's probe PATH"
+    fi
+  fi
+
+  probe="$HARNESS_STATE/ralph-concepts-probe.sh"
+  if [ ! -f "$probe" ]; then
+    cat > "$probe" <<'PROBE'
+#!/usr/bin/env bash
+ralph="$1"
+text="$2"
+# Cleared before the source: a sourced script sees its caller's positional
+# parameters, and bin/ralph's own flag parsing must never be handed these.
+set --
+# shellcheck source=/dev/null
+. "$ralph"
+item_concept_docs "$text"
+PROBE
+  fi
+
+  PATH="$bindir" bash "$probe" "$TOOLKIT_ROOT/bin/ralph" "$text"
+}
+
+# One item's text in, the whole of what came out compared against what should
+# have. Status first and output second, and never `assert_eq "" "$(...)"`: a
+# probe that died before printing a line also prints no lines, and an expected
+# emptiness is most of what is checked here.
+_ralph_assert_concepts() { # $1 = expected output, $2 = mode, $3 = item text, $4 = description
+  local expected="$1" mode="$2" text="$3" what="$4"
+  assert_exit 0 _ralph_item_concepts "$mode" "$text"
+  assert_eq "$expected" "$(last_output)" "$what"
+}
+
+_ralph_resolves_probe() {
+  # Two sources in one item, and the concepts come back in the order the item
+  # named them — a prompt is read top to bottom, so the order is part of it.
+  # `bin/tool` also covers a source with no extension at all, which is the shape
+  # bin/ralph and bin/okf themselves have.
+  _ralph_assert_concepts "$(printf 'install.md\nbin/tool.md')" with-okf \
+    'Extend install.sh and bin/tool with a shell helper. Verify: ./tests/toolkit.sh' \
+    "the concepts of the sources an item names, in the order it names them"
+
+  # A checklist item is prose: its paths arrive wrapped in backticks, brackets
+  # and full stops, and the same path is normally named more than once. Each
+  # concept is printed once however often its source is mentioned.
+  _ralph_assert_concepts 'src/registry.md' with-okf \
+    'Rework `src/registry.ts`, then re-check (src/registry.ts) and **src/registry.ts**.' \
+    "decoration is stripped and a concept is printed once however often named"
+
+  # `./src/registry.ts` as a caller types it and `/src/registry.ts` as SPEC.md
+  # §4 writes it are the one file, and neither is looked up outside the repo.
+  _ralph_assert_concepts 'src/registry.md' with-okf \
+    'Move ./src/registry.ts, whose concept resource is /src/registry.ts' \
+    "a ./ prefix and SPEC.md §4's bundle-absolute / prefix both resolve in-repo"
+
+  # A name that is all extension keeps the whole of it: `.editorconfig` derives
+  # `.editorconfig.md`, and not the `.md` every dotfile would otherwise share.
+  _ralph_assert_concepts '.editorconfig.md' with-okf \
+    'Set root = true in .editorconfig' \
+    "a dotfile's stem is its whole name"
+  return 0
+}
+
+test_ralph_resolves_item_paths_to_their_concept_docs() {
+  with_fixture_repo items _ralph_resolves_probe
+}
+
+_ralph_without_okf_probe() {
+  local text='Extend install.sh and bin/tool with a shell helper.'
+
+  # The check below is only worth anything if this same text resolves when okf
+  # is there — otherwise "nothing came out" is a fixture that names no concept,
+  # and the absence of okf is proving nothing.
+  _ralph_assert_concepts "$(printf 'install.md\nbin/tool.md')" with-okf "$text" \
+    "the item resolves to concepts when okf is installed"
+
+  # SPEC.md §11: okf is not a dependency of ralph. Without it, ralph goes on
+  # working and simply says nothing about concepts — no note, no warning, no
+  # empty heading for a prompt to carry.
+  _ralph_assert_concepts '' without-okf "$text" \
+    "and to nothing at all when okf is not installed"
+  return 0
+}
+
+test_ralph_emits_no_concept_docs_when_okf_is_not_installed() {
+  with_fixture_repo items _ralph_without_okf_probe
+}
+
+_ralph_no_concept_probe() {
+  # Each of these is a real path in the fixture, and none of them has a concept
+  # beside it. A source with none is the ordinary case in any repository, and it
+  # is not an error and not a warning: nothing is printed.
+  _ralph_assert_concepts '' with-okf 'Rewrite src/helper.ts' \
+    "a source with no concept beside it resolves to nothing"
+  _ralph_assert_concepts '' with-okf 'Rewrite src/notes.py' \
+    "prose sitting beside a source is not its concept"
+  _ralph_assert_concepts '' with-okf 'Rewrite src/half.ts' \
+    "a frontmatter block that opens and never closes is not a concept"
+  _ralph_assert_concepts '' with-okf 'Rewrite src/index.ts' \
+    "a stem landing on a reserved OKF filename resolves to nothing"
+  _ralph_assert_concepts '' with-okf 'Rewrite docs/guide.md' \
+    "markdown does not derive itself as its own concept"
+  _ralph_assert_concepts '' with-okf 'Rewrite everything under src/' \
+    "a directory is not a source with a sibling concept"
+  _ralph_assert_concepts '' with-okf 'Add src/parser.ts' \
+    "a path the item names but the repo has not got resolves to nothing"
+  return 0
+}
+
+test_ralph_emits_nothing_when_no_sibling_concept_exists() {
+  with_fixture_repo items _ralph_no_concept_probe
+}
+
+_ralph_not_a_path_probe() {
+  # Frontmatter field names read exactly like paths — `code.content_hash` has a
+  # dot in it and `generated.by` has one too — and an item's text is full of
+  # them. What settles it is whether the file is there, which none of these is.
+  _ralph_assert_concepts '' with-okf \
+    'Update code.content_hash and generated.by per SPEC.md §4, then run /code-review' \
+    "field names and slash commands shaped like paths resolve to nothing"
+
+  # An item's text is not a trusted path. Neither a leading slash nor a `..`
+  # gets a lookup outside the repository ralph is standing in.
+  _ralph_assert_concepts '' with-okf 'Read /etc/passwd and ../outside/install.sh' \
+    "nothing resolves outside the repository"
+
+  # `commands/*.md` really is in PLAN.md's text. Left to word splitting, the
+  # glob would be matched against the working directory before the helper saw
+  # it — here that would turn one token into src/registry.ts and print its
+  # concept, which is not a file the item named.
+  _ralph_assert_concepts '' with-okf 'Rework src/*.ts and every src/registry.?s' \
+    "a glob in an item's text is not expanded against the repository"
+  return 0
+}
+
+test_ralph_reads_only_tokens_that_name_a_file() {
+  with_fixture_repo items _ralph_not_a_path_probe
+}
+
+_ralph_sourcing_probe() {
+  local probe="$HARNESS_STATE/ralph-sourcing-probe.sh"
+  cat > "$probe" <<'PROBE'
+#!/usr/bin/env bash
+ralph="$1"
+# Read before the source and cleared before it too: a sourced script sees its
+# caller's positional parameters, and bin/ralph's own flag parsing must never be
+# handed these.
+set --
+# shellcheck source=/dev/null
+. "$ralph"
+printf '%s\n' "$(type -t item_concept_docs)"
+PROBE
+
+  local bindir="$HARNESS_STATE/ralph-with-okf-bin"
+  if [ ! -d "$bindir" ]; then
+    _okf_probe_path "$bindir" || _abort "cannot build a probe PATH for bin/ralph"
+    ln -sf "$TOOLKIT_ROOT/bin/okf" "$bindir/okf" \
+      || _abort "cannot put okf on bin/ralph's probe PATH"
+  fi
+
+  # Sourcing bin/ralph must yield its helpers and nothing else. Everything below
+  # the guard is one run of the loop — it reads a command line, writes .ralph/
+  # and spawns `claude` — and a guard that stopped working would have every
+  # check above it start a real run inside a fixture repo.
+  assert_exit 0 env "PATH=$bindir" bash "$probe" "$TOOLKIT_ROOT/bin/ralph"
+  assert_eq 'function' "$(last_output)" \
+    "sourcing bin/ralph defines item_concept_docs and runs nothing else"
+
+  if [ -e .ralph ]; then
+    _fail "sourcing bin/ralph starts no run" \
+      "a .ralph directory was created, so the run below the guard was entered"
+  else
+    _pass "sourcing bin/ralph starts no run"
+  fi
+  return 0
+}
+
+test_ralph_can_be_sourced_without_starting_a_run() {
+  with_fixture_repo items _ralph_sourcing_probe
+}
+
 # --- add new test_* functions above this line ------------------------------
 
 # ---------------------------------------------------------------------------

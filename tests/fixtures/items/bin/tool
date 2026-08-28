@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# An executable with no extension, the shape bin/ralph and bin/okf both have.
+echo "tool"

@@ -60,7 +60,7 @@ there). Items are ordered so none depends on a later one. Every item verifies wi
 ## Phase 8 — integration with /onboard and ralph
 
 - [x] Extend commands/onboard.md with an OKF step placed after the CLAUDE.md write and after the verified baseline build, running okf init then generating concepts for in-scope files, skipping cleanly with a printed note when okf is not installed and preserving onboard's existing stopping point (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
-- [ ] Extend bin/ralph with a shell helper that extracts path-like tokens from a checklist item's text and resolves each to its sibling co-located .md concept file, emitting nothing at all when okf is not installed or no sibling concept exists (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
+- [x] Extend bin/ralph with a shell helper that extracts path-like tokens from a checklist item's text and resolves each to its sibling co-located .md concept file, emitting nothing at all when okf is not installed or no sibling concept exists (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Extend bin/ralph so each normal non-[mvn] attempt's PROMPT includes the concept docs resolved by that helper, leaving [mvn] item handling and the review-gate strings untouched (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Extend bin/ralph so a normal non-[mvn] item's PROMPT instructs the attempt to refresh the co-located concept doc of every source file it modified and include those files in the same commit, stamping generated.by as ralph/<model> and never writing a verified entry per SPEC.md §11, skipping silently when okf is absent (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 

@@ -123,6 +123,198 @@ Progress: .ralph/run.log (one line per attempt), .ralph/logs/item-NNN-attempt-N.
 EOF
 }
 
+# ---------------------------------------------------------------------------
+# OKF concept docs (SPEC.md §11)
+# ---------------------------------------------------------------------------
+#
+# SPEC.md §11 has each attempt's prompt carry the concept docs for the files its
+# item is about. This is the resolution half of that, and only that: a checklist
+# item's text goes in, the paths of the concept files it names come out, one per
+# line. Nothing here opens a concept, and nothing here builds a prompt — the
+# caller that pastes these into PROMPT is the next item in PLAN.md, which is why
+# ralph's own run below does not call this yet.
+#
+# The co-location rule is SPEC.md §5's and is spelled out again here rather than
+# asked of `okf`: SPEC.md §7 has no subcommand that answers "which concept
+# documents this file", and ralph has to keep working on a machine where okf is
+# not installed at all. So okf's presence is read as a yes/no — is this repo
+# being run with the OKF half of the toolkit — and the derivation itself is
+# these few lines of string handling. bin/okf's has_concept is the same rule
+# written for the same reasons; a change to one belongs in the other.
+
+# SPEC.md §4's reserved OKF filenames. Neither is ever a source's concept:
+# `index.md` is the directory's own document and `log.md` is left to OKF's own
+# semantics. A source whose stem lands on one — `index.ts`, `log.py` — has no
+# concept to send, and sending the directory's index instead would describe the
+# wrong thing entirely.
+RALPH_RESERVED_CONCEPTS=(index.md log.md)
+
+# Whether the okf half of the toolkit is installed. ralph runs perfectly well
+# without it — every lookup below is simply skipped and nothing is printed — so
+# this is a question, never an error.
+have_okf() { command -v okf > /dev/null 2>&1; }
+
+# One whitespace-delimited token with the decoration a sentence wraps a path in
+# taken off both ends: `bin/ralph`, (tests/toolkit.sh), **install.sh**, and
+# "see commands/onboard.md." all leave the same path behind. Membership is
+# tested against a set of characters rather than a glob so that the set can hold
+# every bracket, quote and backtick without any of them needing to be escaped
+# into a pattern.
+strip_token_decoration() { # $1 = a raw token
+  local token="$1"
+  local lead="\`'\"([{<*" trail="\`'\")]}>*,;:.!?"
+  while [ -n "$token" ] && [[ $lead == *"${token:0:1}"* ]]; do
+    token="${token#?}"
+  done
+  while [ -n "$token" ] && [[ $trail == *"${token: -1}"* ]]; do
+    token="${token%?}"
+  done
+  printf '%s' "$token"
+}
+
+# Whether a stripped token could be a path in this repository at all: made of
+# the characters a repository path is made of, and carrying either a directory
+# separator or a dot. A pre-filter and not the decision — what settles it is
+# whether the file is really there — so it is drawn wide enough for `bin/ralph`,
+# `install.sh` and `.editorconfig` alike, and left narrow enough to turn away a
+# URL (whose `:` is not in the set) and ordinary prose. It lets through plenty
+# that is not a path — `code.content_hash` is shaped exactly like one — and that
+# is the pre-filter working as intended rather than a hole in it.
+#
+# A token holding `..` is refused outright: an item's text is not a trusted path
+# and nothing about resolving one should be able to walk out of the repository.
+looks_like_path() { # $1 = a stripped token
+  local token="$1"
+  [ -n "$token" ] || return 1
+  [[ "$token" =~ ^[A-Za-z0-9._/+@-]+$ ]] || return 1
+  if [[ "$token" == *..* ]]; then
+    return 1
+  fi
+  [[ "$token" == */* || "$token" == *.* ]]
+}
+
+# Whether a file carries a SPEC.md §4 frontmatter block: `---` on line 1, closed
+# by the next line that is exactly `---`. Both ends, because a file that opens a
+# block and stops is a `/okf-generate` interrupted part way through, and a
+# README sitting beside a source of the same name is prose. Pasting either into
+# an attempt's prompt as documentation is worse than sending nothing.
+has_concept_frontmatter() { # $1 = path to a file
+  local line opened=0
+  # `|| [ -n "$line" ]` so a last line with no newline after it is still read.
+  while IFS= read -r line || [ -n "$line" ]; do
+    # A CRLF checkout, or an editor's UTF-8 BOM, does not change what the line
+    # says and must not make a concept unrecognisable.
+    line="${line#$'\xef\xbb\xbf'}"
+    line="${line%$'\r'}"
+    if [ "$opened" -eq 0 ]; then
+      [ "$line" = "---" ] || return 1
+      opened=1
+      continue
+    fi
+    [ "$line" != "---" ] || return 0
+  # stderr redirected before the input, so the shell's own complaint about an
+  # unreadable file is caught rather than printed into ralph's output.
+  done 2> /dev/null < "$1"
+  return 1
+}
+
+# The concept file co-located with one source, printed when there is one.
+# Returns 1, having printed nothing, when there is not — which is the ordinary
+# answer for most of the tokens a checklist item contains.
+#
+# SPEC.md §5's rule: `UserException.java` -> `UserException.md` in the same
+# directory. The stem is the name minus its final extension, so `helper.ts`
+# gives `helper.md` and not `helper.ts.md`; a name that is all extension — a
+# dotfile such as `.gitignore` — keeps its whole name, since stripping it would
+# leave nothing and every dotfile in a directory would share the one concept.
+#
+# The source itself has to exist. That is more than "the concept exists", and
+# deliberately: `code.content_hash` and `generated.by` are shaped exactly like
+# paths, and without this a repo that happened to hold a `code.md` would have
+# ralph paste it in as documentation of a field name.
+concept_for_source() { # $1 = a repo-relative source path
+  local path="$1" dir base stem concept reserved
+  [ -f "$path" ] || return 1
+
+  base="${path##*/}"
+  case "$path" in
+    */*) dir="${path%/*}/" ;;
+    *) dir="" ;;
+  esac
+  case "$base" in
+    ?*.*) stem="${base%.*}" ;;
+    *) stem="$base" ;;
+  esac
+  concept="$dir$stem.md"
+
+  [ -f "$concept" ] || return 1
+  # A markdown source is not its own concept. `-ef` rather than a string
+  # compare, because on a case-insensitive filesystem `Notes.md` and `notes.md`
+  # are one file that two strings cannot tell apart.
+  [ ! "$concept" -ef "$path" ] || return 1
+  has_concept_frontmatter "$concept" || return 1
+  for reserved in "${RALPH_RESERVED_CONCEPTS[@]}"; do
+    [ ! "$concept" -ef "$dir$reserved" ] || return 1
+  done
+
+  printf '%s\n' "$concept"
+}
+
+# The concept docs for the files a checklist item names, one repo-relative path
+# per line, in the order the item names them and each printed at most once.
+#
+# Prints nothing at all — and still succeeds — when okf is not installed, when
+# the item names no path, or when nothing it names has a concept beside it. A
+# checklist item is prose written for a person, so most of what it holds is not
+# a path and most of the paths it does hold have no concept yet; producing
+# nothing is the common case and is not a failure.
+item_concept_docs() { # $1 = a checklist item's text
+  have_okf || return 0
+
+  local text="$1" token concept prev seen
+  local -a tokens=() emitted=()
+  # `read -a` rather than letting word splitting do it: an item's text really
+  # does contain globs — PLAN.md says `commands/*.md` — and an unquoted
+  # expansion would match those against the working directory before this
+  # function ever saw them.
+  IFS=$' \t' read -r -a tokens <<< "$text"
+
+  for token in ${tokens[@]+"${tokens[@]}"}; do
+    token="$(strip_token_decoration "$token")"
+    token="${token#./}"
+    # SPEC.md §4 writes paths bundle-absolute, with a leading `/`. Taking it off
+    # resolves the path against the repo rather than against the filesystem
+    # root, which is also what keeps `/code-review` and the other slash commands
+    # in an item's text from being looked up in `/`.
+    token="${token#/}"
+    looks_like_path "$token" || continue
+    concept="$(concept_for_source "$token")" || continue
+
+    seen=false
+    for prev in ${emitted[@]+"${emitted[@]}"}; do
+      if [ "$prev" = "$concept" ]; then
+        seen=true
+        break
+      fi
+    done
+    if [ "$seen" = true ]; then
+      continue
+    fi
+    emitted+=("$concept")
+    printf '%s\n' "$concept"
+  done
+  return 0
+}
+
+# Sourced rather than executed — which is how tests/toolkit.sh calls the helpers
+# above directly, the same way it sources bin/okf — stop here. Everything below
+# this line is one run of the loop: it reads a command line, writes into
+# .ralph/, and spawns `claude`. Executed, whether from the checkout or from
+# $PATH, $0 and BASH_SOURCE[0] are the one path and the run proceeds as always.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  return 0
+fi
+
 PLAN="PLAN.md"
 MAX_ATTEMPTS=3
 ITEMS_LIMIT=0   # 0 = unlimited
