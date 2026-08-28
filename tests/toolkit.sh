@@ -11143,6 +11143,119 @@ test_okf_search_refuses_what_it_cannot_answer() {
   with_fixture_repo chunks _okf_search_refusal_probe
 }
 
+# SPEC.md §4's body-section headings, one per line, read out of the table that
+# defines them rather than restated here — the same reason _okf_spec_usage reads
+# §7's flags: a heading added to the taxonomy and not to the HyDE prompt fails
+# as a heading the prompt never names, instead of quietly never being checked.
+#
+# Only the table rows, because the prose above it names two of the same headings
+# in passing and a check driven off those would pass on half a table.
+_okf_spec_body_headings() {
+  awk '
+    /^### Body sections$/ { in_section = 1; next }
+    in_section && /^## / { exit }
+    in_section && /^\|/ { print }
+  ' "$TOOLKIT_ROOT/SPEC.md" | grep -oE '`# [A-Za-z][A-Za-z ]*`' | tr -d '`' | sort -u
+}
+
+# SPEC.md §9's HyDE half: `okf search --hyde-prompt` prints a prompt for the
+# slash command to answer and exits.
+#
+# Run through the same fake curl every other search probe uses, and with
+# okf.json pointing at the same two `.invalid` hosts, so "it never calls an LLM
+# or an embedding endpoint" is checked as a request count of zero rather than
+# asserted in a comment — there is a curl on PATH, and it recorded nothing.
+_okf_search_hyde_probe() {
+  _okf_search_configured . || return 1
+
+  # What the bundle looked like first: §9's HyDE prompt is written for a caller
+  # to answer, not into the tree.
+  local before
+  before="$(git status --porcelain 2>&1)"
+
+  local question="how does a request find its handler"
+  _okf_search --hyde-prompt "$question" || return 1
+  assert_eq "0" "$OKF_SEARCH_RC" "okf search --hyde-prompt exits 0"
+  assert_eq "0" "$(_okf_request_count)" \
+    "having sent no request at all — no embedding endpoint, and no Qdrant"
+  assert_eq "" "$OKF_SEARCH_ERR" "and printed nothing on stderr"
+
+  # The prompt is this invocation's answer, so it is on stdout, where the caller
+  # captures it exactly as it captures a ranking.
+  assert_contains "$OKF_SEARCH_OUT" "$question" \
+    "the prompt carries the question it was given"
+
+  # And it asks for a document rather than for a better question, which is the
+  # whole of HyDE: what gets embedded has to be the same kind of object as the
+  # corpus, and SPEC.md §4's headings are what that object is made of.
+  local heading
+  while IFS= read -r heading; do
+    [ -n "$heading" ] || continue
+    assert_contains "$OKF_SEARCH_OUT" "$heading" \
+      "and names SPEC.md §4's $heading as a section to write"
+  done < <(_okf_spec_body_headings)
+
+  # The way back: the answer is a query, and the caller has to be told to run it
+  # as one — a prompt whose answer nobody searches with is a page of prose.
+  assert_contains "$OKF_SEARCH_OUT" "okf search" \
+    "and says to search with what it produced"
+
+  assert_eq "$before" "$(git status --porcelain 2>&1)" \
+    "with nothing in the bundle written, moved or stamped"
+
+  # SPEC.md §7's flags may follow the operand, so the flag is read wherever it
+  # was written — and twice is the switch it already is, not a conflict to pick
+  # between.
+  _okf_search "$question" --hyde-prompt || return 1
+  assert_eq "0" "$OKF_SEARCH_RC" "the flag is read after the query too"
+  assert_eq "0" "$(_okf_request_count)" "and still sends nothing"
+  assert_contains "$OKF_SEARCH_OUT" "$question" "printing the same prompt"
+
+  _okf_search --hyde-prompt "$question" --hyde-prompt || return 1
+  assert_eq "0" "$OKF_SEARCH_RC" "a switch given twice asks for what it already asked"
+  assert_eq "0" "$(_okf_request_count)" "with nothing sent under it either"
+
+  # A prompt is written about a question, so it still needs one, and still only
+  # one — everything cmd_search refuses to search for it refuses to write about.
+  _okf_search --hyde-prompt || return 1
+  assert_eq "1" "$OKF_SEARCH_RC" "--hyde-prompt with no question is refused"
+  assert_contains "$OKF_SEARCH_ERR" "usage: okf search" "with SPEC.md §7's usage line"
+  assert_eq "" "$OKF_SEARCH_OUT" "and no prompt printed"
+
+  _okf_search --hyde-prompt "   " || return 1
+  assert_eq "1" "$OKF_SEARCH_RC" "and so is a question that is only whitespace"
+
+  _okf_search --hyde-prompt one two || return 1
+  assert_eq "1" "$OKF_SEARCH_RC" "two questions are two searches, and are refused here too"
+
+  # The three flags that shape a search shape nothing here, and are refused
+  # rather than dropped: a prompt that came back looking narrowed to a repo,
+  # having ignored the narrowing, is worse than a line the caller has to retype.
+  local flag
+  for flag in "--k 3" "--repo kitchen" "--type Class"; do
+    # Unquoted on purpose: each entry is a flag and its value, two words.
+    # shellcheck disable=SC2086
+    _okf_search --hyde-prompt "$question" $flag || return 1
+    assert_eq "1" "$OKF_SEARCH_RC" "--hyde-prompt with $flag is refused"
+    assert_eq "" "$OKF_SEARCH_OUT" "with no prompt printed under it"
+    assert_eq "0" "$(_okf_request_count)" "and nothing sent"
+  done
+
+  # Past a `--` the same word is the query text, which is what the preflight
+  # already assumes when it holds `okf search -- --hyde-prompt` to curl: it is
+  # embedded and searched for like any other query, and prints no prompt.
+  OKF_FAKE_CURL_DIM=4 _okf_search -- --hyde-prompt || return 1
+  assert_eq "0" "$OKF_SEARCH_RC" "past a -- it is a query rather than a flag"
+  assert_eq '["--hyde-prompt"]' "$(_okf_request 1 '.input')" "and is embedded as written"
+  assert_eq "2" "$(_okf_request_count)" "reaching both endpoints like any search"
+  return 0
+}
+
+test_okf_search_prints_the_hyde_prompt() {
+  _okf_preconditions || return 1
+  with_fixture_repo chunks _okf_search_hyde_probe
+}
+
 # install.sh (PLAN.md Phase 6)
 # ---------------------------------------------------------------------------
 

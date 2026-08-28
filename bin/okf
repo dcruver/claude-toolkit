@@ -7987,6 +7987,77 @@ OKF_SEARCH_RESPONSE_JQ='
   | .[]
 '
 
+# SPEC.md §9's HyDE prompt, printed by `okf search --hyde-prompt` for the slash
+# command to answer.
+#
+# okf never calls an LLM — §9 is explicit about it — so this is the whole of
+# okf's part in HyDE: it writes the instructions and the caller, who is already
+# a model, writes the hypothetical document and hands it back as the query text.
+# A subcommand that shelled out to one instead would need a provider, a key and
+# a model setting that §6 does not have, in a script whose only network tool is
+# curl and whose every other answer is derived from the bundle in front of it.
+#
+# Why the answer is a document and not a better-worded question: the corpus is
+# concept bodies, and a vector search matches what a text is *like*. A question
+# is like other questions, and there are none in the collection; a paragraph of
+# documentation about a router is like the documentation of the router. §9 says
+# the same in a sentence — "the corpus is docs, so hypothetical and target are
+# the same kind of object" — and the prompt spends its length pushing the
+# answer towards that object: §4's body headings by name, and an instruction to
+# invent the type and method names rather than hedge, because a confident wrong
+# name in the right vocabulary lands near the right concept and "it is not clear
+# from the question" lands nowhere.
+#
+# The headings are named in prose rather than read out of the chunker, even
+# though split_concept_body knows them: what the prompt needs is §4's *writing*
+# guidance — which heading holds what — and that is a sentence apiece, not a
+# list. A prompt assembled from the chunker's list would still have to carry
+# these sentences beside it.
+#
+# On stdout, and exit 0. It is this invocation's answer, the same as a ranking
+# is — the caller captures it, and a prompt on stderr would be an answer that a
+# pipeline would have to be written specially to see.
+#
+# The question is indented line by line rather than printed as one word, so a
+# query with a newline in it stays inside the block it was quoted into instead
+# of running back to column one and reading as more of okf's own instructions.
+hyde_prompt() { # $1 = the query the caller asked about
+  printf '%s\n' \
+    'This is HyDE: answer the prompt below yourself, then search with your' \
+    'answer instead of with the question.' \
+    '' \
+    'The question:' \
+    ''
+  printf '%s\n' "$1" | while IFS= read -r line; do
+    printf '  %s\n' "$line"
+  done
+  printf '%s\n' \
+    '' \
+    'Write the body of the one concept that would answer it — the documentation' \
+    'of the single type, module or service the answer lives in, as though this' \
+    'bundle already had it. Use the OKF body headings, and only the ones that' \
+    'bear on the question:' \
+    '' \
+    '  # Responsibilities   what it is for' \
+    '  # Collaborators      what it works with, by name' \
+    '  # Methods            one `## <signature>` per member that matters' \
+    '  # Schema             the fields, for a record or a data model' \
+    '  # Invariants, # Failure Modes, # Examples' \
+    '' \
+    'Invent freely. Nothing you write here is added to the bundle or shown to' \
+    'anyone: it is embedded and matched against the real concepts, so a' \
+    "plausible name in this codebase's vocabulary lands near the right concept," \
+    'while a hedge lands nowhere and a restated question matches other' \
+    'questions. Name the types, methods and fields you would expect to find.' \
+    '' \
+    'Prose under headings and nothing else — no frontmatter, no code fences, no' \
+    'preamble, and nothing about this prompt. A dozen lines is plenty.' \
+    '' \
+    'Then search with what you wrote, as one argument:' \
+    '' \
+    '  okf search "<the body you wrote>" [--k N] [--repo R] [--type T]'
+}
+
 # okf search <query> [--hyde-prompt] [--k N] [--repo R] [--type T]
 #
 # SPEC.md §9's retrieval half: the query text goes to the same OpenAI-shaped
@@ -8007,7 +8078,8 @@ OKF_SEARCH_RESPONSE_JQ='
 # mistyped `collection` setting with an empty index that looks like a working
 # one.
 cmd_search() {
-  local usage="usage: okf search <query> [--k N] [--repo R] [--type T]"
+  local usage="usage: okf search <query> [--hyde-prompt] [--k N] [--repo R] [--type T]"
+  local hyde=0
   local k="" seen_k=0 endflags=0
   local filter_repo="" seen_repo=0
   local filter_type="" seen_type=0
@@ -8024,6 +8096,11 @@ cmd_search() {
     fi
     case "$1" in
       --) endflags=1 ;;
+      # SPEC.md §9's HyDE flag. A switch rather than a value, and so accepted
+      # twice without complaint the way `okf check --strict` is: the second one
+      # asks for what the first already did, and there is no other reading of
+      # it to have to pick between.
+      --hyde-prompt) hyde=1 ;;
       --k)
         shift
         [ $# -gt 0 ] || die "search: --k needs a number" "$usage"
@@ -8084,6 +8161,18 @@ cmd_search() {
     shift
   done
 
+  # `--hyde-prompt` prints a prompt and searches nothing, so the three flags
+  # that shape a search have nothing to shape. Refused rather than ignored:
+  # ignored, `okf search q --repo kitchen --hyde-prompt` looks like a prompt
+  # narrowed to one repo, and the caller would never be told that the narrowing
+  # was dropped — it belongs on the search that runs on the answer, which is a
+  # second command line and the one place it does anything.
+  if [ "$hyde" -eq 1 ] && { [ "$seen_k" -eq 1 ] || [ "$seen_repo" -eq 1 ] \
+    || [ "$seen_type" -eq 1 ]; }; then
+    die "search: --hyde-prompt prints a prompt and searches nothing, so --k, --repo and --type have nothing to narrow" \
+      "give them to the \`okf search\` you run on the answer" "$usage"
+  fi
+
   if [ "$seen_k" -eq 1 ]; then
     case "$k" in
       "") die "search: --k needs a number, not an empty argument" "$usage" ;;
@@ -8132,6 +8221,21 @@ cmd_search() {
     *[![:space:]]*) ;;
     *) die "search: the query is empty, and an empty query asks Qdrant nothing" "$usage" ;;
   esac
+
+  # SPEC.md §9's HyDE half, and the end of this invocation. Ahead of the two
+  # settings reads below because the prompt is not made of settings: it is the
+  # query and a page of instructions, and refusing to print it over an
+  # `embedding_url` it never sends anything to would be a refusal about the
+  # wrong command — the `okf search` that runs on the answer is the one that
+  # needs those settings, and it is the one that reports them.
+  #
+  # The command line above it is checked in full all the same: a `--hyde-prompt`
+  # run is a question, and a question okf would refuse to search for is not one
+  # worth writing a document about either.
+  if [ "$hyde" -eq 1 ]; then
+    hyde_prompt "$query"
+    return 0
+  fi
 
   # Both halves of the configuration read and checked before anything is sent,
   # which is cmd_embed's order for cmd_embed's reason: a bundle whose

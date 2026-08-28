@@ -79,7 +79,7 @@ there). Items are ordered so none depends on a later one. Every item verifies wi
 - [x] Implement okf search in bin/okf to embed the query text and search Qdrant over REST with a --k limit, driven by a fake curl placed on PATH (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [x] Add the optional --repo and --type payload filters to okf search in bin/okf, asserted against the request body sent to a fake curl on PATH (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [x] Extend okf search in bin/okf to group hits by concept_id so a method hit returns its parent concept alongside it, showing each result's trust tier (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
-- [ ] Add --hyde-prompt to okf search in bin/okf, printing the HyDE prompt and exiting without ever calling an LLM or an embedding endpoint, per SPEC.md §9 (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
+- [x] Add --hyde-prompt to okf search in bin/okf, printing the HyDE prompt and exiting without ever calling an LLM or an embedding endpoint, per SPEC.md §9 (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Add commands/okf-search.md following the house style of commands/onboard.md, which calls okf search --hyde-prompt, answers the printed prompt itself, passes the resulting hypothetical concept body back as the query text, and presents results grouped by concept with their trust tier shown (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Extend commands/okf-search.md with a fallback that performs a ripgrep sweep over co-located concept files and prints a note explaining it, used when okf.json has no index block (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 
