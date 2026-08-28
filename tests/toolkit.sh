@@ -10259,6 +10259,207 @@ test_okf_verify_command_walks_the_unconfirmed_queue() {
   with_fixture_repo concepts _okf_verify_command_spelling_probe
 }
 
+# SPEC.md §11: /onboard gains an OKF step *after* the CLAUDE.md write and the
+# verified baseline build, and skips with a printed note when okf is not
+# installed. Ordering is the load-bearing part and the part prose loses first:
+# step 3 exists to run the build against a tree nobody has added anything to, so
+# an OKF step that drifted above it would still read perfectly while destroying
+# what step 3 is for. Checked by step number rather than by byte offset, because
+# the document is a numbered list and that is the order a reader follows.
+#
+# The frontmatter/description invariant is covered for every command by
+# test_commands_have_frontmatter_description; only what is specific to this one
+# is checked here.
+
+# The step number of the first numbered step whose text matches an ERE, or
+# empty if no step does. Step headings are the `**N. ...` lines; the heading
+# itself counts as part of its step, and the trailing Report/Stop paragraphs
+# belong to no step at all.
+_onboard_step_matching() { # $1 = body text, $2 = ERE
+  printf '%s\n' "$1" | awk -v want="$2" '
+    /^\*\*Report\*\*/ { step = 0 }
+    /^\*\*[0-9]+\./ { n = $0; sub(/^\*\*/, "", n); sub(/\..*$/, "", n); step = n + 0 }
+    step > 0 && $0 ~ want { print step; exit }
+  '
+}
+
+# Everything under one numbered step, heading included, stopping at the next
+# step or at the Report paragraph.
+_onboard_step_text() { # $1 = body text, $2 = step number
+  printf '%s\n' "$1" | awk -v want="$2" '
+    /^\*\*Report\*\*/ { step = 0 }
+    /^\*\*[0-9]+\./ { n = $0; sub(/^\*\*/, "", n); sub(/\..*$/, "", n); step = n + 0 }
+    step == want + 0 { print }
+  '
+}
+
+test_onboard_command_opens_a_bundle_after_the_baseline_build() {
+  local doc="$TOOLKIT_ROOT/commands/onboard.md"
+  if [ ! -f "$doc" ]; then
+    _fail "commands/onboard.md exists" "no such file: $doc"
+    return 1
+  fi
+  # The body with the frontmatter cut off, as the sibling okf-* doc tests do:
+  # the description names the OKF step too, so a check run over the whole file
+  # would go on passing with the instructions themselves deleted.
+  local body_text
+  body_text="$(awk '{ sub(/\r$/, "") }
+                    NR == 1 && $0 == "---" { in_front = 1; next }
+                    in_front && $0 == "---" { in_front = 0; next }
+                    !in_front { print }' "$doc")"
+  if [ -z "$body_text" ]; then
+    _fail "commands/onboard.md has a body below its frontmatter" \
+      "nothing follows the frontmatter block in $doc"
+    return 1
+  fi
+
+  # The three steps whose relative order SPEC.md §11 fixes. Each is found by
+  # what the step is *for* rather than by its number, so renumbering the list
+  # is not a failure and reordering it is.
+  local claude_step build_step okf_step
+  claude_step="$(_onboard_step_matching "$body_text" 'CLAUDE[.]md')"
+  build_step="$(_onboard_step_matching "$body_text" '[Bb]aseline.*build|build.*[Bb]aseline')"
+  okf_step="$(_onboard_step_matching "$body_text" 'okf')"
+
+  if [ -z "$claude_step" ]; then
+    _fail "commands/onboard.md still has a step that writes CLAUDE.md" \
+      "no numbered step mentions CLAUDE.md"
+    return 1
+  fi
+  if [ -z "$build_step" ]; then
+    _fail "commands/onboard.md still has a step that builds the baseline" \
+      "no numbered step mentions both a baseline and a build"
+    return 1
+  fi
+  if [ -z "$okf_step" ]; then
+    _fail "commands/onboard.md has an OKF step" \
+      "no numbered step mentions okf at all — SPEC.md §11 asks /onboard for" \
+      "one, running okf init and then generating concepts"
+    return 1
+  fi
+
+  if [ "$okf_step" -gt "$claude_step" ]; then
+    _pass "the OKF step comes after the CLAUDE.md write"
+  else
+    _fail "the OKF step comes after the CLAUDE.md write" \
+      "OKF is step $okf_step, CLAUDE.md is written in step $claude_step"
+  fi
+  if [ "$okf_step" -gt "$build_step" ]; then
+    _pass "the OKF step comes after the verified baseline build"
+  else
+    _fail "the OKF step comes after the verified baseline build" \
+      "OKF is step $okf_step, the baseline build is step $build_step —" \
+      "concepts written first would blur the line that step exists to draw"
+  fi
+
+  local step_text
+  step_text="$(_onboard_step_text "$body_text" "$okf_step")"
+  if [ -z "$step_text" ]; then
+    _fail "the OKF step has a body" "step $okf_step is empty"
+    return 1
+  fi
+
+  # The sequence the item asks for: init the bundle, then document what it puts
+  # in scope. Asserted against the step rather than the document so a mention
+  # somewhere else cannot stand in for the instruction.
+  assert_contains "$step_text" 'okf init' "the OKF step runs okf init"
+  assert_contains "$step_text" 'okf list --missing' \
+    "the OKF step generates concepts for the in-scope files okf list --missing reports"
+  assert_contains "$step_text" '/okf-generate' \
+    "the OKF step names /okf-generate, which stays separately invocable"
+
+  # Skipping cleanly is the whole difference between an optional tool and a
+  # broken command: one line has to say it is not installed, that a note is
+  # printed, and that the step is skipped. Held to a single line because the
+  # three spread across a document are three separate topics, not an
+  # instruction.
+  if printf '%s\n' "$step_text" |
+    grep -q 'not installed' &&
+    printf '%s\n' "$step_text" | awk '
+      /not installed/ && /[Nn]ote/ && /skip/ { found = 1 }
+      END { exit found ? 0 : 1 }'; then
+    _pass "the OKF step skips with a printed note when okf is not installed"
+  else
+    _fail "the OKF step skips with a printed note when okf is not installed" \
+      "no single line says all three of 'not installed', a note, and skipping" \
+      "— SPEC.md §11 asks /onboard to skip cleanly rather than fail"
+  fi
+  assert_contains "$step_text" 'command -v okf' \
+    "the OKF step checks for okf before running it"
+
+  # onboard's existing stopping point, which the item asks to preserve. Both
+  # halves: where it ends, and the refusal to carry on into planning.
+  if printf '%s\n' "$body_text" | grep -qi 'stop there'; then
+    _pass "commands/onboard.md keeps its explicit stopping point"
+  else
+    _fail "commands/onboard.md keeps its explicit stopping point" \
+      "no 'Stop there' in the document"
+  fi
+  assert_contains "$body_text" 'Do not move into planning' \
+    "it still refuses to move into planning"
+
+  # Every slash command the document sends the reader to has to be one that is
+  # installed. A typo here reads fine and resolves to nothing.
+  local cmd
+  while IFS= read -r cmd; do
+    [ -n "$cmd" ] || continue
+    if [ -f "$TOOLKIT_ROOT/commands/${cmd#/}.md" ]; then
+      _pass "commands/onboard.md names an installed command: $cmd"
+    else
+      _fail "commands/onboard.md names an installed command: $cmd" \
+        "no commands/${cmd#/}.md in this repo, so the handoff goes nowhere"
+    fi
+  done < <(printf '%s\n' "$body_text" | grep -oE '/okf-[a-z][a-z-]*' | sort -u)
+
+  # And every okf subcommand it names has to be one bin/okf actually
+  # dispatches, and not a stub — the same standard the okf-* command docs are
+  # held to, for the same reason. Only backticked mentions are collected: the
+  # prose says "okf" as a bare word and "okf reads the repo's scope" would
+  # otherwise be read as a subcommand called `reads`.
+  local -a named=()
+  local sub
+  while IFS= read -r sub; do
+    [ -n "$sub" ] && named+=("$sub")
+  done < <(printf '%s\n' "$body_text" | grep -oE '`okf [a-z][a-z-]*' |
+    awk '{print $2}' | sort -u)
+  if [ "${#named[@]}" -eq 0 ]; then
+    _fail "commands/onboard.md names the okf subcommands it runs" \
+      "no backticked 'okf <subcommand>' mention found in the document"
+    return 1
+  fi
+  local okf="$TOOLKIT_ROOT/bin/okf"
+  if [ ! -x "$okf" ]; then
+    _fail "bin/okf is an executable script" "missing or not executable: $okf"
+    return 1
+  fi
+  local dispatched
+  dispatched="$(_okf_dispatch_subcommands)"
+  if [ -z "$dispatched" ]; then
+    _fail "bin/okf lists the subcommands it dispatches" \
+      "no OKF_SUBCOMMANDS array in bin/okf, or it is empty"
+    return 1
+  fi
+  for sub in "${named[@]}"; do
+    if ! printf '%s\n' "$dispatched" | grep -Fqx -- "$sub"; then
+      _fail "commands/onboard.md names a working subcommand: okf $sub" \
+        "bin/okf's OKF_SUBCOMMANDS does not list $sub, so dispatch would" \
+        "reject it as an unknown subcommand"
+    elif ! grep -qE "^cmd_$sub\(\)" "$okf"; then
+      _fail "commands/onboard.md names a working subcommand: okf $sub" \
+        "bin/okf has no cmd_$sub function, so this document tells the reader" \
+        "to run a subcommand that does not exist"
+    elif grep -qE "(^|[^_[:alnum:]])not_implemented[[:space:]]+$sub([^_[:alnum:]]|\$)" "$okf"; then
+      _fail "commands/onboard.md names a working subcommand: okf $sub" \
+        "cmd_$sub in bin/okf is still a not_implemented stub" \
+        "if the mention is not an instruction to run it, name it as a bare" \
+        "word — only backticked 'okf <name>' mentions are collected"
+    else
+      _pass "commands/onboard.md names a working subcommand: okf $sub"
+    fi
+  done
+  return 0
+}
+
 # --- add new test_* functions above this line ------------------------------
 
 # ---------------------------------------------------------------------------
