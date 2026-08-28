@@ -17,3 +17,11 @@ frontmatter: `Router` is the concept carrying all of it, `code.commit`
 included, and `Fenced` is the one carrying none of the optional fields — no
 `tags`, no `code.lines`, no `code.commit` — so a payload has to say what it
 does about a field the concept has not got.
+
+`okf.json` holds nothing but an empty `index` block, which is what opts this
+bundle in to Tier B: SPEC.md §6 has a Tier B subcommand exit 2 on a bundle with
+no `index` at all, and gives every field inside it a default. Empty rather than
+filled in on purpose — `index.repo` left out is what lets the payload checks
+assert the name a bundle falls back to — and the bundle and tier settings are
+left out for the same reason, so this fixture goes on exercising SPEC.md §6's
+defaults rather than pinning a second copy of them here.

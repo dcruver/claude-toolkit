@@ -8260,8 +8260,171 @@ test_okf_trust_tier_answers_for_an_unverified_concept() {
 }
 
 # ---------------------------------------------------------------------------
+# The Tier B configuration guard (SPEC.md §6, §7)
+# ---------------------------------------------------------------------------
+
+# SPEC.md §6's `index` block, key by key, read out of §6's own example rather
+# than written out here: the keys bin/okf names are the keys the design
+# reference defines, and a key added to one has to reach the other.
+#
+# §6 holds exactly one fenced block, so the fence toggle is enough to find it.
+# Sorted, because this is a set comparison and jq's `keys` sorts.
+_okf_spec_index_keys() {
+  awk '
+    /^## 6\./ { in_section = 1; next }
+    in_section && /^## / { exit }
+    in_section && /^```/ { fence = !fence; next }
+    in_section && fence { print }
+  ' "$TOOLKIT_ROOT/SPEC.md" | jq -r '.index | keys[]' 2> /dev/null
+}
+
+# SPEC.md §6: "Absent `index`, Tier B subcommands exit 2 with one line naming
+# the missing keys."
+#
+# Run in `tiny`, which carries no okf.json — the state a repo is in before
+# anybody has opted in to Tier B, and the one the guard exists for.
+_okf_tier_b_guard_probe() {
+  local okf="$TOOLKIT_ROOT/bin/okf"
+
+  # The precondition the whole probe rests on. Without it every exit 2 below
+  # would still be an exit 2 and would mean nothing.
+  if [ -e okf.json ]; then
+    _fail "the fixture repo starts without an okf.json" "already present under $PWD"
+    return 1
+  fi
+
+  local -a subs=() keys=()
+  local name
+  while IFS= read -r name; do
+    [ -n "$name" ] && subs+=("$name")
+  done < <(_okf_bin_array OKF_TIER_B_SUBCOMMANDS)
+  while IFS= read -r name; do
+    [ -n "$name" ] && keys+=("$name")
+  done < <(_okf_bin_array OKF_INDEX_KEYS)
+  if [ "${#subs[@]}" -eq 0 ] || [ "${#keys[@]}" -eq 0 ]; then
+    _fail "bin/okf lists its Tier B subcommands and SPEC.md §6's index keys" \
+      "no OKF_TIER_B_SUBCOMMANDS or OKF_INDEX_KEYS array in bin/okf, or one is empty"
+    return 1
+  fi
+
+  local stderr="$HARNESS_STATE/okf-tier-b-guard-stderr"
+  local sub key out err rc
+  for sub in "${subs[@]}"; do
+    : > "$stderr"
+    # Invoked with no arguments of its own: what the guard answers cannot depend
+    # on them, and `embed` and `search` are still stubs with nothing to be given.
+    out="$("$okf" "$sub" 2> "$stderr")"
+    rc=$?
+    err="$(cat "$stderr" 2> /dev/null)"
+
+    assert_eq 2 "$rc" "okf $sub exits 2 on a bundle with no index block"
+    assert_eq "" "$out" "okf $sub prints nothing on stdout"
+    assert_eq 1 "$(_okf_line_count "$err")" "okf $sub says so in a single line"
+    assert_contains "$err" "$sub" "and names the subcommand that was refused"
+    for key in "${keys[@]}"; do
+      assert_contains "$err" "index.$key" "okf $sub names the missing index.$key"
+    done
+  done
+
+  # An `index` block with nothing in it is a bundle that has opted in: SPEC.md
+  # §6 defaults every field inside it, so the block's presence is the whole of
+  # what the guard asks about. `okf chunk` with no concept then gets as far as
+  # its own usage line, which is what shows the guard let it past.
+  _okf_tier_b_opt_in . || return 1
+  : > "$stderr"
+  "$okf" chunk > /dev/null 2> "$stderr"
+  rc=$?
+  err="$(cat "$stderr" 2> /dev/null)"
+  assert_eq 1 "$rc" "an empty index block is enough to opt a bundle in to Tier B"
+  assert_contains "$err" "usage: okf chunk" "so chunk gets as far as its own usage"
+  case "$err" in
+    *"index block"*)
+      _fail "an opted-in bundle is not asked to opt in again" "$err"
+      ;;
+    *) _pass "an opted-in bundle is not asked to opt in again" ;;
+  esac
+
+  # A written-out `null` is how JSON spells nothing, and SPEC.md §6 gives the
+  # block no default for a `null` to be overriding — so it is the block being
+  # absent, said out loud.
+  printf '%s\n' '{"index": null}' > okf.json
+  : > "$stderr"
+  "$okf" chunk > /dev/null 2> "$stderr"
+  rc=$?
+  err="$(cat "$stderr" 2> /dev/null)"
+  assert_eq 2 "$rc" "an index of null is the block being absent, and exits 2"
+  assert_contains "$err" "index.repo" "naming the missing keys as any absence does"
+
+  # An `index` that is there and is not a block is a mistyped setting, not a
+  # bundle that never opted in. Exit 2 would answer it by asking for what has
+  # already been written, so it is SPEC.md §7's 1 — an error — like every other
+  # wrong shape in okf.json.
+  printf '%s\n' '{"index": 7}' > okf.json
+  : > "$stderr"
+  "$okf" chunk > /dev/null 2> "$stderr"
+  rc=$?
+  err="$(cat "$stderr" 2> /dev/null)"
+  assert_eq 1 "$rc" "an index that is not an object is an error rather than an opt-out"
+  assert_contains "$err" "index must be a JSON object" "saying what was wrong with it"
+  assert_contains "$err" "found number" "and what was found instead"
+
+  # And nothing here reaches Tier A: SPEC.md §6's guard is Tier B's, and a repo
+  # with no okf.json is a perfectly good Tier A bundle.
+  rm -f okf.json
+  assert_exit 0 "$okf" list
+  case "$(last_output)" in
+    *"index block"*)
+      _fail "a Tier A subcommand is not asked for an index block" "$(last_output)"
+      ;;
+    *) _pass "a Tier A subcommand is not asked for an index block" ;;
+  esac
+  rm -f "$stderr"
+  return 0
+}
+
+test_okf_tier_b_refuses_a_bundle_with_no_index_block() {
+  _okf_preconditions || return 1
+
+  # The set the guard applies to has to be the set the help calls Tier B, or
+  # okf.json's own documentation names one thing and its behaviour another.
+  assert_eq "$(_okf_help_tier_b_subcommands)" "$(_okf_bin_array OKF_TIER_B_SUBCOMMANDS)" \
+    "bin/okf guards exactly the subcommands its help calls Tier B"
+
+  # And the keys it names have to be SPEC.md §6's.
+  local spec_keys
+  spec_keys="$(_okf_spec_index_keys)"
+  if [ -z "$spec_keys" ]; then
+    _fail "SPEC.md §6 lists the keys of the index block" \
+      "extracted no index keys from SPEC.md's okf.json section"
+    return 1
+  fi
+  assert_eq "$spec_keys" "$(_okf_bin_array OKF_INDEX_KEYS | sort)" \
+    "bin/okf names exactly SPEC.md §6's index keys"
+
+  with_fixture_repo tiny _okf_tier_b_guard_probe
+}
+
+# ---------------------------------------------------------------------------
 # okf chunk (SPEC.md §4, §9)
 # ---------------------------------------------------------------------------
+
+# SPEC.md §6's Tier B opt-in, written into a bundle root: an `index` block and
+# nothing in it, which is what stops the guard in bin/okf answering a Tier B
+# subcommand with exit 2 before it has looked at its arguments. Empty because §6
+# defaults every field inside the block, so what is being said here is only that
+# Tier B is wanted — `tests/fixtures/chunks/okf.json` is the same file for the
+# same reason.
+#
+# Needed a second time under any root a probe reaches with -C: SPEC.md §7 has
+# --config default to `./okf.json` relative to the root, so moving the root
+# moves which okf.json is read.
+_okf_tier_b_opt_in() { # $1 = a directory to write okf.json into
+  if ! printf '%s\n' '{"index": {}}' > "$1/okf.json"; then
+    _fail "$CURRENT_TEST opts its bundle in to Tier B" "could not write $1/okf.json"
+    return 1
+  fi
+  return 0
+}
 
 # okf chunk's stdout, its stderr and its exit status, kept apart for the reason
 # _okf_verify keeps verify's apart: the JSON array is stdout, the reason a
@@ -8437,6 +8600,7 @@ _okf_chunk_methods_probe() {
   assert_eq "src/kitchen/Router" "$(_okf_chunk_field 0 concept_id)" \
     "an absolute path is the same concept, and gets the same concept ID"
   # And the ID is relative to the root this run is using, which is what -C moves.
+  _okf_tier_b_opt_in src || return 1
   _okf_chunk_json -C src kitchen/Router || return 1
   assert_eq "kitchen/Router" "$(_okf_chunk_field 0 concept_id)" \
     "the ID is bundle-relative, so -C moves what it is relative to"
@@ -8644,6 +8808,16 @@ test_okf_chunk_builds_a_bodyless_stub_from_its_frontmatter() {
 }
 
 _okf_chunk_refusal_probe() {
+  # `concepts` is a Tier A fixture — it exists for the frontmatter reader, and
+  # every other probe over it is a Tier A subcommand — so it carries no okf.json
+  # and SPEC.md §6's guard would answer every refusal below with exit 2 before
+  # cmd_chunk ever saw the argument. Opting the copy in here rather than
+  # committing an okf.json into the fixture keeps that one Tier B need out of
+  # the thirty Tier A probes that share it. Empty, for the reason the `chunks`
+  # fixture's own okf.json is empty: §6 defaults every field inside the block,
+  # and it is the block that says Tier B is wanted at all.
+  _okf_tier_b_opt_in . || return 1
+
   # A markdown file whose frontmatter block was never closed. Everything below
   # its `---` is unclosed YAML rather than a body, so there is nothing here to
   # chunk and saying so beats embedding half a frontmatter block.
@@ -8698,6 +8872,10 @@ _okf_chunk_refusal_probe() {
     _fail "a concept outside the bundle is refused" "could not stage Outside.md"
     return 1
   }
+  # -C moves the root, and SPEC.md §7 has --config default to `./okf.json`
+  # relative to it, so the opt-in above is not the one this run reads: the new
+  # root needs its own or the guard answers first.
+  _okf_tier_b_opt_in src || return 1
   _okf_chunk -C src ../Outside.md
   assert_eq "1" "$OKF_CHUNK_RC" "a concept above the root is refused"
   assert_eq "" "$OKF_CHUNK_OUT" "and nothing is printed on stdout"
@@ -8792,9 +8970,13 @@ _okf_chunk_payload_probe() {
   # default for the bundle-root index.md title: the directory the root is.
   assert_eq "${PWD##*/}" "$(_okf_chunk_column repo | sort -u)" \
     "repo defaults to the bundle's directory name when okf.json names none"
+  # -C moves the root, and with it the `./okf.json` SPEC.md §7 has --config
+  # default to, so the fixture's own opt-in is not the one this run reads.
+  _okf_tier_b_opt_in src || return 1
   _okf_chunk_json -C src kitchen/Router || return 1
   assert_eq "src" "$(_okf_chunk_column repo | sort -u)" \
     "-C moves the bundle root, and that default moves with it"
+  rm -f src/okf.json
 
   # SPEC.md §6 puts the setting at `index.repo`, and §9 wants it on every point
   # so that "cross-repo search is a filter change, not a schema change".
@@ -8817,7 +8999,10 @@ _okf_chunk_payload_probe() {
   _okf_chunk src/kitchen/Router
   assert_eq "1" "$OKF_CHUNK_RC" "and so is an index.repo of false, rather than defaulting"
   assert_contains "$OKF_CHUNK_ERR" "must be a string" "saying what was wrong with it"
-  rm -f okf.json
+  # Back to the fixture's own opt-in rather than removed: with no okf.json at
+  # all, SPEC.md §6's guard answers every chunk below with exit 2 and none of
+  # the payload checks left in this probe would run.
+  _okf_tier_b_opt_in . || return 1
 
   # A concept carrying none of the optional payload fields. Each absence is
   # spelled differently on purpose: an empty list is a `tags` somebody wrote

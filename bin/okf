@@ -239,6 +239,85 @@ http_preflight() { # $1 = the subcommand being dispatched, $2.. = its arguments
 }
 
 # ---------------------------------------------------------------------------
+# Tier B configuration (SPEC.md §6)
+# ---------------------------------------------------------------------------
+
+# The subcommands SPEC.md §7 marks Tier B, which is a wider set than
+# OKF_HTTP_SUBCOMMANDS and is why the two lists are kept apart: §9 has `okf
+# chunk` split a concept body locally, so it speaks no HTTP and is Tier B all
+# the same. This is the set the §6 configuration guard below applies to, and
+# tests/toolkit.sh checks it against the sentence in the help that names them.
+OKF_TIER_B_SUBCOMMANDS=(chunk embed search)
+
+# SPEC.md §6's `index` block, key by key, in the order §6's example writes them.
+# Kept as a list rather than spelled into the message below, so that the line a
+# caller gets back names exactly the keys §6 defines, and a key added there is
+# added here rather than buried in a sentence.
+OKF_INDEX_KEYS=(repo qdrant_url collection embedding_url embedding_model embedding_dim)
+
+# SPEC.md §6: "Absent `index`, Tier B subcommands exit 2 with one line naming
+# the missing keys." That is §7's 2 and deliberately not §7's 1, because a
+# bundle that never opted in to Tier B is not a broken bundle: a caller looping
+# `okf chunk` over a repo that configured no index wants to tell "this repo does
+# no semantic retrieval" from "this concept is malformed", and one status for
+# both is what makes that impossible.
+#
+# Called from dispatch, after http_preflight and for http_preflight's reason:
+# that is where the name has been matched against OKF_SUBCOMMANDS rather than
+# being whatever word came first. After, and not before, because what is missing
+# from the machine outranks what is missing from the repo — a caller with no
+# curl who is told to write six settings first, and only then told to install
+# curl, has been sent round twice.
+#
+# The guard is on the block and not on its keys. §6 gives every field a default
+# — index.repo already falls back to the bundle's directory name — so `"index":
+# {}` is a bundle that has opted in and taken those defaults, which is a thing
+# somebody may well mean. It is the block's absence that says nobody opted in,
+# and its absence is what §6 makes the test.
+tier_b_preflight() { # $1 = the subcommand being dispatched
+  local sub="$1" name
+  for name in "${OKF_TIER_B_SUBCOMMANDS[@]}"; do
+    [ "$sub" = "$name" ] || continue
+    load_settings
+
+    # `getpath` and an explicit null test rather than `// empty`, which is
+    # index_repo's choice for index_repo's reason: `//` reads `false` as absent,
+    # so `"index": false` would be answered with the line about opting in rather
+    # than reported as the wrong shape it is. A written-out `null` is the one
+    # value that does read as absent — it is how JSON spells nothing, and §6
+    # gives the block no default for it to be overriding.
+    local shape
+    shape="$(printf '%s\n' "$OKF_SETTINGS" | jq -r '
+        getpath(["index"]) as $index
+        | if $index == null then "absent" else ($index | type) end' 2> /dev/null)" \
+      || die "cannot read index from $(display_path "$OKF_CONFIG")"
+
+    case "$shape" in
+      object) return 0 ;;
+      absent) ;;
+      *)
+        # There is an `index` and it is not a block. Exiting 2 here would answer
+        # a mistyped setting by telling the caller to write what they have
+        # already written, so this is §7's 1 — a wrong shape, reported the way
+        # settings_strings reports one.
+        die "$(display_path "$OKF_CONFIG"): index must be a JSON object, found $shape"
+        ;;
+    esac
+
+    # One line, because §6 says one line — and it says one line for
+    # require_tools' reason: someone who has to write six settings wants all six
+    # now, not one per re-run.
+    local keys="" key
+    for key in "${OKF_INDEX_KEYS[@]}"; do
+      keys="${keys:+$keys, }index.$key"
+    done
+    warn "$sub is Tier B and $(display_path "$OKF_CONFIG") has no index block: add $keys"
+    exit 2
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Global flags (SPEC.md §7)
 # ---------------------------------------------------------------------------
 
@@ -6950,6 +7029,11 @@ main() {
       die "$sub is listed as a subcommand but has no cmd_$sub function"
     fi
     http_preflight "$sub" ${1+"$@"}
+    # SPEC.md §6's other half of the same idea, checked here rather than inside
+    # each Tier B subcommand so that the three of them cannot answer an
+    # unconfigured bundle three different ways — and so that the two which are
+    # still stubs answer it at all.
+    tier_b_preflight "$sub"
     # ${1+"$@"} rather than "$@": under `set -u` an empty "$@" is an unbound
     # variable on bash 3.2, which is still what macOS ships.
     #
