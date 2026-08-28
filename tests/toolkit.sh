@@ -9959,6 +9959,306 @@ test_okf_refresh_command_reauthors_drifted_concepts() {
   with_fixture_repo concepts _okf_refresh_trust_probe
 }
 
+# Grounds commands/okf-verify.md's step 3 against bin/okf: that the concept
+# spelling the document tells the reader to pass is the one `okf check` prints,
+# that a drifted concept comes back below Human-reviewed on a run that still
+# exits 0 — which is the whole argument for sending drift to /okf-refresh
+# instead of stamping it — and that a second verify appends rather than merges.
+_okf_verify_command_drift_probe() {
+  local okf="$TOOLKIT_ROOT/bin/okf"
+  local concept="src/route/RouteRegistry.md" source="src/route/RouteRegistry.java"
+
+  # The fixture ships in step, so the drift below is this probe's and not the
+  # fixture's. Without this the tier assertions would hold for the wrong reason.
+  if printf '%s\n' "$("$okf" check 2> /dev/null)" | grep -Fq "drifted: $concept"; then
+    _fail "the concepts fixture starts in step with its sources" \
+      "$concept is already drifted before this probe changed anything"
+    return 1
+  fi
+  _pass "the concepts fixture starts in step with its sources"
+
+  # Undrifted first, so the degradation below is attributable to the drift and
+  # not to anything else §8 reads. The fixture's own human entry is what earns
+  # the tier, which is also step 1's "already confirmed" case.
+  _okf_assert_trust "Human-reviewed" \
+    "an undrifted concept with a qualifying human entry is already Human-reviewed" \
+    "$concept" --by process:okf/0.2
+
+  # Every bail below records a failure before it returns: with_fixture_repo's
+  # status is discarded at the call site, so a silent `return 1` would leave the
+  # rest unrun on a suite that still prints PASS.
+  if ! printf '\n// a line the concept says nothing about\n' >> "$source" \
+    || ! git add -A > /dev/null 2>&1 \
+    || ! git commit -qm 'a source change the concept has not caught up with' \
+      > /dev/null 2>&1; then
+    _fail "the fixture source can be changed and committed" \
+      "could not write and commit $source under $PWD"
+    return 1
+  fi
+
+  # The path exactly as `okf check` prints it, taken off the line rather than
+  # spelled again here — the document tells the reader those lines pipe straight
+  # back in, and this is that claim.
+  local printed
+  printed="$(printf '%s\n' "$("$okf" check 2> /dev/null)" |
+    sed -n 's/^drifted: //p' | head -1)"
+  if [ -z "$printed" ]; then
+    _fail "okf check reports the changed source as drifted" \
+      "no 'drifted: ' line after committing a change to $source"
+    return 1
+  fi
+  assert_eq "$concept" "$printed" \
+    "okf check spells a drifted finding as the path okf verify takes"
+
+  local before after
+  before="$(_okf_verified_ats "$concept" | grep -c .)"
+  _okf_assert_trust "Machine-confirmed" \
+    "a human review of a drifted concept does not earn Human-reviewed" \
+    "$printed" --by human:reviewer
+  # The run still exits 0 — asserted by _okf_assert_trust, which fails on any
+  # other status — so the document is right that the tier is read off stdout
+  # and never off the exit code.
+  assert_contains "$OKF_VERIFY_ERR" "drifted" \
+    "and okf verify says on stderr why the tier came out below Human-reviewed"
+
+  # Appended, never merged: SPEC.md §8's historical facts, and the reason the
+  # document forbids re-running verify to chase a better tier.
+  after="$(_okf_verified_ats "$concept" | grep -c .)"
+  assert_eq "$((before + 1))" "$after" \
+    "okf verify appends one entry rather than merging into an existing one"
+  assert_eq "1" "$(grep -c 'by: human:dcruver' "$concept")" \
+    "and the entry the fixture already carried is untouched"
+  return 0
+}
+
+# Grounds the two spellings commands/okf-verify.md warns about, both of which
+# fail quietly rather than loudly: SPEC.md §4's bundle-absolute `resource` form
+# handed to a subcommand that reads filesystem paths, and a `human` actor
+# written with the wrong separator, which SPEC.md §8 never counts as a human's.
+_okf_verify_command_spelling_probe() {
+  local source="src/route/RouteSource.java" clean
+
+  clean="sha256:$(sha256sum < "$source" | awk '{print $1}')"
+  _okf_trust_concept src/route/Fresh.md "/$source" 1970-01-01T00:00:00Z "$clean"
+
+  # The actor the document insists on, on a concept nothing else can degrade.
+  _okf_assert_trust "Human-reviewed" \
+    "--by human:<id> on an undrifted concept earns Human-reviewed" \
+    src/route/Fresh.md --by human:reviewer
+
+  # The same review, spelled with a slash. Recorded as given — okf does not
+  # overrule §4's vocabulary — and worth nothing, which is why the document
+  # calls the prefix load-bearing and the rest of the string not.
+  _okf_trust_concept src/route/Slashed.md "/$source" 1970-01-01T00:00:00Z "$clean"
+  _okf_assert_trust "Machine-confirmed" \
+    "--by human/<id> is not read as a human's review" \
+    src/route/Slashed.md --by human/reviewer
+  assert_contains "$OKF_VERIFY_ERR" "human:" \
+    "and okf verify warns on stderr, naming the spelling SPEC.md §4 wants"
+
+  # A `resource` value passed straight through. It is a path with a leading `/`
+  # that means the bundle root, and okf reads paths as the filesystem's, so the
+  # document tells the reader to strip it — okf refuses and names the other
+  # spelling rather than acting for it.
+  _okf_verify /src/route/Fresh.md --by human:reviewer
+  if [ "$OKF_VERIFY_RC" -eq 0 ]; then
+    _fail "okf verify refuses SPEC.md §4's bundle-absolute spelling" \
+      "okf verify /src/route/Fresh.md exited 0, so the document's warning" \
+      "about passing a resource value straight through describes nothing"
+  else
+    _pass "okf verify refuses SPEC.md §4's bundle-absolute spelling"
+  fi
+  # The whole point of the refusal is that okf names the other spelling instead
+  # of guessing at it. Matched on the suggestion and not on the path alone: the
+  # rejected argument is `/src/route/Fresh.md`, which contains the corrected
+  # path as a substring, so a bare contains would pass on a message that never
+  # made the suggestion at all.
+  assert_contains "$OKF_VERIFY_ERR" "did you mean src/route/Fresh.md" \
+    "and names the path without the leading slash rather than acting for it"
+  return 0
+}
+
+# SPEC.md §11 once more, for the command that ends the workflow: it is the only
+# one that may write a `verified` entry, and the only one whose output is a
+# claim about what a person did. What is pinned is that seam — `okf verify` with
+# a `human:` actor for the stamp, `okf check` for the drifted half of the queue,
+# SPEC.md §8's three tiers named as §8 spells them, and the two rules that keep
+# the command from confirming its own work.
+#
+# The frontmatter of the document itself is checked for every command file by
+# test_commands_have_frontmatter_description; only what is specific to this one
+# is asserted here.
+test_okf_verify_command_walks_the_unconfirmed_queue() {
+  local doc="$TOOLKIT_ROOT/commands/okf-verify.md"
+  if [ ! -f "$doc" ]; then
+    _fail "commands/okf-verify.md exists" "no such file: $doc"
+    return 1
+  fi
+  _okf_preconditions || return 1
+
+  local body_text
+  body_text="$(_command_body "$doc")"
+  if [ -z "$body_text" ]; then
+    _fail "commands/okf-verify.md has a body below its frontmatter" \
+      "nothing follows the frontmatter block in $doc"
+    return 1
+  fi
+
+  # It narrows its walk with $ARGUMENTS, and SPEC.md §11 asks for an
+  # argument-hint from any command that takes arguments — it is what Claude
+  # Code shows the user at the prompt, so an undocumented argument is an
+  # invisible one. CR stripped first, as the sibling frontmatter check does.
+  if grep -q '\$ARGUMENTS' "$doc"; then
+    if awk '{ sub(/\r$/, "") }
+            NR == 1 && $0 != "---" { exit 1 }
+            NR > 1 && $0 == "---" { exit 1 }
+            NR > 1 && /^argument-hint:[[:space:]]*[^[:space:]]/ { found = 1; exit 0 }
+            END { exit found ? 0 : 1 }' "$doc"; then
+      _pass "commands/okf-verify.md documents its arguments with an argument-hint"
+    else
+      _fail "commands/okf-verify.md documents its arguments with an argument-hint" \
+        "it takes \$ARGUMENTS but its frontmatter has no non-empty" \
+        "argument-hint line"
+    fi
+  fi
+
+  # The two shell calls this command sits on, and the actor form the PLAN.md
+  # item names. The `--by human:` prefix is not decoration: SPEC.md §8 reads an
+  # entry as a human's only when the actor begins with it, so a document that
+  # left it to the default would be describing a review credited to whatever
+  # account the session runs as.
+  assert_contains "$body_text" 'okf verify' \
+    "it stamps a confirmed concept with okf verify"
+  assert_contains "$body_text" '--by human:' \
+    "it names the actor as SPEC.md §4's human:<id>"
+  assert_contains "$body_text" 'okf check' \
+    "it takes the drifted half of its queue from okf check"
+
+  # Every subcommand it names has to be one bin/okf actually dispatches, and
+  # one that is not still a stub. Same collection rule as the sibling command
+  # checks: only backticked `okf <name>` mentions, in either voice, because a
+  # prohibition written as code is still a name a reader may go and run.
+  local -a named=()
+  local sub
+  while IFS= read -r sub; do
+    [ -n "$sub" ] && named+=("$sub")
+  done < <(printf '%s\n' "$body_text" | grep -oE '`okf [a-z][a-z-]*' |
+    awk '{print $2}' | sort -u)
+  if [ "${#named[@]}" -eq 0 ]; then
+    _fail "commands/okf-verify.md names the okf subcommands it runs" \
+      "no 'okf <subcommand>' mention found in the document"
+    return 1
+  fi
+  local okf="$TOOLKIT_ROOT/bin/okf"
+  local dispatched
+  dispatched="$(_okf_dispatch_subcommands)"
+  if [ -z "$dispatched" ]; then
+    _fail "bin/okf lists the subcommands it dispatches" \
+      "no OKF_SUBCOMMANDS array in bin/okf, or it is empty"
+    return 1
+  fi
+  for sub in "${named[@]}"; do
+    if ! printf '%s\n' "$dispatched" | grep -Fqx -- "$sub"; then
+      _fail "commands/okf-verify.md names a working subcommand: okf $sub" \
+        "bin/okf's OKF_SUBCOMMANDS does not list $sub, so dispatch would" \
+        "reject it as an unknown subcommand"
+    elif ! grep -qE "^cmd_$sub\(\)" "$okf"; then
+      _fail "commands/okf-verify.md names a working subcommand: okf $sub" \
+        "bin/okf has no cmd_$sub function, so this document tells the reader" \
+        "to run a subcommand that does not exist"
+    elif grep -qE "(^|[^_[:alnum:]])not_implemented[[:space:]]+$sub([^_[:alnum:]]|\$)" "$okf"; then
+      _fail "commands/okf-verify.md names a working subcommand: okf $sub" \
+        "cmd_$sub in bin/okf is still a not_implemented stub" \
+        "if the mention is not an instruction to run it, name it as a bare" \
+        "word — only backticked 'okf <name>' mentions are collected"
+    else
+      _pass "commands/okf-verify.md names a working subcommand: okf $sub"
+    fi
+  done
+
+  # SPEC.md §8's three tiers, spelled as §8 spells them. `okf verify` prints one
+  # of these per run and it is the answer the user is actually after, so a
+  # document that never names them describes a run whose output it cannot read.
+  local tier
+  for tier in "Unverified" "Machine-confirmed" "Human-reviewed"; do
+    assert_contains "$body_text" "$tier" \
+      "it names SPEC.md §8's $tier tier"
+  done
+
+  # The two halves of the queue the PLAN.md item names, spelled as the things
+  # they are read off: `status: draft` in the frontmatter, and okf check's
+  # `drifted: ` finding. Matched with the colon okf check prints it with, so a
+  # bare `drifted` in a sentence does not answer for it.
+  assert_contains "$body_text" 'status: draft' \
+    "it walks the concepts left at status: draft"
+  assert_contains "$body_text" 'drifted: ' \
+    "it walks the concepts okf check reports drifted"
+
+  # The other two kinds of line okf check prints are not this command's, and a
+  # document that does not name them is one whose reader silently invents a
+  # repair for an orphan — which is a deletion, and takes a verified history
+  # with it.
+  local kind
+  for kind in missing orphan; do
+    assert_contains "$body_text" "$kind: " \
+      "it says what it does with okf check's \"$kind: \" findings"
+  done
+
+  # The rule the whole command exists for. SPEC.md §11 keeps ralph off a
+  # verified entry so that unattended regeneration cannot forge review; a
+  # command that stamped human: for a person who never answered would forge the
+  # same thing by hand, so the prohibition has to be in the document in words.
+  if printf '%s\n' "$body_text" | grep -qi "on the user's behalf"; then
+    _pass "commands/okf-verify.md forbids confirming on the user's behalf"
+  else
+    _fail "commands/okf-verify.md forbids confirming on the user's behalf" \
+      "nothing in the document says a review is the user's to give — without" \
+      "it the command is free to stamp human:<id> for an answer nobody gave"
+  fi
+
+  # And the other half of that separation: this command reads prose, it does
+  # not write it. A run that corrected a concept and then confirmed its own
+  # correction has no reviewer left in it.
+  assert_contains "$body_text" '/okf-refresh' \
+    "it hands a drifted concept on to /okf-refresh rather than re-authoring it"
+  assert_contains "$body_text" '/okf-generate' \
+    "it hands a missing concept on to /okf-generate"
+
+  # SPEC.md §8: verified entries are historical facts and are never stripped.
+  if printf '%s\n' "$body_text" | grep -qiE 'verified.{0,80}never|never.{0,80}verified'; then
+    _pass "commands/okf-verify.md says an existing verified entry is never removed"
+  else
+    _fail "commands/okf-verify.md says an existing verified entry is never removed" \
+      "SPEC.md §8 calls verified entries historical facts that are never" \
+      "stripped, and nothing in this document states it"
+  fi
+
+  # stale_after is okf check --stamp's mark at the instant drift was detected,
+  # and this command resolves no drift. Clearing it here would drop the signal
+  # without fixing what raised it, so the document has to say so.
+  assert_contains "$body_text" 'stale_after' \
+    "it says to leave the stale_after a stamped check wrote alone"
+
+  # The house-style pair from commands/onboard.md.
+  if printf '%s\n' "$body_text" | grep -qi 'stop there'; then
+    _pass "commands/okf-verify.md has an explicit stopping point"
+  else
+    _fail "commands/okf-verify.md has an explicit stopping point" \
+      "no 'Stop there' in the document — SPEC.md §11 asks every okf-* command" \
+      "for one, in the style of commands/onboard.md"
+  fi
+  if printf '%s\n' "$body_text" | grep -qi 'non-goal'; then
+    _pass "commands/okf-verify.md states its non-goals explicitly"
+  else
+    _fail "commands/okf-verify.md states its non-goals explicitly" \
+      "the words 'non-goal' appear nowhere in the document"
+  fi
+
+  # And the seam itself, against bin/okf rather than against the prose.
+  with_fixture_repo concepts _okf_verify_command_drift_probe
+  with_fixture_repo concepts _okf_verify_command_spelling_probe
+}
+
 # --- add new test_* functions above this line ------------------------------
 
 # ---------------------------------------------------------------------------
