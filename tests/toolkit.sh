@@ -9368,23 +9368,43 @@ test_okf_chunk_gives_every_method_chunk_its_own_symbol() {
 # between this section and a real HTTP request.
 #
 # It opens no socket. What it does is record the request — the whole argument
-# vector, the URL, and the body okf wrote to its stdin — and answer with an
-# OpenAI-shaped embeddings response computed from that body, so that a request
-# for three texts is answered with three vectors without anything having to
-# know in advance how many chunks a concept has.
+# vector, the URL, and the body okf wrote to its stdin — and answer it.
+#
+# It stands in for both endpoints Tier B talks to, told apart by the URL the
+# way nothing else could tell them apart: a `/collections` path is Qdrant, and
+# anything else is the embedding endpoint. Which one answered a given request is
+# recorded alongside it, so a test filters on the fake's own decision rather
+# than on a second guess at the same URLs.
+#
+# The embedding endpoint's answer is computed from the request body, so that a
+# request for three texts is answered with three vectors without anything having
+# to know in advance how many chunks a concept has. Qdrant's is computed from
+# the method and from whether the collection is supposed to be there.
 #
 # Prepended to the real PATH rather than replacing it, which is
 # _ralph_probe_bin's arrangement for its reason: okf still needs git, jq, rg
 # and sha256sum to be findable, and what is being staged here is one tool's
 # answers rather than an empty machine.
 #
-# What each run is told, all optional:
+# What each run is told, all optional. The first group is the embedding
+# endpoint's, the second Qdrant's, and they are kept apart so that a test
+# breaking one endpoint's answer does not quietly break the other's — a run
+# meant to prove what okf does with a 503 from the embeddings would otherwise
+# never get past Qdrant to find out.
 #   OKF_FAKE_CURL_DIR      where to record (required; set by _okf_embed)
 #   OKF_FAKE_CURL_DIM      how wide the vectors come back (default 4)
 #   OKF_FAKE_CURL_STATUS   the HTTP status to write out (default 200)
 #   OKF_FAKE_CURL_BODY     a canned response body, instead of the computed one
 #   OKF_FAKE_CURL_EXIT     fail the way an unreachable endpoint fails
 #   OKF_FAKE_CURL_NO_STATUS  answer without curl's --write-out status at all
+#
+#   OKF_FAKE_CURL_COLLECTION     present|missing — what the GET finds (default missing)
+#   OKF_FAKE_CURL_COLLECTION_DIM       how wide an existing collection is (default DIM)
+#   OKF_FAKE_CURL_COLLECTION_DISTANCE  what it measures with (default Cosine)
+#   OKF_FAKE_CURL_QDRANT_STATUS  the status every Qdrant request answers with
+#   OKF_FAKE_CURL_CREATE_STATUS  the status the creating PUT answers with
+#   OKF_FAKE_CURL_QDRANT_BODY    a canned Qdrant response body
+#   OKF_FAKE_CURL_QDRANT_EXIT    fail the way an unreachable Qdrant fails
 OKF_FAKE_CURL_BIN=""
 _okf_fake_curl_bin() {
   OKF_FAKE_CURL_BIN="$HARNESS_STATE/fake-curl-bin"
@@ -9404,6 +9424,7 @@ argv=("$@")
 url=""
 data=""
 wout=""
+method="GET"
 while [ $# -gt 0 ]; do
   case "$1" in
     --url)
@@ -9418,7 +9439,11 @@ while [ $# -gt 0 ]; do
       wout="${2-}"
       shift 2
       ;;
-    --header | --request)
+    --request)
+      method="${2-}"
+      shift 2
+      ;;
+    --header)
       shift 2
       ;;
     *) shift ;;
@@ -9430,11 +9455,62 @@ done
 body=""
 [ "$data" = "@-" ] && body="$(cat)"
 
+# Which endpoint was asked for, decided once and recorded, so that the tests
+# and the fake cannot disagree about what a request was.
+case "$url" in
+  */collections | */collections/*) kind="qdrant" ;;
+  *) kind="embeddings" ;;
+esac
+
 n=$(( $(cat "$dir/count" 2> /dev/null || echo 0) + 1 ))
 printf '%s\n' "$n" > "$dir/count"
 printf '%s\n' "${argv[@]}" > "$dir/argv-$n"
 printf '%s\n' "$url" >> "$dir/urls"
+printf '%s\n' "$kind" >> "$dir/kinds"
 printf '%s' "$body" > "$dir/req-$n.json"
+
+if [ "$kind" = "qdrant" ]; then
+  code="${OKF_FAKE_CURL_QDRANT_EXIT:-0}"
+  if [ "$code" -ne 0 ]; then
+    printf 'curl: (%s) the fake curl was told not to reach Qdrant\n' "$code" >&2
+    [ -n "$wout" ] && printf '\n000'
+    exit "$code"
+  fi
+
+  # A collection the run has already created is there for the rest of it, the
+  # way a real Qdrant would have it — so a second GET in one run cannot answer
+  # 404 to a collection okf just made.
+  status="${OKF_FAKE_CURL_QDRANT_STATUS:-}"
+  if [ -z "$status" ]; then
+    if [ "$method" = "PUT" ]; then
+      status="${OKF_FAKE_CURL_CREATE_STATUS:-200}"
+    elif [ "${OKF_FAKE_CURL_COLLECTION:-missing}" = "present" ] \
+      || [ -e "$dir/collection-created" ]; then
+      status="200"
+    else
+      status="404"
+    fi
+  fi
+  [ "$method" = "PUT" ] && case "$status" in 2??) : > "$dir/collection-created" ;; esac
+
+  if [ -n "${OKF_FAKE_CURL_QDRANT_BODY+set}" ]; then
+    printf '%s' "$OKF_FAKE_CURL_QDRANT_BODY"
+  elif [ "$status" = "404" ]; then
+    printf '%s' '{"status": {"error": "Not found: Collection does not exist!"}, "time": 0.0}'
+  elif [ "$method" = "GET" ]; then
+    # What Qdrant answers about a collection it has: the config it was created
+    # with, which is where its width and distance are fixed for good.
+    jq -n -c --argjson size "${OKF_FAKE_CURL_COLLECTION_DIM:-${OKF_FAKE_CURL_DIM:-4}}" \
+      --arg distance "${OKF_FAKE_CURL_COLLECTION_DISTANCE:-Cosine}" \
+      '{result: {status: "green",
+                 config: {params: {vectors: {size: $size, distance: $distance}}}},
+        status: "ok", time: 0.0}'
+  else
+    printf '%s' '{"result": true, "status": "ok", "time": 0.0}'
+  fi
+  [ -n "$wout" ] && [ -z "${OKF_FAKE_CURL_NO_STATUS:-}" ] && printf '\n%s' "$status"
+  exit 0
+fi
 
 code="${OKF_FAKE_CURL_EXIT:-0}"
 if [ "$code" -ne 0 ]; then
@@ -9523,6 +9599,48 @@ _okf_embed_argv() { # $1 = which request, from 1
   cat "$OKF_EMBED_REQUESTS/argv-$1" 2> /dev/null
 }
 
+# One recorded request body, exactly as okf wrote it — for the checks that are
+# about there being no body at all, which jq cannot tell from a body of `null`.
+_okf_embed_request_raw() { # $1 = which request, from 1
+  cat "$OKF_EMBED_REQUESTS/req-$1.json" 2> /dev/null
+}
+
+# One recorded request's URL, and its method as curl was told it.
+_okf_embed_url() { # $1 = which request, from 1
+  _okf_embed_urls | sed -n "$1p"
+}
+_okf_embed_method() { # $1 = which request, from 1
+  _okf_embed_argv "$1" | awk '$0 == "--request" { getline; print; exit }'
+}
+
+# Which endpoint answered each request, in order — the fake curl's own decision,
+# recorded by it rather than guessed at again here.
+_okf_embed_request_kinds() {
+  cat "$OKF_EMBED_REQUESTS/kinds" 2> /dev/null
+}
+
+# The request numbers that went to one endpoint, in order, so that a check about
+# the third embedding request stays a check about the third embedding request
+# however many Qdrant calls came before it.
+_okf_embed_requests_of_kind() { # $1 = qdrant or embeddings
+  local want="$1" kind n=0
+  while IFS= read -r kind; do
+    n=$((n + 1))
+    [ "$kind" = "$want" ] && printf '%s\n' "$n"
+  done < <(_okf_embed_request_kinds)
+  return 0
+}
+
+# How many of that run's requests went to one endpoint.
+_okf_embed_kind_count() { # $1 = qdrant or embeddings
+  _okf_embed_requests_of_kind "$1" | wc -l | tr -d ' '
+}
+
+# The recorded request number of the nth request to one endpoint, from 1.
+_okf_embed_nth_of_kind() { # $1 = qdrant or embeddings, $2 = which, from 1
+  _okf_embed_requests_of_kind "$1" | sed -n "$2p"
+}
+
 # The `chunks` fixture's concepts, in the order `okf embed` walks them — which
 # is load_concepts' order, which is `git ls-files`'. Unwritten is deliberately
 # not here: it has neither a body nor a `title`, `description` or
@@ -9549,18 +9667,23 @@ _okf_embed_request_probe() {
   assert_eq "0" "$OKF_EMBED_RC" "okf embed exits 0 over a bundle it could embed"
 
   # Four requests for five concepts: one per concept that has chunks, and
-  # nothing at all for the one that has none.
-  assert_eq "4" "$(_okf_embed_request_count)" \
+  # nothing at all for the one that has none. Counted over the requests that
+  # went to the embedding endpoint, because the run also calls Qdrant about its
+  # collection — see _okf_embed_collection_probe for that half.
+  assert_eq "4" "$(_okf_embed_kind_count embeddings)" \
     "one request per concept with chunks in it, and none for the concept with none"
   assert_contains "$OKF_EMBED_ERR" "nothing to embed" \
     "and the concept nothing was sent for is named on stderr rather than dropped in silence"
 
-  assert_eq "$(printf '%s\n' "$url" "$url" "$url" "$url")" "$(_okf_embed_urls)" \
+  local sent_to
+  sent_to="$(_okf_embed_requests_of_kind embeddings \
+    | while IFS= read -r n; do _okf_embed_url "$n"; done)"
+  assert_eq "$(printf '%s\n' "$url" "$url" "$url" "$url")" "$sent_to" \
     "every request goes to the endpoint okf.json configures, and nowhere else"
 
   # SPEC.md §9's OpenAI shape: a POST carrying JSON.
   local argv
-  argv="$(_okf_embed_argv 1)"
+  argv="$(_okf_embed_argv "$(_okf_embed_nth_of_kind embeddings 1)")"
   assert_contains "$argv" "POST" "the request is a POST"
   assert_contains "$argv" "Content-Type: application/json" "declaring a JSON body"
 
@@ -9569,12 +9692,13 @@ _okf_embed_request_probe() {
   # concept, in that order. Compared against `okf chunk`'s own output rather
   # than against a copy of the fixture's prose, so the two cannot answer
   # differently about what a concept splits into.
-  local expected="" actual="" concept i=0
+  local expected="" actual="" concept i=0 req
   while IFS= read -r concept; do
     i=$((i + 1))
+    req="$(_okf_embed_nth_of_kind embeddings "$i")"
     expected="$expected$("$TOOLKIT_ROOT/bin/okf" chunk "$concept" | jq -c '[.[].text]')"$'\n'
-    actual="$actual$(_okf_embed_request "$i" '.input')"$'\n'
-    assert_eq "$model" "$(_okf_embed_request "$i" '.model')" \
+    actual="$actual$(_okf_embed_request "$req" '.input')"$'\n'
+    assert_eq "$model" "$(_okf_embed_request "$req" '.model')" \
       "request $i names the model okf.json configures"
   done < <(_okf_chunks_fixture_concepts)
   assert_eq "$expected" "$actual" \
@@ -9601,11 +9725,13 @@ _okf_embed_settings_probe() {
 
   OKF_FAKE_CURL_DIM=768 _okf_embed || return 1
   assert_eq "0" "$OKF_EMBED_RC" "an empty index block is a bundle running on the defaults"
+  local first
+  first="$(_okf_embed_nth_of_kind embeddings 1)"
   assert_eq "$(_okf_bin_scalar OKF_DEFAULT_EMBEDDING_URL)" \
-    "$(_okf_embed_urls | sort -u)" \
+    "$(_okf_embed_requests_of_kind embeddings | while IFS= read -r n; do _okf_embed_url "$n"; done | sort -u)" \
     "with no embedding_url set, the requests go to SPEC.md §6's default"
   assert_eq "$(_okf_bin_scalar OKF_DEFAULT_EMBEDDING_MODEL)" \
-    "$(_okf_embed_request 1 '.model')" \
+    "$(_okf_embed_request "$first" '.model')" \
     "and carry SPEC.md §6's default model"
   assert_contains "$OKF_EMBED_OUT" "768-dim" \
     "and are checked against SPEC.md §6's default dimension"
@@ -9664,7 +9790,7 @@ _okf_embed_refusal_probe() {
   OKF_FAKE_CURL_STATUS=503 OKF_FAKE_CURL_DIM=4 _okf_embed || return 1
   assert_eq "1" "$OKF_EMBED_RC" "a non-2xx status is a refusal"
   assert_contains "$OKF_EMBED_ERR" "503" "naming the status that came back"
-  assert_eq "1" "$(_okf_embed_request_count)" \
+  assert_eq "1" "$(_okf_embed_kind_count embeddings)" \
     "and the run stops there rather than sending the rest of the bundle"
 
   OKF_FAKE_CURL_EXIT=7 _okf_embed || return 1
@@ -9724,7 +9850,7 @@ _okf_embed_drift_probe() {
     || return 1
 
   OKF_FAKE_CURL_DIM=4 _okf_embed || return 1
-  assert_eq "4" "$(_okf_embed_request_count)" \
+  assert_eq "4" "$(_okf_embed_kind_count embeddings)" \
     "with nothing drifted, every concept with chunks is embedded"
 
   # One source changed, so its concept's stored code.content_hash no longer
@@ -9737,7 +9863,7 @@ _okf_embed_drift_probe() {
 
   OKF_FAKE_CURL_DIM=4 _okf_embed || return 1
   assert_eq "0" "$OKF_EMBED_RC" "a drifted concept is not an error"
-  assert_eq "3" "$(_okf_embed_request_count)" "but it is left out of a plain okf embed"
+  assert_eq "3" "$(_okf_embed_kind_count embeddings)" "but it is left out of a plain okf embed"
   assert_contains "$OKF_EMBED_ERR" "drifted" "which is said on stderr, not left to be noticed"
   assert_contains "$OKF_EMBED_ERR" "--all" "along with the flag that embeds it anyway"
   assert_contains "$OKF_EMBED_OUT" "from 3 concepts" "and the report counts what was sent"
@@ -9754,7 +9880,7 @@ _okf_embed_drift_probe() {
 
   OKF_FAKE_CURL_DIM=4 _okf_embed --all || return 1
   assert_eq "0" "$OKF_EMBED_RC" "okf embed --all exits 0"
-  assert_eq "4" "$(_okf_embed_request_count)" "and embeds the drifted concept too"
+  assert_eq "4" "$(_okf_embed_kind_count embeddings)" "and embeds the drifted concept too"
   sent="$(cat "$OKF_EMBED_REQUESTS"/req-*.json 2> /dev/null)"
   assert_contains "$sent" "answers which one serves a" \
     "so its prose does reach the endpoint under --all"
@@ -9764,6 +9890,246 @@ _okf_embed_drift_probe() {
 test_okf_embed_leaves_out_drifted_concepts_unless_all_is_given() {
   _okf_preconditions || return 1
   with_fixture_repo chunks _okf_embed_drift_probe
+}
+
+# PLAN.md's Phase 10 collection item, and SPEC.md §9's "One collection, cosine
+# distance, dimension `embedding_dim`": the collection is created over Qdrant's
+# REST API when it is not already there, asserted against the fake curl above.
+_okf_embed_collection_probe() {
+  local qdrant="http://qdrant.invalid:6333" collection="probe_concepts"
+  _okf_index_block . \
+    "{\"qdrant_url\": \"$qdrant\", \"collection\": \"$collection\",
+      \"embedding_url\": \"http://embeddings.invalid/v1/embeddings\", \"embedding_dim\": 4}" \
+    || return 1
+
+  OKF_FAKE_CURL_DIM=4 _okf_embed || return 1
+  assert_eq "0" "$OKF_EMBED_RC" "okf embed exits 0 having created the collection it needed"
+
+  # Qdrant first, and only then the embedding endpoint: a run that could not
+  # store its points should not spend an endpoint's time computing them.
+  assert_eq "$(printf '%s\n' qdrant qdrant)" \
+    "$(_okf_embed_request_kinds | head -2)" \
+    "the collection is settled before a single chunk is embedded"
+  assert_eq "2" "$(_okf_embed_kind_count qdrant)" \
+    "and settled once for the run, not once per concept"
+
+  # The existence check: a GET to the collection's own REST path, carrying no
+  # body, built from the two settings okf.json gives.
+  assert_eq "GET" "$(_okf_embed_method 1)" "okf asks after the collection before creating it"
+  assert_eq "$qdrant/collections/$collection" "$(_okf_embed_url 1)" \
+    "at the REST path SPEC.md §9 keeps a collection behind"
+  assert_eq "" "$(_okf_embed_request_raw 1)" "with no request body on the question"
+
+  # The creation itself, which is what this item is about.
+  assert_eq "PUT" "$(_okf_embed_method 2)" "a collection Qdrant has not got is created with a PUT"
+  assert_eq "$qdrant/collections/$collection" "$(_okf_embed_url 2)" "to the same path"
+  assert_contains "$(_okf_embed_argv 2)" "Content-Type: application/json" \
+    "declaring a JSON body"
+  assert_eq "Cosine" "$(_okf_embed_request 2 '.vectors.distance')" \
+    "SPEC.md §9's cosine distance"
+  assert_eq "4" "$(_okf_embed_request 2 '.vectors.size')" \
+    "and SPEC.md §9's dimension, which is okf.json's embedding_dim"
+
+  assert_contains "$OKF_EMBED_OUT" "created collection $collection" \
+    "and the run says it created it, naming which"
+
+  # A collection that is already there is left exactly as it is: Qdrant answers
+  # a PUT over an existing collection with a 409, so a run that created it every
+  # time would fail on the second run against a working bundle.
+  OKF_FAKE_CURL_COLLECTION=present OKF_FAKE_CURL_DIM=4 _okf_embed || return 1
+  assert_eq "0" "$OKF_EMBED_RC" "a bundle whose collection exists embeds without incident"
+  assert_eq "1" "$(_okf_embed_kind_count qdrant)" \
+    "an existing collection is asked after and then left alone"
+  assert_eq "GET" "$(_okf_embed_method 1)" "with nothing but the question sent"
+  assert_eq "4" "$(_okf_embed_kind_count embeddings)" \
+    "and the concepts are embedded either way"
+  case "$OKF_EMBED_OUT" in
+    *"created collection"*)
+      _fail "an existing collection is not reported as created" \
+        "the report claims to have created one: $OKF_EMBED_OUT"
+      ;;
+    *) _pass "an existing collection is not reported as created" ;;
+  esac
+
+  # SPEC.md §6's "every field defaults if absent", for the two Qdrant keys:
+  # an empty index block is a bundle that opted in and took them.
+  _okf_tier_b_opt_in . || return 1
+  OKF_FAKE_CURL_DIM=768 _okf_embed || return 1
+  assert_eq "$(_okf_bin_scalar OKF_DEFAULT_QDRANT_URL)/collections/$(_okf_bin_scalar OKF_DEFAULT_COLLECTION)" \
+    "$(_okf_embed_url 1)" \
+    "with neither qdrant_url nor collection set, the collection is SPEC.md §6's default one"
+  assert_eq "768" "$(_okf_embed_request 2 '.vectors.size')" \
+    "created at SPEC.md §6's default dimension"
+
+  # A dimension is a count, and JSON has more than one way to write one. What
+  # goes into the request has to be digits either way: `"size": 1E+3` is a
+  # request Qdrant refuses, and `(1E+3-dim)` is a report nobody wants to read.
+  _okf_index_block . \
+    "{\"qdrant_url\": \"$qdrant\", \"embedding_url\": \"http://embeddings.invalid/v1/embeddings\", \"embedding_dim\": 1e3}" \
+    || return 1
+  OKF_FAKE_CURL_DIM=1000 _okf_embed || return 1
+  assert_eq "0" "$OKF_EMBED_RC" "a dimension written 1e3 is a whole number like any other"
+  assert_eq "1000" "$(_okf_embed_request 2 '.vectors.size')" \
+    "and the collection is created at that width, in digits"
+  assert_contains "$OKF_EMBED_OUT" "1000-dim" "with the report saying it the same way"
+
+  # And the collection that comes back saying 1000 is the collection that was
+  # asked for, however either side spells the number.
+  OKF_FAKE_CURL_COLLECTION=present OKF_FAKE_CURL_COLLECTION_DIM=1000 \
+    OKF_FAKE_CURL_DIM=1000 _okf_embed || return 1
+  assert_eq "0" "$OKF_EMBED_RC" \
+    "a 1000-dim collection agrees with an embedding_dim written 1e3"
+  assert_eq "4" "$(_okf_embed_kind_count embeddings)" "and the bundle is embedded into it"
+
+  _okf_index_block . \
+    "{\"qdrant_url\": \"$qdrant\", \"embedding_url\": \"http://embeddings.invalid/v1/embeddings\", \"embedding_dim\": 4}" \
+    || return 1
+  OKF_FAKE_CURL_COLLECTION=present OKF_FAKE_CURL_DIM=4 \
+    OKF_FAKE_CURL_QDRANT_BODY='{"result": {"config": {"params": {"vectors": {"size": 4.0, "distance": "cosine"}}}}, "status": "ok"}' \
+    _okf_embed || return 1
+  assert_eq "0" "$OKF_EMBED_RC" \
+    "a Qdrant that answers 4.0 and lowercase cosine is answering about the right collection"
+  assert_eq "4" "$(_okf_embed_kind_count embeddings)" "and the bundle is embedded into it"
+
+  # A qdrant_url written the way a browser shows it. Qdrant would answer the
+  # doubled slash, but every URL quoted back at the caller would carry it.
+  _okf_index_block . "{\"qdrant_url\": \"$qdrant/\", \"embedding_dim\": 4}" || return 1
+  OKF_FAKE_CURL_DIM=4 _okf_embed || return 1
+  assert_eq "$qdrant/collections/$(_okf_bin_scalar OKF_DEFAULT_COLLECTION)" \
+    "$(_okf_embed_url 1)" \
+    "a trailing slash on qdrant_url does not become an empty path segment"
+  return 0
+}
+
+test_okf_embed_creates_the_qdrant_collection_when_it_is_missing() {
+  _okf_preconditions || return 1
+  with_fixture_repo chunks _okf_embed_collection_probe
+}
+
+# What okf does with a Qdrant it cannot use, and with settings that would build
+# a URL naming something other than the collection. Every one of these is a run
+# that must stop before it embeds anything: the points would have nowhere to go.
+_okf_embed_collection_refusal_probe() {
+  local qdrant="http://qdrant.invalid:6333"
+  _okf_index_block . \
+    "{\"qdrant_url\": \"$qdrant\", \"embedding_url\": \"http://embeddings.invalid/v1/embeddings\", \"embedding_dim\": 4}" \
+    || return 1
+
+  OKF_FAKE_CURL_QDRANT_STATUS=500 OKF_FAKE_CURL_DIM=4 _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "a Qdrant that cannot answer for the collection is a refusal"
+  assert_contains "$OKF_EMBED_ERR" "500" "naming the status that came back"
+  assert_eq "0" "$(_okf_embed_kind_count embeddings)" \
+    "and nothing is embedded for a collection okf could not settle"
+
+  OKF_FAKE_CURL_QDRANT_EXIT=7 OKF_FAKE_CURL_DIM=4 _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "a Qdrant that could not be reached is a refusal"
+  assert_contains "$OKF_EMBED_ERR" "curl exited 7" "reported in curl's own terms"
+  assert_eq "0" "$(_okf_embed_kind_count embeddings)" "with nothing embedded"
+
+  OKF_FAKE_CURL_CREATE_STATUS=409 OKF_FAKE_CURL_DIM=4 _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "a collection that could not be created is a refusal"
+  assert_contains "$OKF_EMBED_ERR" "409" "naming the status the creation came back with"
+  assert_eq "2" "$(_okf_embed_kind_count qdrant)" "after asking and then trying"
+  assert_eq "0" "$(_okf_embed_kind_count embeddings)" "and nothing is embedded into it"
+
+  # A collection that is already there, at a width the bundle no longer embeds
+  # at. Its width was fixed when it was created, so this is a run that would
+  # embed the whole bundle and then have Qdrant refuse its first point.
+  _okf_index_block . \
+    "{\"qdrant_url\": \"$qdrant\", \"embedding_url\": \"http://embeddings.invalid/v1/embeddings\", \"embedding_dim\": 4}" \
+    || return 1
+  OKF_FAKE_CURL_COLLECTION=present OKF_FAKE_CURL_COLLECTION_DIM=8 OKF_FAKE_CURL_DIM=4 \
+    _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "an existing collection of another width is a refusal"
+  assert_contains "$OKF_EMBED_ERR" "embedding_dim" "naming the setting it disagrees with"
+  assert_contains "$OKF_EMBED_ERR" "8-dim" "and the width the collection is actually at"
+  assert_eq "0" "$(_okf_embed_kind_count embeddings)" \
+    "before a single chunk is embedded at a width it could not store"
+
+  OKF_FAKE_CURL_COLLECTION=present OKF_FAKE_CURL_COLLECTION_DISTANCE=Euclid \
+    OKF_FAKE_CURL_DIM=4 _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "an existing collection measuring another distance is a refusal"
+  assert_contains "$OKF_EMBED_ERR" "cosine" "naming the distance SPEC.md §9 embeds for"
+  assert_eq "0" "$(_okf_embed_kind_count embeddings)" "with nothing embedded into it"
+
+  # A Qdrant that words its answer differently, or a collection configured with
+  # named vectors, says nothing okf can compare — which is not a disagreement,
+  # and refusing on it would break a working bundle on somebody else's upgrade.
+  OKF_FAKE_CURL_COLLECTION=present OKF_FAKE_CURL_DIM=4 \
+    OKF_FAKE_CURL_QDRANT_BODY='{"result": {"config": {"params": {"vectors": {"text": {"size": 8}}}}}, "status": "ok"}' \
+    _okf_embed || return 1
+  assert_eq "0" "$OKF_EMBED_RC" "a config okf cannot read a width out of is not a refusal"
+  assert_eq "4" "$(_okf_embed_kind_count embeddings)" "and the bundle is embedded"
+
+  # A number no count of vector components could be, and one that a bare
+  # `tostring` would have sent as `1E+999`.
+  _okf_index_block . "{\"qdrant_url\": \"$qdrant\", \"embedding_dim\": 1e999}" || return 1
+  _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "an embedding_dim too big to write out in digits is refused"
+  assert_contains "$OKF_EMBED_ERR" "index.embedding_dim" "naming the setting"
+  assert_eq "0" "$(_okf_embed_request_count)" "before anything is sent under it"
+
+  # SPEC.md §9 puts the collection name in a REST path, so a name that is not
+  # one path segment is refused rather than sent: `/` would address a different
+  # endpoint entirely.
+  _okf_index_block . "{\"qdrant_url\": \"$qdrant\", \"collection\": \"points/x\"}" || return 1
+  _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "a collection name that is not a single path segment is refused"
+  assert_contains "$OKF_EMBED_ERR" "index.collection" "naming the setting"
+  assert_eq "0" "$(_okf_embed_request_count)" "before anything is sent anywhere"
+
+  _okf_index_block . "{\"collection\": \"\"}" || return 1
+  _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "an empty collection is refused rather than defaulted over"
+  assert_contains "$OKF_EMBED_ERR" "index.collection" "naming the setting"
+
+  # `.` and `..` pass the charset check and are then resolved away by curl
+  # before it sends: `..` asks after Qdrant's root, which answers 200, and okf
+  # would take that for a collection that exists.
+  local dots
+  for dots in . ..; do
+    _okf_index_block . "{\"qdrant_url\": \"$qdrant\", \"collection\": \"$dots\"}" || return 1
+    _okf_embed || return 1
+    assert_eq "1" "$OKF_EMBED_RC" "a collection called '$dots' is refused rather than resolved away"
+    assert_contains "$OKF_EMBED_ERR" "index.collection" "naming the setting"
+    assert_eq "0" "$(_okf_embed_request_count)" "before anything is sent"
+  done
+
+  # A query or a fragment has nowhere to go in a base URL: appending
+  # /collections/<name> to one puts the path inside the query.
+  _okf_index_block . "{\"qdrant_url\": \"$qdrant/?tenant=a\"}" || return 1
+  _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "a qdrant_url carrying a query is refused"
+  assert_contains "$OKF_EMBED_ERR" "index.qdrant_url" "naming the setting"
+  assert_eq "0" "$(_okf_embed_request_count)" "and nothing is sent under it"
+
+  _okf_index_block . "{\"qdrant_url\": \"$qdrant#top\"}" || return 1
+  _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "and so is one carrying a fragment"
+
+  # And the same line index_string and embed_settings draw for the embedding
+  # endpoint, drawn for this one: curl would take `file://` and answer from the
+  # disk, and a bare host:port is a URL it guesses a scheme for.
+  _okf_index_block . '{"qdrant_url": "localhost:6333"}' || return 1
+  _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "a qdrant_url with no scheme is refused"
+  assert_contains "$OKF_EMBED_ERR" "index.qdrant_url" "naming the setting"
+  assert_eq "0" "$(_okf_embed_request_count)" "and nothing is sent under it"
+
+  _okf_index_block . '{"qdrant_url": "http://"}' || return 1
+  _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "a qdrant_url that is a scheme and no host is refused too"
+
+  _okf_index_block . '{"qdrant_url": 7}' || return 1
+  _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "a qdrant_url that is not a string is refused"
+  assert_contains "$OKF_EMBED_ERR" "must be a string" "saying what was wrong with it"
+  return 0
+}
+
+test_okf_embed_refuses_a_qdrant_it_cannot_use() {
+  _okf_preconditions || return 1
+  with_fixture_repo chunks _okf_embed_collection_refusal_probe
 }
 
 # The fallbacks in bin/okf are SPEC.md §6's example, which is the one place the
@@ -9781,7 +10147,7 @@ test_okf_embed_defaults_are_the_spec_ones() {
   fi
 
   local key var
-  for key in embedding_url embedding_model embedding_dim; do
+  for key in qdrant_url collection embedding_url embedding_model embedding_dim; do
     var="OKF_DEFAULT_$(printf '%s' "$key" | tr '[:lower:]' '[:upper:]')"
     assert_eq "$(printf '%s\n' "$spec" | jq -r --arg key "$key" '.index[$key] | tostring')" \
       "$(_okf_bin_scalar "$var")" \

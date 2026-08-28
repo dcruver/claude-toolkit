@@ -255,19 +255,20 @@ OKF_TIER_B_SUBCOMMANDS=(chunk embed search)
 # added here rather than buried in a sentence.
 OKF_INDEX_KEYS=(repo qdrant_url collection embedding_url embedding_model embedding_dim)
 
-# What SPEC.md §6's example writes for the three embedding settings, which is
-# also SPEC.md §9's documented default — "Ollama `nomic-embed-text`, 768-dim".
-# §6 says every field defaults if absent, and these are the values it defaults
-# to; tests/toolkit.sh reads them back out of §6's own JSON block, so the
-# example and the fallback cannot drift apart.
+# What SPEC.md §6's example writes for the Tier B settings that have a constant
+# default — the two Qdrant ones, and the three embedding ones §9 documents as
+# "Ollama `nomic-embed-text`, 768-dim". §6 says every field defaults if absent,
+# and these are the values it defaults to; tests/toolkit.sh reads them back out
+# of §6's own JSON block, so the example and the fallback cannot drift apart.
 #
 # Constants rather than an okf.json `okf init` writes: §1 makes Tier B opt-in
 # and `okf init` deliberately writes no `index` block at all, so a bundle that
 # has opted in with `"index": {}` still has to get these from somewhere.
 #
-# `index.repo` is not here because its default is not a constant — see
-# index_repo — and `qdrant_url` and `collection` are not here yet because
-# nothing reaches Qdrant until the upsert.
+# `index.repo` is the one §6 key not here, because its default is not a
+# constant — see index_repo.
+OKF_DEFAULT_QDRANT_URL="http://localhost:6333"
+OKF_DEFAULT_COLLECTION="okf_concepts"
 OKF_DEFAULT_EMBEDDING_URL="http://localhost:11434/v1/embeddings"
 OKF_DEFAULT_EMBEDDING_MODEL="nomic-embed-text"
 OKF_DEFAULT_EMBEDDING_DIM=768
@@ -6511,6 +6512,15 @@ index_string() { # $1 = a key inside the index block, $2 = its default
 # `embedding_dim` is the only one today, and it is a count of vector
 # components — so a fraction, a zero and a negative are each refused rather
 # than defaulted over, for index_string's reason. Left in OKF_INDEX_INT.
+#
+# Held as plain digits rather than as jq spells it, which is chunk_lines_json's
+# canonicalisation for chunk_lines_json's reason: `1e3` and `768.0` are legal
+# JSON for whole numbers okf has no quarrel with, but `1E+3` is what a bare
+# `tostring` yields, and that then goes into a Qdrant request as
+# `"size": 1E+3` — which Qdrant refuses — and into the run's own report as
+# `(1E+3-dim)`. A number too big to write out in digits at all is refused here
+# rather than sent in exponent form: `embedding_dim` is a count of vector
+# components, and nothing that needs an exponent is one.
 OKF_INDEX_INT=0
 index_int() { # $1 = a key inside the index block, $2 = its default
   local key="$1" fallback="$2" value
@@ -6525,7 +6535,9 @@ index_int() { # $1 = a key inside the index block, $2 = its default
           error("must be a whole number, found " + ($v | tostring))
         elif $v <= 0 then
           error("must be greater than zero, found " + ($v | tostring))
-        else ($v | tostring) end' 2>&1)" \
+        elif ($v | floor | tojson | test("^[0-9]+$") | not) then
+          error("must be a whole number okf can write out in digits, found " + ($v | tostring))
+        else ($v | floor | tojson) end' 2>&1)" \
     || die "$(display_path "$OKF_CONFIG"): index.$key ${value#jq: error*: }"
 
   [ -n "$value" ] || value="$fallback"
@@ -7094,6 +7106,85 @@ embed_settings() {
   esac
 }
 
+# The two SPEC.md §6 settings that say where the points go, read once per
+# invocation for embed_settings' reason and held in the URL the REST calls are
+# built from.
+#
+# SPEC.md §9 puts Qdrant behind "its **REST** API", where the collection name is
+# a path segment. That is why a name is held to letters, digits, `.`, `_` and
+# `-` rather than passed through: a name with a `/` in it would not be a
+# collection okf could not find, it would be a request to a different endpoint
+# entirely, and one with a space or a `?` would be a URL curl reads as something
+# other than what okf.json says. SPEC.md §3 has no tool to percent-encode with,
+# and inventing one in bash to accept a name nobody sensible writes would be
+# more code than the refusal is.
+OKF_QDRANT_URL=""
+OKF_COLLECTION=""
+OKF_COLLECTION_URL=""
+qdrant_settings() {
+  index_string qdrant_url "$OKF_DEFAULT_QDRANT_URL"
+  local url="$OKF_INDEX_STRING"
+
+  # Trailing slashes off before anything is appended, so that a `qdrant_url`
+  # written the way a browser shows it does not become `…:6333//collections/x`.
+  # Qdrant answers that, but the empty path segment is then in every URL a
+  # caller sees quoted back at them in an error.
+  while [ "${url%/}" != "$url" ]; do
+    url="${url%/}"
+  done
+
+  # After the trimming rather than before, so that `http://` and `http:///` —
+  # a scheme and no host — are refused here rather than becoming a URL curl
+  # would go and guess a host for. The value is quoted back as okf.json spells
+  # it, not as trimmed.
+  case "$url" in
+    http://?* | https://?*) ;;
+    *)
+      die "$(display_path "$OKF_CONFIG"): index.qdrant_url must be an http:// or https:// URL, found $OKF_INDEX_STRING" \
+        "SPEC.md §9 reaches Qdrant over its REST API"
+      ;;
+  esac
+
+  # A query or a fragment is refused rather than carried, because what is built
+  # from this is a base for paths: `http://host/?tenant=a` with `/collections/x`
+  # appended asks for `/` with a query of `tenant=a/collections/x`, which is
+  # Qdrant's root and not a collection at all. There is nowhere in a base URL
+  # for either of these to go.
+  case "$url" in
+    *[?#]*)
+      die "$(display_path "$OKF_CONFIG"): index.qdrant_url must have no query or fragment in it, found $OKF_INDEX_STRING" \
+        "it is the base the /collections/… paths are built on, and a query would swallow them"
+      ;;
+  esac
+  OKF_QDRANT_URL="$url"
+
+  index_string collection "$OKF_DEFAULT_COLLECTION"
+
+  # `.` and `..` get through the charset check below and are then removed from
+  # the path by curl, which resolves dot segments before it sends: `..` would
+  # ask after Qdrant's root, which answers 200, and okf would read that as a
+  # collection that exists. Neither is a name anybody means.
+  case "$OKF_INDEX_STRING" in
+    . | ..)
+      die "$(display_path "$OKF_CONFIG"): index.collection must name a collection, found $OKF_INDEX_STRING" \
+        "curl resolves . and .. away before it sends, so neither would ever reach a collection"
+      ;;
+  esac
+  case "$OKF_INDEX_STRING" in
+    *[!A-Za-z0-9._-]*)
+      die "$(display_path "$OKF_CONFIG"): index.collection must be made of letters, digits, '.', '_' or '-', found $OKF_INDEX_STRING" \
+        "SPEC.md §9 puts the collection name in a REST path, where anything else would name something other than the collection"
+      ;;
+  esac
+  OKF_COLLECTION="$OKF_INDEX_STRING"
+
+  # SPEC.md §9's "One collection", as the URL every call about it is made to:
+  # Qdrant keeps a collection at /collections/<name>, where a GET asks after it,
+  # a PUT creates it, and — when the upsert arrives — /points/… hangs off the
+  # same path.
+  OKF_COLLECTION_URL="$OKF_QDRANT_URL/collections/$OKF_COLLECTION"
+}
+
 # Up to ten lines of a response or a curl complaint, ready to hand to `die` as
 # its detail lines. Cut off rather than printed in full: an endpoint that
 # answers an okf request with a page of HTML has said what it had to say in its
@@ -7116,16 +7207,24 @@ http_detail_lines() { # $1 = a blob of text
   return 0
 }
 
-# One JSON POST, with the response body left in OKF_HTTP_BODY. Exits 1 — SPEC.md
-# §7's "error, or a missing prerequisite" — when the endpoint could not be
-# reached or did not answer 2xx, because there is no partial success to report:
-# an embedding that did not come back is a point that cannot be written.
+# One HTTP request, with the response body left in OKF_HTTP_BODY and the status
+# that came back in OKF_HTTP_STATUS. Exits 1 — SPEC.md §7's "error, or a missing
+# prerequisite" — only when there is no answer to hand back at all: the endpoint
+# could not be reached, or what answered was not curl.
 #
-# The request goes in on stdin as `--data-binary @-` rather than as an argument
-# or a temp file. An argument would put a whole concept's prose on the command
-# line, where it is both bounded by ARG_MAX and visible in `ps` to everyone on
-# the machine; a temp file would need `mktemp`, which SPEC.md §3's tool list has
-# not got — see init_write on why that list is taken literally.
+# Which statuses are acceptable is the caller's to say, and the two callers do
+# not agree: a 404 from the embedding endpoint is a mistyped setting, while a
+# 404 from Qdrant is the collection not existing yet, which is the ordinary case
+# `okf embed` is there to fix. http_ok_or_die below is the common judgement,
+# for every caller that has no such case.
+#
+# A request body goes in on stdin as `--data-binary @-` rather than as an
+# argument or a temp file. An argument would put a whole concept's prose on the
+# command line, where it is both bounded by ARG_MAX and visible in `ps` to
+# everyone on the machine; a temp file would need `mktemp`, which SPEC.md §3's
+# tool list has not got — see init_write on why that list is taken literally.
+# A request with no body sends none, and reads its stdin from /dev/null so that
+# a GET cannot sit waiting on whatever the caller's stdin was.
 #
 # The status comes back appended to the body by `--write-out`, and is split off
 # below, for the same reason: `--output` would need a file to write to. curl's
@@ -7133,27 +7232,33 @@ http_detail_lines() { # $1 = a blob of text
 # reported in curl's words rather than as an empty body.
 #
 # No Authorization header, deliberately: SPEC.md §6 defines no key to put in one
-# and SPEC.md §9's documented endpoint is a local Ollama. An endpoint that wants
-# a token is a §6 change, and inventing a setting here would put a secret in a
-# committed file ahead of anybody deciding it belongs there.
+# and SPEC.md §9's documented endpoints are a local Ollama and a local Qdrant.
+# An endpoint that wants a token is a §6 change, and inventing a setting here
+# would put a secret in a committed file ahead of anybody deciding it belongs
+# there.
 OKF_HTTP_STATUS=""
 OKF_HTTP_BODY=""
-http_post_json() { # $1 = what is being reached, $2 = the URL, $3 = the request body
-  local what="$1" url="$2" request="$3" response="" rc=0
+http_request() { # $1 = what is being reached, $2 = the method, $3 = the URL, $4 = the request body, or "" for none
+  local what="$1" method="$2" url="$3" request="$4" response="" rc=0
 
   OKF_HTTP_STATUS=""
   OKF_HTTP_BODY=""
 
   # `--url` rather than a trailing operand, so a URL that begins with a dash is
   # a bad URL rather than an option curl invents a meaning for.
-  response="$(printf '%s' "$request" | curl \
-      --silent --show-error \
-      --request POST \
-      --header 'Content-Type: application/json' \
-      --header 'Accept: application/json' \
-      --data-binary @- \
-      --write-out '\n%{http_code}' \
-      --url "$url" 2>&1)" || rc=$?
+  local args=(
+    --silent --show-error
+    --request "$method"
+    --header 'Accept: application/json'
+    --write-out '\n%{http_code}'
+    --url "$url"
+  )
+  if [ -n "$request" ]; then
+    response="$(printf '%s' "$request" | curl "${args[@]}" \
+        --header 'Content-Type: application/json' --data-binary @- 2>&1)" || rc=$?
+  else
+    response="$(curl "${args[@]}" < /dev/null 2>&1)" || rc=$?
+  fi
 
   if [ "$rc" -ne 0 ]; then
     http_detail_lines "$response"
@@ -7166,24 +7271,36 @@ http_post_json() { # $1 = what is being reached, $2 = the URL, $3 = the request 
   OKF_HTTP_BODY="${OKF_HTTP_BODY%$'\n'}"
 
   case "$OKF_HTTP_STATUS" in
-    [0-9][0-9][0-9]) ;;
-    *)
-      # curl exited 0 and wrote no status, which is not something curl does —
-      # so what is on the PATH under that name is not curl. Said plainly,
-      # because every other message here would send somebody to look at their
-      # endpoint.
-      http_detail_lines "$response"
-      die "$what at $url gave back no HTTP status, so curl is not what answered" \
-        ${OKF_HTTP_LINES[@]+"${OKF_HTTP_LINES[@]}"}
-      ;;
+    [0-9][0-9][0-9]) return 0 ;;
   esac
+
+  # curl exited 0 and wrote no status, which is not something curl does — so
+  # what is on the PATH under that name is not curl. Said plainly, because every
+  # other message here would send somebody to look at their endpoint.
+  http_detail_lines "$response"
+  die "$what at $url gave back no HTTP status, so curl is not what answered" \
+    ${OKF_HTTP_LINES[@]+"${OKF_HTTP_LINES[@]}"}
+}
+
+# The status http_request left, judged the ordinary way: anything but a 2xx is
+# the end of the run. There is no partial success to report — an embedding that
+# did not come back is a point that cannot be written, and a collection that was
+# not created is a point that has nowhere to go.
+http_ok_or_die() { # $1 = what was reached, $2 = the URL
   case "$OKF_HTTP_STATUS" in
     2??) return 0 ;;
   esac
 
   http_detail_lines "$OKF_HTTP_BODY"
-  die "$what at $url answered $OKF_HTTP_STATUS" \
+  die "$1 at $2 answered $OKF_HTTP_STATUS" \
     ${OKF_HTTP_LINES[@]+"${OKF_HTTP_LINES[@]}"}
+}
+
+# One JSON POST that has to succeed, which is every request the embedding half
+# of Tier B makes.
+http_post_json() { # $1 = what is being reached, $2 = the URL, $3 = the request body
+  http_request "$1" POST "$2" "$3"
+  http_ok_or_die "$1" "$2"
 }
 
 # What jq makes of an OpenAI-shaped embeddings response: one embedding per line
@@ -7276,6 +7393,110 @@ embed_texts() { # $1.. = the texts to embed
   return 0
 }
 
+# A collection that already exists, held to the settings it would have been
+# created with — the two SPEC.md §9 fixes at creation and cannot change
+# afterwards.
+#
+# Worth a check rather than a shrug, because the failure it catches is a whole
+# run's work thrown away: a bundle whose `embedding_dim` changed embeds every
+# concept it has, at an endpoint's expense, before Qdrant refuses the first
+# point for being the wrong width. Said here, the caller is told before anything
+# was computed, and told which two numbers disagree rather than reading a
+# Qdrant complaint about a vector.
+#
+# Only what the response actually says. A collection configured with *named*
+# vectors keeps a map where the size would be, and a Qdrant that words its
+# response differently keeps nothing okf can read there at all — neither is a
+# disagreement, and refusing on a shape okf does not understand would turn a
+# working bundle into a broken one on somebody else's upgrade.
+collection_agrees() {
+  local vectors size distance
+  vectors="$(printf '%s\n' "$OKF_HTTP_BODY" | jq -c \
+      '.result.config.params.vectors? // empty' 2> /dev/null)" || return 0
+  [ -n "$vectors" ] || return 0
+
+  # Canonicalised the way index_int canonicalises the setting it is compared
+  # against, and then compared as a number: a Qdrant that answers `768.0`, or a
+  # setting spelled `1e3` against a collection that says `1000`, is a collection
+  # of exactly the right width, and telling its owner to drop it would be this
+  # check doing harm where it meant to save a run.
+  size="$(printf '%s\n' "$vectors" | jq -r \
+      'if type == "object" and (.size | type) == "number"
+       then (.size | floor | tojson) else empty end' 2> /dev/null)"
+  case "$size" in
+    *[!0-9]* | "") size="" ;;
+  esac
+  if [ -n "$size" ] && [ "$size" -ne "$OKF_EMBEDDING_DIM" ]; then
+    die "Qdrant already has a collection called $OKF_COLLECTION holding $size-dim vectors, but index.embedding_dim says $OKF_EMBEDDING_DIM" \
+      "a collection's width is fixed when it is created: embed into another collection, or drop this one first"
+  fi
+
+  # Case-insensitively, because "Cosine" is how Qdrant spells it back and the
+  # comparison is about which distance it is, not about how it is written.
+  distance="$(printf '%s\n' "$vectors" | jq -r 'if type == "object" and (.distance | type) == "string" then (.distance | ascii_downcase) else empty end' 2> /dev/null)"
+  if [ -n "$distance" ] && [ "$distance" != "cosine" ]; then
+    die "Qdrant already has a collection called $OKF_COLLECTION using $distance distance, but SPEC.md §9 embeds for cosine" \
+      "a collection's distance is fixed when it is created: embed into another collection, or drop this one first"
+  fi
+  return 0
+}
+
+# SPEC.md §9's collection, made to exist: "One collection, cosine distance,
+# dimension `embedding_dim`."
+#
+# Asked for before it is created, because creating it is the exceptional case.
+# A PUT to a collection Qdrant already has is not idempotent — it answers 409
+# Conflict — so a run that simply created it every time would fail on its second
+# run against a working bundle, which is the run `okf embed` mostly is.
+#
+# Cosine and not dot or euclid, because §9 says cosine: it is the distance the
+# OpenAI-shaped embedding endpoints normalise for, and a collection created with
+# another one would answer searches with confidently wrong neighbours rather
+# than with an error anybody could see.
+#
+# `embedding_dim` is the width the collection is fixed at for good — Qdrant will
+# not take a vector of another width afterwards — which is the same setting
+# embed_texts has already held every response to. One setting, checked on the
+# way in and on the way out, so a bundle cannot write 768-wide points into a
+# 1024-wide collection or the other way about. A collection that is already
+# there is held to it too: see collection_agrees.
+#
+# Once per run, before a single chunk is embedded: an unreachable Qdrant is a
+# run that cannot store anything it is about to spend an endpoint's time
+# computing, and finding that out after the last concept would be a bundle's
+# worth of embeddings thrown away.
+ensure_collection() {
+  # 404 is Qdrant saying it has no such collection, which is the ordinary case
+  # here and not a failure — so this one call judges the status itself rather
+  # than handing it to http_ok_or_die. Every other non-2xx is a Qdrant that
+  # cannot answer for the collection, and a run that went on to create it would
+  # be answering a 500 by writing.
+  http_request "Qdrant" GET "$OKF_COLLECTION_URL" ""
+  case "$OKF_HTTP_STATUS" in
+    2??)
+      collection_agrees
+      return 0
+      ;;
+    404) ;;
+    *) http_ok_or_die "Qdrant" "$OKF_COLLECTION_URL" ;;
+  esac
+
+  local request
+  request="$(jq -n -c --argjson size "$OKF_EMBEDDING_DIM" \
+      '{vectors: {size: $size, distance: "Cosine"}}')" \
+    || die "the collection request could not be rendered as JSON"
+
+  http_request "Qdrant" PUT "$OKF_COLLECTION_URL" "$request"
+  http_ok_or_die "Qdrant" "$OKF_COLLECTION_URL"
+
+  # Said out loud, because it is the one thing an `okf embed` run does that is
+  # not a point: a caller who watched okf create `okf_concepts` when they meant
+  # to add to `okf_concepts_v2` has been told which name it was, at the moment
+  # the collection came into being rather than after the points went into it.
+  printf 'created collection %s (%s-dim, cosine) at %s\n' \
+    "$OKF_COLLECTION" "$OKF_EMBEDDING_DIM" "$OKF_QDRANT_URL"
+}
+
 # `1 chunk`, `2 chunks` — a count and its noun, agreeing. require_tools' `tool`
 # / `tools` written once, because the report below has four of them in it.
 count_noun() { # $1 = a count, $2 = the singular noun
@@ -7324,8 +7545,16 @@ cmd_embed() {
 
   [ $# -eq 0 ] || die "embed takes no arguments, but was given: $1" "$usage"
 
+  # Every setting read and checked before a single request is made, so a bundle
+  # whose `collection` is unusable is told so rather than after an endpoint has
+  # been paid to embed the whole bundle.
   embed_settings
+  qdrant_settings
   load_concepts
+
+  # And the collection made to exist before the first concept is embedded — see
+  # ensure_collection on why that order and not the other.
+  ensure_collection
 
   local concept concepts=0 chunks=0 drifted=0 empty=0 rc=0 total=0
   for concept in ${OKF_CONCEPTS[@]+"${OKF_CONCEPTS[@]}"}; do
