@@ -118,8 +118,12 @@ the full [mvn] field syntax):
                 success ralph itself checks it off and commits; on failure
                 the tree is left dirty for inspection.
 
-Progress: .ralph/run.log (one line per attempt), .ralph/logs/item-NNN-attempt-N.log
-(full transcript per attempt).
+Progress: .ralph/run.log (one line per attempt).
+Per attempt, .ralph/logs/ holds:
+  item-NNN-attempt-N.jsonl         full stream-json transcript (the real record)
+  item-NNN-attempt-N.jsonl.stderr  claude's stderr for that attempt
+  item-NNN-attempt-N.log           just the final result message, distilled
+                                   from the .jsonl with jq (optional)
 EOF
 }
 
@@ -756,7 +760,25 @@ $REVIEW_STEP
 $REFRESH_BLOCK
 Work on ONLY this task. Do not start any other item, do not refactor unrelated code."
 
-      claude -p "$PROMPT" --permission-mode auto "${MODEL_FLAG[@]}" > "$LOG_FILE" 2>&1 || true
+      # Full transcript as JSONL. stderr is kept OUT of the .jsonl so it stays
+      # parseable; the readable summary is distilled from it below. Plain
+      # `> "$LOG_FILE"` captured only claude's final message, not a transcript,
+      # despite what this script's own --help used to claim.
+      JSONL_FILE="${LOG_FILE%.log}.jsonl"
+      claude -p "$PROMPT" --permission-mode auto "${MODEL_FLAG[@]}" \
+        --output-format stream-json --verbose \
+        > "$JSONL_FILE" 2> "${JSONL_FILE}.stderr" || true
+
+      # Distil the final result message into the readable .log. jq is optional:
+      # without it the .jsonl is still the complete record.
+      if command -v jq >/dev/null 2>&1; then
+        jq -r 'select(.type == "result") | .result' "$JSONL_FILE" 2>/dev/null \
+          | tail -1 > "$LOG_FILE"
+      fi
+      if [[ ! -s "$LOG_FILE" ]]; then
+        printf '(no result message distilled; full transcript in %s)\n' \
+          "$JSONL_FILE" > "$LOG_FILE"
+      fi
 
       AFTER_SHA=$(git rev-parse HEAD)
       NEW_REMAINING=$(remaining_items)
@@ -767,9 +789,9 @@ Work on ONLY this task. Do not start any other item, do not refactor unrelated c
         ITEMS_DONE=$((ITEMS_DONE + 1))
         break
       elif [[ "$BEFORE_SHA" == "$AFTER_SHA" ]]; then
-        echo "ralph: attempt $attempt/$MAX_ATTEMPTS made no commit at all. See $LOG_FILE." | tee -a "$RUN_LOG"
+        echo "ralph: attempt $attempt/$MAX_ATTEMPTS made no commit at all. See ${LOG_FILE%.log}.jsonl." | tee -a "$RUN_LOG"
       else
-        echo "ralph: attempt $attempt/$MAX_ATTEMPTS committed partial progress, item not yet passing. See $LOG_FILE." | tee -a "$RUN_LOG"
+        echo "ralph: attempt $attempt/$MAX_ATTEMPTS committed partial progress, item not yet passing. See ${LOG_FILE%.log}.jsonl." | tee -a "$RUN_LOG"
       fi
     fi
   done
