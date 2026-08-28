@@ -7870,8 +7870,50 @@ cmd_embed() {
 # easier.
 OKF_DEFAULT_K=10
 
-# What jq makes of a Qdrant search response: one hit per line, best first, in
-# the order Qdrant scored them.
+# What jq makes of a Qdrant search response: the hits grouped by the concept
+# they came out of, best group first, and inside a group in the order Qdrant
+# scored them.
+#
+# Grouped rather than one flat line per hit, because a chunk is not the unit
+# anybody reads. SPEC.md §9 splits a concept into a summary and one chunk per
+# method, so what matches a query is very often a single method — and a method
+# named on its own is an answer with its subject left out. Printing the concept
+# above its hits is what hands that subject back: `route(String)` under
+# `src/kitchen/Router`, rather than a column of lines that merely happen to
+# share a prefix and have to be re-assembled by whoever is reading them.
+#
+# The concept is the header line and its chunks are indented under it:
+#
+#   kitchen  src/kitchen/Router  Class  Unverified  /src/kitchen/Router.java:6-26
+#     1.0000  summary  com.example.kitchen.Router
+#     0.9900  method  com.example.kitchen.Router#route(String)
+#
+# The repo leads the header, and is half of what a group is grouped on, because
+# SPEC.md §9 puts every repo's points in the one collection — "cross-repo search
+# is a filter change, not a schema change" — so a `concept_id` is a path inside
+# a repo and not an identity on its own. Two repos that both document
+# `src/Router` are two concepts, and grouping them together would print one of
+# them under the other's trust tier: a bundle nobody reviewed, shown as reviewed
+# because a namesake was.
+#
+# `type`, the trust tier and the located path sit on the header rather than on
+# each hit because SPEC.md §9 puts them on the payload of every chunk of the one
+# concept, where they are the same value written out again and again — a field
+# that cannot vary within a group is a field read once. The trust tier is the
+# header's reason for existing: it is what says whether the concept a reader is
+# about to believe was confirmed by a human or drafted by a model, and it grades
+# the concept rather than the chunk, so it belongs on the line that names the
+# concept. All of them are taken from the group's best-scoring hit, which is the
+# one hit every group is certain to have.
+#
+# Groups keep the ranking Qdrant answered with: each is placed by its own best
+# hit, so the first header names the concept the best hit is in. Nothing is
+# re-scored and nothing is dropped — grouping changes what a result is printed
+# beside, not what matched or in which order.
+#
+# A hit whose payload names no concept is its own group rather than one of many
+# under a shared `-`, because two hits that name no concept are not two chunks
+# of the same one.
 #
 # The checks are embed_texts' checks for embed_texts' reason. A response okf
 # cannot read is not an empty result set — an empty result set is a question
@@ -7903,6 +7945,14 @@ OKF_SEARCH_RESPONSE_JQ='
     + (if ($p.lines | type) == "array" and ($p.lines | length) == 2
          and ($p.lines | all(type == "number"))
        then ":\($p.lines[0])-\($p.lines[1])" else "" end);
+  # What two hits have to agree on to be two chunks of the one concept: the
+  # repo and the concept_id both, because SPEC.md §9 makes a concept_id a path
+  # inside a repo rather than an identity of its own. A payload whose
+  # concept_id is missing, empty or not a string carries the rank instead,
+  # which no other hit can share, so it groups with nothing.
+  def group_key($p; $rank):
+    if ($p.concept_id | type) == "string" and $p.concept_id != ""
+    then [$p.repo, $p.concept_id, -1] else [null, null, $rank] end;
   if type != "object" then
     error("the response is not a JSON object but a " + type)
   else . end
@@ -7913,14 +7963,28 @@ OKF_SEARCH_RESPONSE_JQ='
     elif any($r[]; type != "object") then
       error("one of the hits is not an object")
     else . end
-  | $r[]
-  | (if (.payload | type) == "object" then .payload else {} end) as $p
-  | [ (if (.score | type) == "number" then score4(.score) else "-" end),
-      shown($p.concept_id),
-      shown($p.chunk_kind),
-      shown($p.symbol),
-      located($p) ]
-  | join("  ")
+  | [ $r[]
+      | (if (.payload | type) == "object" then .payload else {} end) as $p
+      | {payload: $p,
+         concept: [ shown($p.repo),
+                    shown($p.concept_id),
+                    shown($p.type),
+                    shown($p.trust_tier),
+                    located($p) ],
+         hit: [ (if (.score | type) == "number" then score4(.score) else "-" end),
+                shown($p.chunk_kind),
+                shown($p.symbol) ]} ]
+  # to_entries carries the rank Qdrant gave each hit alongside it, so the order
+  # is restored by sorting on it rather than by trusting group_by to leave it
+  # alone: the hits of a group back into the order they came in, and the groups
+  # into the order of their best hit.
+  | to_entries
+  | group_by(group_key(.value.payload; .key))
+  | map(sort_by(.key))
+  | sort_by(.[0].key)
+  | map((.[0].value.concept | join("  ")),
+        (.[] | "  " + (.value.hit | join("  "))))
+  | .[]
 '
 
 # okf search <query> [--hyde-prompt] [--k N] [--repo R] [--type T]

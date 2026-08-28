@@ -10557,6 +10557,18 @@ _okf_search() { # $1.. = arguments after `search`
   return 0
 }
 
+# A grouped ranking has two kinds of line in it, and a check that means one of
+# them must not count the other: a concept header starts at column one, and
+# every hit under it is indented. Counted with grep rather than by parsing,
+# because the indent is the whole of the distinction okf prints.
+_okf_search_group_count() { # $1 = a search's stdout
+  printf '%s\n' "$1" | grep -c '^[^ ]' || true
+}
+
+_okf_search_hit_count() { # $1 = a search's stdout
+  printf '%s\n' "$1" | grep -c '^  ' || true
+}
+
 # The `index` block the search probes run against: a never-resolvable embedding
 # endpoint and a never-resolvable Qdrant, both RFC 2606 `.invalid` names, so
 # that even a bug getting past the fake curl could not reach anything — SPEC.md
@@ -10564,12 +10576,18 @@ _okf_search() { # $1.. = arguments after `search`
 OKF_SEARCH_EMBEDDING_URL="http://embeddings.invalid/v1/embeddings"
 OKF_SEARCH_QDRANT_URL="http://qdrant.invalid:6333"
 OKF_SEARCH_COLLECTION="okf_probe"
+# Named rather than left to default to the bundle directory, which is a mktemp
+# name that changes every run: SPEC.md §9 puts `repo` on every payload and okf
+# search prints it, so a probe that reads the output needs it to be the same
+# word twice.
+OKF_SEARCH_REPO="kitchen"
 _okf_search_configured() { # $1 = a directory to write okf.json into
   _okf_index_block "$1" \
     "{\"embedding_url\": \"$OKF_SEARCH_EMBEDDING_URL\",
       \"embedding_model\": \"probe-embed-3\",
       \"embedding_dim\": 4,
       \"qdrant_url\": \"$OKF_SEARCH_QDRANT_URL\",
+      \"repo\": \"$OKF_SEARCH_REPO\",
       \"collection\": \"$OKF_SEARCH_COLLECTION\"}"
 }
 
@@ -10643,32 +10661,38 @@ _okf_search_probe() {
   assert_eq "true" "$(_okf_request 2 '.with_payload')" \
     "and asking for the payload, which is the whole of what a hit says"
 
-  # The ranking itself, one line per hit in the order Qdrant scored them, each
-  # naming the concept it is in, what kind of chunk it is, its symbol and where
-  # in the source to look.
-  local expected="" i=0 total
-  total="$(printf '%s' "$hits" | jq 'length')"
-  while [ "$i" -lt "$total" ]; do
-    # The score to four places, worked out here rather than read back out of
-    # okf — an expectation taken from the output it is checking would agree
-    # with whatever okf happened to print. Written the short way that only
-    # works for the 0-to-1 scores this probe hands back: five digits, zero
-    # padded, split after the first.
-    expected="$expected$(printf '%s' "$hits" | jq -r --argjson i "$i" '
-      .[$i] as $h
-      | (("0000" + ($h.score * 10000 | round | tostring)) | .[-5:]) as $d
-      | [ "\($d[0:1]).\($d[1:5])",
-          $h.payload.concept_id, $h.payload.chunk_kind, $h.payload.symbol,
-          "\($h.payload.path):\($h.payload.lines[0])-\($h.payload.lines[1])" ]
-      | join("  ")')"$'\n'
-    i=$((i + 1))
-  done
-  # The last separator off, because OKF_SEARCH_OUT came through a command
-  # substitution and has had its own trailing newline stripped already.
-  expected="${expected%$'\n'}"
+  # The ranking itself. Every chunk here came out of the one concept, so it is
+  # one group: a header naming the concept, its type, its trust tier and where
+  # in the source to look, then one indented line per hit carrying the score,
+  # the kind of chunk and its symbol.
+  local expected
+  # Worked out here rather than read back out of okf — an expectation taken
+  # from the output it is checking would agree with whatever okf happened to
+  # print. The score is spelled the short way that only works for the 0-to-1
+  # scores this probe hands back: five digits, zero padded, split after the
+  # first.
+  expected="$(printf '%s' "$hits" | jq -r '
+    def score4($s): (("0000" + ($s * 10000 | round | tostring)) | .[-5:])
+      | "\(.[0:1]).\(.[1:5])";
+    ( .[0].payload as $p
+      | [ $p.repo, $p.concept_id, $p.type, $p.trust_tier,
+          "\($p.path):\($p.lines[0])-\($p.lines[1])" ]
+      | join("  ") ),
+    ( .[]
+      | "  " + ([score4(.score), .payload.chunk_kind, .payload.symbol]
+                | join("  ")) )')"
   assert_eq "$expected" "$OKF_SEARCH_OUT" \
-    "every hit is one line: score, concept, chunk kind, symbol and where to look"
+    "the hits come back grouped under the concept they are chunks of"
   assert_eq "" "$OKF_SEARCH_ERR" "and a search that found something says nothing else"
+
+  # The header carries the trust tier of the concept, which is what SPEC.md §8
+  # grades and what a reader needs before believing any of the chunks under it.
+  assert_contains "$OKF_SEARCH_OUT" "kitchen  src/kitchen/Router  Class  Unverified" \
+    "the concept header shows the repo, the concept, its type and its trust tier"
+  assert_eq "1" "$(_okf_search_group_count "$OKF_SEARCH_OUT")" \
+    "four chunks of the one concept are one group and not four"
+  assert_eq "4" "$(_okf_search_hit_count "$OKF_SEARCH_OUT")" \
+    "with every hit still printed, indented under it"
 
   # Read-only, which is what permissions.json pre-approves it as.
   assert_eq "$before" "$(git status --porcelain 2>&1)" \
@@ -10706,7 +10730,9 @@ _okf_search_k_probe() {
     || return 1
   assert_eq "0" "$OKF_SEARCH_RC" "okf search --k 2 exits 0"
   assert_eq "2" "$(_okf_request 2 '.limit')" "and asks Qdrant for two"
-  assert_eq "2" "$(_okf_line_count "$OKF_SEARCH_OUT")" \
+  # Counted as hits and not as lines: `--k` limits the hits Qdrant answers
+  # with, and the concept headers okf groups them under are not among them.
+  assert_eq "2" "$(_okf_search_hit_count "$OKF_SEARCH_OUT")" \
     "which is how many come back, and how many are printed"
 
   # The GNU spelling, for the reason `--config=PATH` is accepted: left to fall
@@ -10714,7 +10740,8 @@ _okf_search_k_probe() {
   OKF_FAKE_CURL_DIM=4 OKF_FAKE_CURL_HITS="$hits" _okf_search --k=3 "a query" \
     || return 1
   assert_eq "3" "$(_okf_request 2 '.limit')" "--k=N says the same thing as --k N"
-  assert_eq "3" "$(_okf_line_count "$OKF_SEARCH_OUT")" "and is honoured the same way"
+  assert_eq "3" "$(_okf_search_hit_count "$OKF_SEARCH_OUT")" \
+    "and is honoured the same way"
 
   # Leading zeros are a written-out ten and not an octal eight, which is what
   # bash's own `[` would have made of it.
@@ -10747,6 +10774,110 @@ _okf_search_k_probe() {
 test_okf_search_limits_the_results_with_k() {
   _okf_preconditions || return 1
   with_fixture_repo chunks _okf_search_k_probe
+}
+
+# PLAN.md Phase 8: the hits grouped by `concept_id`, so a method hit comes back
+# with the concept it is a method of, and every result carries the SPEC.md §8
+# trust tier of the concept it belongs to.
+#
+# Driven with the chunks of two different concepts handed back interleaved,
+# which is what a real ranking looks like — relevance does not arrive one
+# concept at a time — and with neither of Router's summary chunks among them, so
+# that the concept named above its methods is one okf grouped its way to rather
+# than one that happened to be a hit itself.
+_okf_search_grouping_probe() {
+  _okf_search_configured . || return 1
+
+  local router routekey
+  router="$(_okf_search_hits src/kitchen/Router)"
+  routekey="$(_okf_search_hits src/kitchen/RouteKey)"
+  if [ "$(printf '%s' "$router" | jq 'length')" -lt 3 ] \
+    || [ "$(printf '%s' "$routekey" | jq 'length')" -lt 2 ]; then
+    _fail "$CURRENT_TEST can build its canned hits" \
+      "okf chunk did not yield the chunks these hits are built from"
+    return 1
+  fi
+
+  # Router's two methods at ranks 1 and 3, RouteKey's two chunks at 2 and 4:
+  # every concept has a hit scored above another concept's, so a ranking that
+  # was not grouped would interleave them exactly as Qdrant answered.
+  local hits
+  hits="$(jq -n -c --argjson a "$router" --argjson b "$routekey" '
+    [ ($a[1] | .score = 0.99), ($b[0] | .score = 0.98),
+      ($a[2] | .score = 0.97), ($b[1] | .score = 0.96) ]')"
+
+  OKF_FAKE_CURL_DIM=4 OKF_FAKE_CURL_HITS="$hits" \
+    _okf_search "how does a request find its handler" || return 1
+  assert_eq "0" "$OKF_SEARCH_RC" "a search across two concepts exits 0"
+  assert_eq "" "$OKF_SEARCH_ERR" "saying nothing on stderr"
+
+  # The whole ranking, spelled out: two headers, each with its concept's own
+  # type and trust tier, and the hits of each concept gathered under it in the
+  # order Qdrant scored them.
+  assert_eq "kitchen  src/kitchen/Router  Class  Unverified  /src/kitchen/Router.java:6-26
+  0.9900  method  com.example.kitchen.Router#add(String, Handler)
+  0.9700  method  com.example.kitchen.Router#route(String)
+kitchen  src/kitchen/RouteKey  Record  Human-reviewed  /src/kitchen/RouteKey.java:3-3
+  0.9800  summary  com.example.kitchen.RouteKey
+  0.9600  schema  com.example.kitchen.RouteKey" \
+    "$OKF_SEARCH_OUT" \
+    "the hits are grouped by concept, each group under the concept it is in"
+
+  assert_eq "2" "$(_okf_search_group_count "$OKF_SEARCH_OUT")" \
+    "two concepts are two groups"
+  assert_eq "4" "$(_okf_search_hit_count "$OKF_SEARCH_OUT")" \
+    "and no hit is lost to the grouping"
+
+  # The point of the grouping: a method matched, and what came back names the
+  # class the method is on — which no chunk among these hits said on its own.
+  assert_contains "$OKF_SEARCH_OUT" "src/kitchen/Router  Class  Unverified" \
+    "a method hit is returned under its parent concept, tier and all"
+
+  # Nothing is re-scored: a group is placed by its best hit, so Router leads on
+  # 0.9900 even though RouteKey outranks Router's second method.
+  assert_eq "kitchen  src/kitchen/Router  Class  Unverified  /src/kitchen/Router.java:6-26" \
+    "$(printf '%s\n' "$OKF_SEARCH_OUT" | head -1)" \
+    "the first group is the concept the best hit is in"
+
+  # And the order follows the scores rather than the concept names or the order
+  # the chunks arrived in: RouteKey scored best leads, and it sorts before
+  # Router alphabetically either way, so only the scores can explain both runs.
+  hits="$(jq -n -c --argjson a "$router" --argjson b "$routekey" '
+    [ ($b[0] | .score = 0.99), ($a[1] | .score = 0.98) ]')"
+  OKF_FAKE_CURL_DIM=4 OKF_FAKE_CURL_HITS="$hits" _okf_search "a query" || return 1
+  assert_eq "kitchen  src/kitchen/RouteKey  Record  Human-reviewed  /src/kitchen/RouteKey.java:3-3
+  0.9900  summary  com.example.kitchen.RouteKey
+kitchen  src/kitchen/Router  Class  Unverified  /src/kitchen/Router.java:6-26
+  0.9800  method  com.example.kitchen.Router#add(String, Handler)" \
+    "$OKF_SEARCH_OUT" \
+    "a different best hit is a different first group, and a different tier shown"
+
+  # Two repos that both document the same path are two concepts. SPEC.md §9
+  # keeps every repo's points in the one collection, so this is a ranking okf
+  # search can really be handed — and grouping on `concept_id` alone would
+  # print the unreviewed one under the reviewed one's trust tier, which is the
+  # one thing the tier is on the header to prevent.
+  hits="$(jq -n -c --argjson a "$router" '
+    [ ($a[1] | .score = 0.99
+             | .payload.repo = "elsewhere"
+             | .payload.trust_tier = "Human-reviewed"),
+      ($a[2] | .score = 0.98) ]')"
+  OKF_FAKE_CURL_DIM=4 OKF_FAKE_CURL_HITS="$hits" _okf_search "a query" || return 1
+  assert_eq "0" "$OKF_SEARCH_RC" "a ranking spanning two repos exits 0"
+  assert_eq "2" "$(_okf_search_group_count "$OKF_SEARCH_OUT")" \
+    "one concept path in two repos is two groups, not one"
+  assert_contains "$OKF_SEARCH_OUT" \
+    "elsewhere  src/kitchen/Router  Class  Human-reviewed" \
+    "each named by the repo its points came from"
+  assert_contains "$OKF_SEARCH_OUT" \
+    "kitchen  src/kitchen/Router  Class  Unverified" \
+    "and graded by its own trust tier rather than by its namesake's"
+  return 0
+}
+
+test_okf_search_groups_hits_by_concept() {
+  _okf_preconditions || return 1
+  with_fixture_repo chunks _okf_search_grouping_probe
 }
 
 # SPEC.md §9's `--repo` and `--type`, the two optional payload filters — "every
@@ -10990,8 +11121,20 @@ _okf_search_refusal_probe() {
   OKF_FAKE_CURL_QDRANT_BODY='{"result": [{"id": "x", "score": 0.5, "payload": {"concept_id": "src/kitchen/RouteKey", "chunk_kind": "summary"}}], "status": "ok"}' \
     OKF_FAKE_CURL_DIM=4 _okf_search "a query" || return 1
   assert_eq "0" "$OKF_SEARCH_RC" "a hit missing an optional payload field is still a hit"
-  assert_eq "0.5000  src/kitchen/RouteKey  summary  -  -" "$OKF_SEARCH_OUT" \
+  assert_eq "-  src/kitchen/RouteKey  -  -  -
+  0.5000  summary  -" "$OKF_SEARCH_OUT" \
     "printed with a - where the payload said nothing, so the columns still line up"
+
+  # A payload that names no concept has no parent to be grouped under, and two
+  # of them are not two chunks of the same concept: each is its own group.
+  # Grouped together they would read as one concept with two chunks in it,
+  # which is a claim about the bundle that no payload here made.
+  OKF_FAKE_CURL_QDRANT_BODY='{"result": [{"id": "x", "score": 0.5, "payload": {"chunk_kind": "summary"}}, {"id": "y", "score": 0.4, "payload": {"chunk_kind": "method"}}], "status": "ok"}' \
+    OKF_FAKE_CURL_DIM=4 _okf_search "a query" || return 1
+  assert_eq "0" "$OKF_SEARCH_RC" "a hit whose payload names no concept is still a hit"
+  assert_eq "2" "$(_okf_search_group_count "$OKF_SEARCH_OUT")" \
+    "and two of them are two groups, not one concept called -"
+  assert_eq "2" "$(_okf_search_hit_count "$OKF_SEARCH_OUT")" "with both hits printed"
   return 0
 }
 
