@@ -9863,9 +9863,12 @@ test_okf_embed_sends_every_chunk_to_the_configured_endpoint() {
   with_fixture_repo chunks _okf_embed_request_probe
 }
 
-# SPEC.md §6 gives every field a default, and SPEC.md §9 documents which:
-# "Ollama `nomic-embed-text`, 768-dim". A bundle that opted in to Tier B with an
-# empty `index` block gets those.
+# SPEC.md §6 gives every field a default, and SPEC.md §9 documents which: the
+# docker-compose.yml stack -- Infinity serving nomic-ai/nomic-embed-text-v1.5 on
+# localhost:7997/embeddings, 768-dim. A bundle that opted in to Tier B with an
+# empty `index` block gets those. The assertions below read the values out of
+# bin/okf rather than hard-coding them, so changing a default here is a one-line
+# change in bin/okf, not a test edit.
 _okf_embed_settings_probe() {
   _okf_tier_b_opt_in . || return 1
 

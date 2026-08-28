@@ -269,8 +269,8 @@ OKF_INDEX_KEYS=(repo qdrant_url collection embedding_url embedding_model embeddi
 # constant — see index_repo.
 OKF_DEFAULT_QDRANT_URL="http://localhost:6333"
 OKF_DEFAULT_COLLECTION="okf_concepts"
-OKF_DEFAULT_EMBEDDING_URL="http://localhost:11434/v1/embeddings"
-OKF_DEFAULT_EMBEDDING_MODEL="nomic-embed-text"
+OKF_DEFAULT_EMBEDDING_URL="http://localhost:7997/embeddings"
+OKF_DEFAULT_EMBEDDING_MODEL="nomic-ai/nomic-embed-text-v1.5"
 OKF_DEFAULT_EMBEDDING_DIM=768
 
 # SPEC.md §6: "Absent `index`, Tier B subcommands exit 2 with one line naming
@@ -7148,7 +7148,7 @@ embed_settings() {
     http://* | https://*) ;;
     *)
       die "$(display_path "$OKF_CONFIG"): index.embedding_url must be an http:// or https:// URL, found $OKF_EMBEDDING_URL" \
-        "SPEC.md §9 puts the embeddings behind an OpenAI-shaped /v1/embeddings endpoint"
+        "SPEC.md §9 puts the embeddings behind an OpenAI-shaped embeddings endpoint"
       ;;
   esac
 }
