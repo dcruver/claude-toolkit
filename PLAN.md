@@ -85,4 +85,4 @@ there). Items are ordered so none depends on a later one. Every item verifies wi
 
 ## Phase 11 — documentation
 
-- [ ] Update README.md to document the okf component: what OKF is, the Tier A and Tier B split with Tier B opt-in, that MCP is deliberately deferred, the five new slash commands, the okf subcommands from SPEC.md §7, the okf.json keys, the SPEC.md §3 runtime prerequisites, and okf entries in the Install and Uninstall sections alongside ralph (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
+- [x] Update README.md to document the okf component: what OKF is, the Tier A and Tier B split with Tier B opt-in, that MCP is deliberately deferred, the five new slash commands, the okf subcommands from SPEC.md §7, the okf.json keys, the SPEC.md §3 runtime prerequisites, and okf entries in the Install and Uninstall sections alongside ralph (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
