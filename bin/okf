@@ -255,6 +255,23 @@ OKF_TIER_B_SUBCOMMANDS=(chunk embed search)
 # added here rather than buried in a sentence.
 OKF_INDEX_KEYS=(repo qdrant_url collection embedding_url embedding_model embedding_dim)
 
+# What SPEC.md §6's example writes for the three embedding settings, which is
+# also SPEC.md §9's documented default — "Ollama `nomic-embed-text`, 768-dim".
+# §6 says every field defaults if absent, and these are the values it defaults
+# to; tests/toolkit.sh reads them back out of §6's own JSON block, so the
+# example and the fallback cannot drift apart.
+#
+# Constants rather than an okf.json `okf init` writes: §1 makes Tier B opt-in
+# and `okf init` deliberately writes no `index` block at all, so a bundle that
+# has opted in with `"index": {}` still has to get these from somewhere.
+#
+# `index.repo` is not here because its default is not a constant — see
+# index_repo — and `qdrant_url` and `collection` are not here yet because
+# nothing reaches Qdrant until the upsert.
+OKF_DEFAULT_EMBEDDING_URL="http://localhost:11434/v1/embeddings"
+OKF_DEFAULT_EMBEDDING_MODEL="nomic-embed-text"
+OKF_DEFAULT_EMBEDDING_DIM=768
+
 # SPEC.md §6: "Absent `index`, Tier B subcommands exit 2 with one line naming
 # the missing keys." That is §7's 2 and deliberately not §7's 1, because a
 # bundle that never opted in to Tier B is not a broken bundle: a caller looping
@@ -6424,6 +6441,97 @@ stub_summary_text() {
   OKF_STUB_SUMMARY="$text"
 }
 
+# SPEC.md §9's chunking, whole: one concept's body split into
+# OKF_CHUNK_KIND/HEADING/TEXT, and the §9 stub summary standing in for a body
+# that had nothing in it. Returns 1 for split_concept_body's reason and only
+# that one — the file could not be read as a concept.
+#
+# The arrays come back empty from a concept with neither a body nor a `title`,
+# `description` or `code.signature` to build one out of. That is not a failure:
+# `okf chunk` answers `[]` and `okf embed` embeds nothing for it, and both are
+# the honest report that there is no text here to index.
+#
+# Split out of cmd_chunk so `okf embed` gets the same chunks `okf chunk` prints
+# rather than a second implementation of §9 that agrees with it today. The
+# frontmatter is the caller's to read first: both callers need it for their own
+# reasons before they get here, and stub_summary_text reads what that left
+# behind.
+concept_chunks() { # $1 = a path to a concept file, its frontmatter already read
+  split_concept_body "$1" || return 1
+  [ "${#OKF_CHUNK_KIND[@]}" -eq 0 ] || return 0
+
+  # A body with nothing in it, which is SPEC.md §9's Tier 0 concept: the one
+  # summary chunk it yields is built from the frontmatter instead.
+  stub_summary_text
+  chunk_record summary "" "$OKF_STUB_SUMMARY"
+  return 0
+}
+
+# One `index` setting SPEC.md §6 spells as a string, left in OKF_INDEX_STRING:
+# the value okf.json gives, or $2 when the block does not mention it — §6's
+# "every field defaults if absent".
+#
+# Absent is the only thing that defaults. A key written out and left empty is
+# refused, along with every wrong shape: §6 gives no field a meaningful empty
+# value, so `"embedding_model": ""` is a setting somebody started and did not
+# finish, and quietly running it as `nomic-embed-text` would answer a caller
+# who was plainly trying to say something else. The line index_repo has always
+# drawn, drawn once here for every key.
+OKF_INDEX_STRING=""
+index_string() { # $1 = a key inside the index block, $2 = its default
+  local key="$1" fallback="$2" value
+  load_settings
+
+  # stderr folded into the value so jq's own complaint about a wrong shape is
+  # what gets reported, the way settings_strings reports one about a list.
+  #
+  # `getpath` and an explicit `null` test rather than `// empty`, which is
+  # settings_strings' choice for settings_strings' reason: `//` reads `false` as
+  # absent, so `"repo": false` would fall through to the directory name while
+  # `7` and `[]` were refused. Every wrong shape is a wrong shape.
+  #
+  # A newline is refused as its own case rather than left to the caller: these
+  # values go into an HTTP request, where a newline inside a URL or a model name
+  # is not a typo but a second header the bundle's author did not write.
+  value="$(printf '%s\n' "$OKF_SETTINGS" | jq -r --arg key "$key" '
+      getpath(["index", $key]) as $v
+      | if $v == null then ""
+        elif ($v | type) != "string" then
+          error("must be a string, found " + ($v | type))
+        elif $v == "" then error("must not be empty")
+        elif ($v | contains("\n")) then error("must not have a newline in it")
+        else $v end' 2>&1)" \
+    || die "$(display_path "$OKF_CONFIG"): index.$key ${value#jq: error*: }"
+
+  [ -n "$value" ] || value="$fallback"
+  OKF_INDEX_STRING="$value"
+}
+
+# The same, for an `index` setting SPEC.md §6 spells as a number:
+# `embedding_dim` is the only one today, and it is a count of vector
+# components — so a fraction, a zero and a negative are each refused rather
+# than defaulted over, for index_string's reason. Left in OKF_INDEX_INT.
+OKF_INDEX_INT=0
+index_int() { # $1 = a key inside the index block, $2 = its default
+  local key="$1" fallback="$2" value
+  load_settings
+
+  value="$(printf '%s\n' "$OKF_SETTINGS" | jq -r --arg key "$key" '
+      getpath(["index", $key]) as $v
+      | if $v == null then ""
+        elif ($v | type) != "number" then
+          error("must be a number, found " + ($v | type))
+        elif ($v | floor) != $v then
+          error("must be a whole number, found " + ($v | tostring))
+        elif $v <= 0 then
+          error("must be greater than zero, found " + ($v | tostring))
+        else ($v | tostring) end' 2>&1)" \
+    || die "$(display_path "$OKF_CONFIG"): index.$key ${value#jq: error*: }"
+
+  [ -n "$value" ] || value="$fallback"
+  OKF_INDEX_INT="$value"
+}
+
 # SPEC.md §9's `repo`, the payload field "every point carries … so cross-repo
 # search is a filter change, not a schema change". Left in OKF_INDEX_REPO.
 #
@@ -6437,27 +6545,14 @@ stub_summary_text() {
 # Shared with `okf embed` and `okf search` when they arrive: the field has to
 # mean the same thing on the point that is written and in the filter that finds
 # it again, and two readings of one setting is how that stops being true.
+#
+# The default is passed in empty and applied below rather than handed to
+# index_string, because it is the one §6 default that is not a constant: it is
+# computed from the root this run entered.
 OKF_INDEX_REPO=""
 index_repo() {
-  load_settings
-
-  local repo
-  # stderr folded into the value so jq's own complaint about a wrong shape is
-  # what gets reported, the way settings_strings reports one about a list.
-  #
-  # `getpath` and an explicit `null` test rather than `// empty`, which is
-  # settings_strings' choice for settings_strings' reason: `//` reads `false` as
-  # absent, so `"repo": false` would fall through to the directory name while
-  # `7` and `[]` were refused. Every wrong shape is a wrong shape.
-  repo="$(printf '%s\n' "$OKF_SETTINGS" | jq -r '
-      getpath(["index", "repo"]) as $r
-      | if $r == null then ""
-        elif ($r | type) != "string" then
-          error("must be a string, found " + ($r | type))
-        elif $r == "" then error("must not be empty")
-        elif ($r | contains("\n")) then error("must not have a newline in it")
-        else $r end' 2>&1)" \
-    || die "$(display_path "$OKF_CONFIG"): index.repo ${repo#jq: error*: }"
+  index_string repo ""
+  local repo="$OKF_INDEX_STRING"
 
   if [ -z "$repo" ]; then
     # cmd_init's line and its reason: the bundle is named for the directory it
@@ -6891,20 +6986,13 @@ cmd_chunk() {
   index_repo
   local p_repo="$OKF_INDEX_REPO"
 
-  split_concept_body "$concept" \
+  concept_chunks "$concept" \
     || die "$concept: its body could not be read, so there are no chunks to emit"
 
   concept_id_of "$concept"
   local concept_id="$OKF_CONCEPT_ID"
 
   local total="${#OKF_CHUNK_KIND[@]}"
-  if [ "$total" -eq 0 ]; then
-    # A body with nothing in it, which is SPEC.md §9's Tier 0 concept: the one
-    # summary chunk it yields is built from the frontmatter instead.
-    stub_summary_text
-    chunk_record summary "" "$OKF_STUB_SUMMARY"
-    total="${#OKF_CHUNK_KIND[@]}"
-  fi
   if [ "$total" -eq 0 ]; then
     # No body, and no frontmatter to stand in for one. `[]` and not silence,
     # for the reason `check --json` spells out at length: a caller parsing this
@@ -6970,8 +7058,330 @@ cmd_chunk() {
     ' || die "the chunks for $concept could not be rendered as JSON"
 }
 
+# ---------------------------------------------------------------------------
+# okf embed (SPEC.md §9)
+# ---------------------------------------------------------------------------
+
+# The three SPEC.md §6 settings the embedding half of Tier B runs on, read once
+# per invocation and then held: a bundle whose okf.json changed mid-run would
+# otherwise send the first concept to one endpoint and the next to another.
+#
+# Read before a single concept is opened, so a bundle whose `embedding_dim` is
+# a string is told so immediately rather than after the walk — and, more to the
+# point, before anything has been sent anywhere.
+OKF_EMBEDDING_URL=""
+OKF_EMBEDDING_MODEL=""
+OKF_EMBEDDING_DIM=0
+embed_settings() {
+  index_string embedding_url "$OKF_DEFAULT_EMBEDDING_URL"
+  OKF_EMBEDDING_URL="$OKF_INDEX_STRING"
+  index_string embedding_model "$OKF_DEFAULT_EMBEDDING_MODEL"
+  OKF_EMBEDDING_MODEL="$OKF_INDEX_STRING"
+  index_int embedding_dim "$OKF_DEFAULT_EMBEDDING_DIM"
+  OKF_EMBEDDING_DIM="$OKF_INDEX_INT"
+
+  # The scheme is checked here because curl accepts far more than SPEC.md §9
+  # describes: a `file://` URL would read a local file and answer with its
+  # bytes, and a bare `localhost:11434` is a URL curl guesses a scheme for. §9
+  # says an OpenAI-shaped HTTP endpoint, and a setting that is not one is a
+  # mistyped setting rather than a request okf should try to make sense of.
+  case "$OKF_EMBEDDING_URL" in
+    http://* | https://*) ;;
+    *)
+      die "$(display_path "$OKF_CONFIG"): index.embedding_url must be an http:// or https:// URL, found $OKF_EMBEDDING_URL" \
+        "SPEC.md §9 puts the embeddings behind an OpenAI-shaped /v1/embeddings endpoint"
+      ;;
+  esac
+}
+
+# Up to ten lines of a response or a curl complaint, ready to hand to `die` as
+# its detail lines. Cut off rather than printed in full: an endpoint that
+# answers an okf request with a page of HTML has said what it had to say in its
+# first few lines, and the rest is a caller's terminal filled with someone
+# else's error page.
+OKF_HTTP_LINES=()
+http_detail_lines() { # $1 = a blob of text
+  OKF_HTTP_LINES=()
+  [ -n "$1" ] || return 0
+
+  local line n=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    if [ "$n" -gt 10 ]; then
+      OKF_HTTP_LINES+=("…")
+      break
+    fi
+    OKF_HTTP_LINES+=("$line")
+  done <<< "$1"
+  return 0
+}
+
+# One JSON POST, with the response body left in OKF_HTTP_BODY. Exits 1 — SPEC.md
+# §7's "error, or a missing prerequisite" — when the endpoint could not be
+# reached or did not answer 2xx, because there is no partial success to report:
+# an embedding that did not come back is a point that cannot be written.
+#
+# The request goes in on stdin as `--data-binary @-` rather than as an argument
+# or a temp file. An argument would put a whole concept's prose on the command
+# line, where it is both bounded by ARG_MAX and visible in `ps` to everyone on
+# the machine; a temp file would need `mktemp`, which SPEC.md §3's tool list has
+# not got — see init_write on why that list is taken literally.
+#
+# The status comes back appended to the body by `--write-out`, and is split off
+# below, for the same reason: `--output` would need a file to write to. curl's
+# own stderr is folded into the same capture, so a connection that failed is
+# reported in curl's words rather than as an empty body.
+#
+# No Authorization header, deliberately: SPEC.md §6 defines no key to put in one
+# and SPEC.md §9's documented endpoint is a local Ollama. An endpoint that wants
+# a token is a §6 change, and inventing a setting here would put a secret in a
+# committed file ahead of anybody deciding it belongs there.
+OKF_HTTP_STATUS=""
+OKF_HTTP_BODY=""
+http_post_json() { # $1 = what is being reached, $2 = the URL, $3 = the request body
+  local what="$1" url="$2" request="$3" response="" rc=0
+
+  OKF_HTTP_STATUS=""
+  OKF_HTTP_BODY=""
+
+  # `--url` rather than a trailing operand, so a URL that begins with a dash is
+  # a bad URL rather than an option curl invents a meaning for.
+  response="$(printf '%s' "$request" | curl \
+      --silent --show-error \
+      --request POST \
+      --header 'Content-Type: application/json' \
+      --header 'Accept: application/json' \
+      --data-binary @- \
+      --write-out '\n%{http_code}' \
+      --url "$url" 2>&1)" || rc=$?
+
+  if [ "$rc" -ne 0 ]; then
+    http_detail_lines "$response"
+    die "$what could not be reached at $url: curl exited $rc" \
+      ${OKF_HTTP_LINES[@]+"${OKF_HTTP_LINES[@]}"}
+  fi
+
+  OKF_HTTP_STATUS="${response##*$'\n'}"
+  OKF_HTTP_BODY="${response%"$OKF_HTTP_STATUS"}"
+  OKF_HTTP_BODY="${OKF_HTTP_BODY%$'\n'}"
+
+  case "$OKF_HTTP_STATUS" in
+    [0-9][0-9][0-9]) ;;
+    *)
+      # curl exited 0 and wrote no status, which is not something curl does —
+      # so what is on the PATH under that name is not curl. Said plainly,
+      # because every other message here would send somebody to look at their
+      # endpoint.
+      http_detail_lines "$response"
+      die "$what at $url gave back no HTTP status, so curl is not what answered" \
+        ${OKF_HTTP_LINES[@]+"${OKF_HTTP_LINES[@]}"}
+      ;;
+  esac
+  case "$OKF_HTTP_STATUS" in
+    2??) return 0 ;;
+  esac
+
+  http_detail_lines "$OKF_HTTP_BODY"
+  die "$what at $url answered $OKF_HTTP_STATUS" \
+    ${OKF_HTTP_LINES[@]+"${OKF_HTTP_LINES[@]}"}
+}
+
+# What jq makes of an OpenAI-shaped embeddings response: one embedding per line
+# as compact JSON, in the order the texts were sent, or an error naming what
+# was wrong with it.
+#
+# Every one of these checks is a claim the caller would otherwise make silently.
+# A response holding fewer embeddings than there were inputs, or one whose
+# vectors are the wrong width for the collection, is not a partial success —
+# it is a set of points that would go into Qdrant attached to the wrong chunks,
+# which is worse than no points at all and impossible to notice afterwards.
+#
+# `index` is honoured when the response carries one on every element, because
+# the OpenAI shape defines it and defines it as the thing that says which input
+# an embedding belongs to. An endpoint that omits it is answered in array
+# order, which is the only order left; one that numbers its elements anything
+# other than 0 to n-1 is refused rather than guessed at.
+OKF_EMBED_RESPONSE_JQ='
+  if type != "object" then
+    error("the response is not a JSON object but a " + type)
+  else . end
+  | .data as $d
+  | if $d == null then error("the response carries no data")
+    elif ($d | type) != "array" then
+      error("the response carries no array for data but a " + ($d | type))
+    elif ($d | length) != $n then
+      error("okf asked for \($n) embeddings and the response carries \($d | length)")
+    else . end
+  | [ $d[] | .index ] as $ix
+  | (if ($ix | map(select(type == "number")) | length) == $n then
+       (if ($ix | sort) != [range(0; $n)] then
+          error("the response numbers its embeddings \($ix | tostring), not 0 to \($n - 1)")
+        else ($d | sort_by(.index)) end)
+     else $d end) as $ordered
+  | [ $ordered[] | .embedding ]
+  | if any(.[]; type != "array") then
+      error("one of the embeddings is not an array of numbers")
+    elif any(.[]; any(.[]; type != "number")) then
+      error("one of the embeddings holds a value that is not a number")
+    elif any(.[]; length != $dim) then
+      error("the embeddings came back \([ .[] | length ] | unique | join(", ")) components wide, but index.embedding_dim says \($dim)")
+    else . end
+  | .[] | @json
+'
+
+# Embeds one batch of texts, leaving one compact JSON vector per text in
+# OKF_EMBED_VECTORS, positionally aligned with the arguments.
+#
+# One request per call, and the caller calls it once per concept — see cmd_embed
+# on why the batch is a concept. `input` is an array because the OpenAI shape
+# takes one, and a request per chunk would be four round trips for a class with
+# three methods.
+OKF_EMBED_VECTORS=()
+embed_texts() { # $1.. = the texts to embed
+  local count=$#
+  OKF_EMBED_VECTORS=()
+  [ "$count" -gt 0 ] || return 0
+
+  # The NUL-separated stream cmd_chunk builds its array from, for its reason: a
+  # chunk's text is somebody's prose and may hold quotes, backslashes, tabs and
+  # newlines, and NUL is the one byte it cannot hold.
+  local request
+  request="$(printf '%s\0' "$@" | jq -c -Rs --arg model "$OKF_EMBEDDING_MODEL" '
+      {model: $model, input: (split("\u0000")[:-1])}')" \
+    || die "the embedding request could not be rendered as JSON"
+
+  http_post_json "the embedding endpoint" "$OKF_EMBEDDING_URL" "$request"
+
+  local vectors
+  vectors="$(printf '%s\n' "$OKF_HTTP_BODY" | jq -r \
+      --argjson n "$count" --argjson dim "$OKF_EMBEDDING_DIM" \
+      "$OKF_EMBED_RESPONSE_JQ" 2>&1)" \
+    || die "the embedding endpoint at $OKF_EMBEDDING_URL answered with something okf cannot use: ${vectors#jq: error*: }"
+
+  local line
+  while IFS= read -r line; do
+    # A blank line is not a vector. `<<<` on an empty string is one empty line,
+    # so without this a concept with a single chunk could take an empty answer
+    # for a vector and pass the count below.
+    [ -n "$line" ] || continue
+    OKF_EMBED_VECTORS+=("$line")
+  done <<< "$vectors"
+
+  # The one thing the jq above cannot say for itself: a 2xx carrying an empty
+  # body is no JSON at all, and jq answers an empty input with an empty output
+  # and a zero status. Counted here so that "the endpoint said nothing" is a
+  # refusal rather than a concept whose vectors quietly went missing.
+  [ "${#OKF_EMBED_VECTORS[@]}" -eq "$count" ] \
+    || die "the embedding endpoint at $OKF_EMBEDDING_URL answered $OKF_HTTP_STATUS with nothing okf could read as embeddings"
+  return 0
+}
+
+# `1 chunk`, `2 chunks` — a count and its noun, agreeing. require_tools' `tool`
+# / `tools` written once, because the report below has four of them in it.
+count_noun() { # $1 = a count, $2 = the singular noun
+  if [ "$1" -eq 1 ]; then
+    printf '%s %s' "$1" "$2"
+  else
+    printf '%s %ss' "$1" "$2"
+  fi
+}
+
 # okf embed [--all] — Tier B: embed and upsert to Qdrant
-cmd_embed() { not_implemented embed; }
+#
+# SPEC.md §7 gives this subcommand no operand and one flag, so what it embeds is
+# the bundle: every concept `okf check` would have an opinion about, chunked by
+# SPEC.md §9 and sent to the endpoint SPEC.md §6 configures.
+#
+# `--all` is what SPEC.md §7 leaves okf to define, and it is defined against
+# SPEC.md §8's drift: a concept whose stored `code.content_hash` no longer
+# matches its source describes a version of the code that is gone, and
+# embedding it writes a point that will answer searches with prose about a
+# function that has since changed. The default is therefore the bundle minus
+# those, said out loud on stderr rather than silently; `--all` embeds them too,
+# for the caller who would rather have stale answers than none while
+# /okf-refresh catches up.
+#
+# Drift and not "changed since the last run": okf keeps no record of a previous
+# run to compare against, and a `.okf/` cache claiming to know what Qdrant holds
+# would be a second source of truth for the one thing Qdrant can be asked
+# directly.
+cmd_embed() {
+  local usage="usage: okf embed [--all]"
+  local all=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all) all=1 ;;
+      --)
+        shift
+        break
+        ;;
+      -*) die "embed: unknown flag: $1" "$usage" ;;
+      *) break ;;
+    esac
+    shift
+  done
+
+  [ $# -eq 0 ] || die "embed takes no arguments, but was given: $1" "$usage"
+
+  embed_settings
+  load_concepts
+
+  local concept concepts=0 chunks=0 drifted=0 empty=0 rc=0 total=0
+  for concept in ${OKF_CONCEPTS[@]+"${OKF_CONCEPTS[@]}"}; do
+    # A concept that stopped being readable between load_concepts and here is
+    # left off rather than reported, which is cmd_check's rule and its reason:
+    # nothing was read, so there is nothing to say about it.
+    read_frontmatter "$concept" || continue
+
+    if [ "$all" -eq 0 ]; then
+      # 0 is drifted; 1 is not; 2 is a comparison concept_drift could not make
+      # at all — an orphan, or a hash that was never a digest. Only the first is
+      # a reason to hold a concept back, because only the first is §8's evidence
+      # that the prose and the code have parted company. A concept nothing can
+      # be compared for has made no claim to have gone stale.
+      rc=0
+      concept_drift "$concept" "$OKF_FM_RESOURCE" "$OKF_FM_CODE_CONTENT_HASH" || rc=$?
+      if [ "$rc" -eq 0 ]; then
+        drifted=$((drifted + 1))
+        continue
+      fi
+    fi
+
+    concept_chunks "$concept" \
+      || die "$concept: its body could not be read, so there is nothing to embed"
+
+    total="${#OKF_CHUNK_KIND[@]}"
+    if [ "$total" -eq 0 ]; then
+      empty=$((empty + 1))
+      continue
+    fi
+
+    # One request per concept rather than one for the whole bundle: a bundle's
+    # worth of prose in a single request is a body an endpoint may well refuse
+    # by size, and the failure would take every concept with it. Per concept is
+    # also the unit the Qdrant upsert works in, so the vectors are already
+    # grouped the way the points that carry them will be.
+    embed_texts ${OKF_CHUNK_TEXT[@]+"${OKF_CHUNK_TEXT[@]}"}
+    concepts=$((concepts + 1))
+    chunks=$((chunks + total))
+  done
+
+  # The counts on stdout, the reasons something is missing from them on stderr —
+  # warn's division, and here because a caller watching a bundle shrink between
+  # runs needs to be told why without having to run `okf check` to find out.
+  if [ "$drifted" -gt 0 ]; then
+    warn "left out $(count_noun "$drifted" "drifted concept"): the prose no longer matches the source it documents" \
+      "\`okf check\` names them, /okf-refresh rewrites them, and \`okf embed --all\` embeds them as they are"
+  fi
+  if [ "$empty" -gt 0 ]; then
+    warn "left out $(count_noun "$empty" "concept") with nothing to embed: no body, and no title, description or code.signature to summarise instead"
+  fi
+
+  printf 'embedded %s from %s with %s (%s-dim)\n' \
+    "$(count_noun "$chunks" chunk)" "$(count_noun "$concepts" concept)" \
+    "$OKF_EMBEDDING_MODEL" "$OKF_EMBEDDING_DIM"
+}
 
 # okf search <query> [--hyde-prompt] [--k N] [--repo R] [--type T]
 cmd_search() { not_implemented search; }

@@ -568,6 +568,20 @@ _okf_bin_array() { # $1 = array name
   sed -n "s/^$1=(\(.*\))\$/\1/p" "$TOOLKIT_ROOT/bin/okf" | tr ' ' '\n' | sed '/^$/d'
 }
 
+# One of bin/okf's top-level scalars, as the script itself sees it.
+#
+# Sourced rather than read with sed, which is _okf_bin_array's trick and cannot
+# be used here: a scalar is written with quotes around it that a `sed` would
+# have to strip, and stripping them is guessing at the shell's own quoting
+# rules. bin/okf's sourcing guard is what makes this safe — sourced, it defines
+# its functions and constants and runs no command line.
+_okf_bin_scalar() { # $1 = variable name
+  bash -c '
+    # shellcheck source=/dev/null
+    . "$1" > /dev/null 2>&1 || exit 1
+    printf "%s\n" "${!2-}"' _ "$TOOLKIT_ROOT/bin/okf" "$1"
+}
+
 # The names bin/okf's dispatch accepts, read out of its OKF_SUBCOMMANDS array.
 _okf_dispatch_subcommands() {
   _okf_bin_array OKF_SUBCOMMANDS | sort -u
@@ -9342,6 +9356,451 @@ CONCEPT
 test_okf_chunk_gives_every_method_chunk_its_own_symbol() {
   _okf_preconditions || return 1
   with_fixture_repo chunks _okf_chunk_symbol_probe
+}
+
+# ---------------------------------------------------------------------------
+# okf embed (SPEC.md §9, §10)
+# ---------------------------------------------------------------------------
+
+# SPEC.md §10: "never touch the network. Tier B tests point `qdrant_url` and
+# `embedding_url` at a local stub served by a temp file or a trap-based fake
+# `curl` on `PATH`." This is that fake curl, and it is the only thing standing
+# between this section and a real HTTP request.
+#
+# It opens no socket. What it does is record the request — the whole argument
+# vector, the URL, and the body okf wrote to its stdin — and answer with an
+# OpenAI-shaped embeddings response computed from that body, so that a request
+# for three texts is answered with three vectors without anything having to
+# know in advance how many chunks a concept has.
+#
+# Prepended to the real PATH rather than replacing it, which is
+# _ralph_probe_bin's arrangement for its reason: okf still needs git, jq, rg
+# and sha256sum to be findable, and what is being staged here is one tool's
+# answers rather than an empty machine.
+#
+# What each run is told, all optional:
+#   OKF_FAKE_CURL_DIR      where to record (required; set by _okf_embed)
+#   OKF_FAKE_CURL_DIM      how wide the vectors come back (default 4)
+#   OKF_FAKE_CURL_STATUS   the HTTP status to write out (default 200)
+#   OKF_FAKE_CURL_BODY     a canned response body, instead of the computed one
+#   OKF_FAKE_CURL_EXIT     fail the way an unreachable endpoint fails
+#   OKF_FAKE_CURL_NO_STATUS  answer without curl's --write-out status at all
+OKF_FAKE_CURL_BIN=""
+_okf_fake_curl_bin() {
+  OKF_FAKE_CURL_BIN="$HARNESS_STATE/fake-curl-bin"
+  [ -x "$OKF_FAKE_CURL_BIN/curl" ] && return 0
+
+  if ! mkdir -p "$OKF_FAKE_CURL_BIN"; then
+    _fail "$CURRENT_TEST builds a fake curl" "could not create $OKF_FAKE_CURL_BIN"
+    return 1
+  fi
+  cat > "$OKF_FAKE_CURL_BIN/curl" <<'FAKE' || return 1
+#!/usr/bin/env bash
+# A stand-in for curl that never opens a socket — see SPEC.md §10.
+set -u
+dir="${OKF_FAKE_CURL_DIR:?the fake curl needs OKF_FAKE_CURL_DIR}"
+argv=("$@")
+
+url=""
+data=""
+wout=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --url)
+      url="${2-}"
+      shift 2
+      ;;
+    --data-binary)
+      data="${2-}"
+      shift 2
+      ;;
+    --write-out)
+      wout="${2-}"
+      shift 2
+      ;;
+    --header | --request)
+      shift 2
+      ;;
+    *) shift ;;
+  esac
+done
+
+# Only when the request said the body is coming that way. A blind `cat` would
+# block on the harness's own stdin for a request that carries no body.
+body=""
+[ "$data" = "@-" ] && body="$(cat)"
+
+n=$(( $(cat "$dir/count" 2> /dev/null || echo 0) + 1 ))
+printf '%s\n' "$n" > "$dir/count"
+printf '%s\n' "${argv[@]}" > "$dir/argv-$n"
+printf '%s\n' "$url" >> "$dir/urls"
+printf '%s' "$body" > "$dir/req-$n.json"
+
+code="${OKF_FAKE_CURL_EXIT:-0}"
+if [ "$code" -ne 0 ]; then
+  # How curl fails when it never reached anything: its complaint on stderr, and
+  # a 000 where the status would be.
+  printf 'curl: (%s) the fake curl was told not to reach anything\n' "$code" >&2
+  [ -n "$wout" ] && printf '\n000'
+  exit "$code"
+fi
+
+if [ -n "${OKF_FAKE_CURL_BODY+set}" ]; then
+  printf '%s' "$OKF_FAKE_CURL_BODY"
+else
+  printf '%s' "$body" | jq -c --argjson dim "${OKF_FAKE_CURL_DIM:-4}" '
+    {object: "list",
+     model: .model,
+     data: [ .input | to_entries[]
+             | {object: "embedding", index: .key,
+                embedding: [range(0; $dim) | 0.25]} ]}'
+fi
+[ -n "$wout" ] && [ -z "${OKF_FAKE_CURL_NO_STATUS:-}" ] && printf '\n%s' "${OKF_FAKE_CURL_STATUS:-200}"
+exit 0
+FAKE
+  chmod +x "$OKF_FAKE_CURL_BIN/curl" || return 1
+  return 0
+}
+
+# SPEC.md §6's `index` block, written into a bundle root with the fields a test
+# wants in it — `_okf_tier_b_opt_in` with something inside the braces.
+_okf_index_block() { # $1 = a directory to write okf.json into, $2 = the block, as JSON
+  if ! printf '{"index": %s}\n' "$2" > "$1/okf.json"; then
+    _fail "$CURRENT_TEST configures its bundle's index block" "could not write $1/okf.json"
+    return 1
+  fi
+  return 0
+}
+
+# okf embed's stdout, its stderr and its exit status, kept apart the way
+# _okf_chunk keeps chunk's apart: the report is stdout, what was left out and
+# why is stderr, and the status says whether anything was refused.
+#
+# Every run starts with an empty recording directory, so "no request was sent"
+# is an honestly empty directory rather than the leftovers of the run before.
+OKF_EMBED_OUT=""
+OKF_EMBED_ERR=""
+OKF_EMBED_RC=0
+OKF_EMBED_REQUESTS=""
+_okf_embed() { # $1.. = arguments after `embed`
+  _okf_fake_curl_bin || return 1
+  OKF_EMBED_REQUESTS="$HARNESS_STATE/fake-curl-requests"
+  rm -rf "$OKF_EMBED_REQUESTS"
+  if ! mkdir -p "$OKF_EMBED_REQUESTS"; then
+    _fail "$CURRENT_TEST records the requests okf makes" \
+      "could not create $OKF_EMBED_REQUESTS"
+    return 1
+  fi
+
+  local stderr="$HARNESS_STATE/okf-embed-stderr"
+  : > "$stderr"
+  OKF_EMBED_OUT="$(PATH="$OKF_FAKE_CURL_BIN:$PATH" \
+    OKF_FAKE_CURL_DIR="$OKF_EMBED_REQUESTS" \
+    "$TOOLKIT_ROOT/bin/okf" embed ${1+"$@"} 2> "$stderr")"
+  OKF_EMBED_RC=$?
+  OKF_EMBED_ERR="$(cat "$stderr" 2> /dev/null)"
+  return 0
+}
+
+# How many requests that run made, which is the number the fake curl counted
+# and not a count of files that might include the run before's.
+_okf_embed_request_count() {
+  cat "$OKF_EMBED_REQUESTS/count" 2> /dev/null || printf '0\n'
+}
+
+# One recorded request body, through jq.
+_okf_embed_request() { # $1 = which request, from 1, $2 = a jq filter
+  jq -c -r "$2" "$OKF_EMBED_REQUESTS/req-$1.json" 2> /dev/null
+}
+
+# Every URL the run asked for, one per line.
+_okf_embed_urls() {
+  cat "$OKF_EMBED_REQUESTS/urls" 2> /dev/null
+}
+
+# One recorded argument vector, one argument per line.
+_okf_embed_argv() { # $1 = which request, from 1
+  cat "$OKF_EMBED_REQUESTS/argv-$1" 2> /dev/null
+}
+
+# The `chunks` fixture's concepts, in the order `okf embed` walks them — which
+# is load_concepts' order, which is `git ls-files`'. Unwritten is deliberately
+# not here: it has neither a body nor a `title`, `description` or
+# `code.signature`, so SPEC.md §9 gives it no chunk and there is nothing to
+# send for it.
+_okf_chunks_fixture_concepts() {
+  printf '%s\n' src/kitchen/Fenced src/kitchen/NoSuchRouteException \
+    src/kitchen/RouteKey src/kitchen/Router
+}
+
+# PLAN.md's Phase 10 embedding item: the request body, asserted against a fake
+# curl on PATH.
+_okf_embed_request_probe() {
+  local url="http://embeddings.invalid/v1/embeddings" model="probe-embed-3"
+
+  # `.invalid` is RFC 2606's never-resolvable TLD, so even a bug that got past
+  # the fake curl below could not reach anything — SPEC.md §10's rule with a
+  # second lock on it.
+  _okf_index_block . \
+    "{\"embedding_url\": \"$url\", \"embedding_model\": \"$model\", \"embedding_dim\": 4}" \
+    || return 1
+
+  OKF_FAKE_CURL_DIM=4 _okf_embed || return 1
+  assert_eq "0" "$OKF_EMBED_RC" "okf embed exits 0 over a bundle it could embed"
+
+  # Four requests for five concepts: one per concept that has chunks, and
+  # nothing at all for the one that has none.
+  assert_eq "4" "$(_okf_embed_request_count)" \
+    "one request per concept with chunks in it, and none for the concept with none"
+  assert_contains "$OKF_EMBED_ERR" "nothing to embed" \
+    "and the concept nothing was sent for is named on stderr rather than dropped in silence"
+
+  assert_eq "$(printf '%s\n' "$url" "$url" "$url" "$url")" "$(_okf_embed_urls)" \
+    "every request goes to the endpoint okf.json configures, and nowhere else"
+
+  # SPEC.md §9's OpenAI shape: a POST carrying JSON.
+  local argv
+  argv="$(_okf_embed_argv 1)"
+  assert_contains "$argv" "POST" "the request is a POST"
+  assert_contains "$argv" "Content-Type: application/json" "declaring a JSON body"
+
+  # The body itself, which is what this item is about: `model` out of okf.json,
+  # and `input` holding exactly the chunk texts `okf chunk` prints for that
+  # concept, in that order. Compared against `okf chunk`'s own output rather
+  # than against a copy of the fixture's prose, so the two cannot answer
+  # differently about what a concept splits into.
+  local expected="" actual="" concept i=0
+  while IFS= read -r concept; do
+    i=$((i + 1))
+    expected="$expected$("$TOOLKIT_ROOT/bin/okf" chunk "$concept" | jq -c '[.[].text]')"$'\n'
+    actual="$actual$(_okf_embed_request "$i" '.input')"$'\n'
+    assert_eq "$model" "$(_okf_embed_request "$i" '.model')" \
+      "request $i names the model okf.json configures"
+  done < <(_okf_chunks_fixture_concepts)
+  assert_eq "$expected" "$actual" \
+    "each request carries one concept's chunk texts, in the order okf chunk prints them"
+
+  # And the report says what was done, in the terms the caller configured it in.
+  assert_contains "$OKF_EMBED_OUT" "9 chunks from 4 concepts" \
+    "the report counts the chunks embedded and the concepts they came from"
+  assert_contains "$OKF_EMBED_OUT" "$model" "naming the model they went to"
+  assert_contains "$OKF_EMBED_OUT" "4-dim" "and the dimension they came back in"
+  return 0
+}
+
+test_okf_embed_sends_every_chunk_to_the_configured_endpoint() {
+  _okf_preconditions || return 1
+  with_fixture_repo chunks _okf_embed_request_probe
+}
+
+# SPEC.md §6 gives every field a default, and SPEC.md §9 documents which:
+# "Ollama `nomic-embed-text`, 768-dim". A bundle that opted in to Tier B with an
+# empty `index` block gets those.
+_okf_embed_settings_probe() {
+  _okf_tier_b_opt_in . || return 1
+
+  OKF_FAKE_CURL_DIM=768 _okf_embed || return 1
+  assert_eq "0" "$OKF_EMBED_RC" "an empty index block is a bundle running on the defaults"
+  assert_eq "$(_okf_bin_scalar OKF_DEFAULT_EMBEDDING_URL)" \
+    "$(_okf_embed_urls | sort -u)" \
+    "with no embedding_url set, the requests go to SPEC.md §6's default"
+  assert_eq "$(_okf_bin_scalar OKF_DEFAULT_EMBEDDING_MODEL)" \
+    "$(_okf_embed_request 1 '.model')" \
+    "and carry SPEC.md §6's default model"
+  assert_contains "$OKF_EMBED_OUT" "768-dim" \
+    "and are checked against SPEC.md §6's default dimension"
+
+  # Absent is what defaults; a key written out and left empty is refused, for
+  # the reason index_string gives — it is a setting somebody started and did
+  # not finish, and a request naming the default model would answer a caller
+  # who was plainly trying to say something else.
+  _okf_index_block . '{"embedding_model": "", "embedding_dim": 4}' || return 1
+  _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "an empty embedding_model is refused rather than defaulted over"
+  assert_contains "$OKF_EMBED_ERR" "index.embedding_model" "naming the setting"
+  assert_eq "0" "$(_okf_embed_request_count)" "and nothing is sent under it"
+
+  # A wrong shape is not a missing value, and is refused rather than defaulted
+  # over — before anything is sent anywhere.
+  _okf_index_block . '{"embedding_dim": "768"}' || return 1
+  _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "an embedding_dim that is not a number is refused"
+  assert_contains "$OKF_EMBED_ERR" "index.embedding_dim" "naming the setting"
+  assert_eq "0" "$(_okf_embed_request_count)" "and nothing is sent while it is wrong"
+
+  _okf_index_block . '{"embedding_dim": 0}' || return 1
+  _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "a zero-width embedding_dim is refused too"
+
+  _okf_index_block . '{"embedding_url": 7}' || return 1
+  _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "an embedding_url that is not a string is refused"
+  assert_contains "$OKF_EMBED_ERR" "must be a string" "saying what was wrong with it"
+
+  # SPEC.md §9's endpoint is an HTTP one. curl would take `file://` and answer
+  # from the disk, which is a bundle silently embedding nothing it was pointed
+  # at over the network.
+  _okf_index_block . '{"embedding_url": "file:///etc/hostname"}' || return 1
+  _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "an embedding_url that is not http:// or https:// is refused"
+  assert_contains "$OKF_EMBED_ERR" "index.embedding_url" "naming the setting"
+  assert_eq "0" "$(_okf_embed_request_count)" "and nothing is read or sent under it"
+  return 0
+}
+
+test_okf_embed_reads_its_endpoint_from_okf_json() {
+  _okf_preconditions || return 1
+  with_fixture_repo chunks _okf_embed_settings_probe
+}
+
+# What okf does with an answer it cannot use. Every one of these is a response
+# that would otherwise become points in Qdrant attached to the wrong chunks —
+# the one failure nobody notices afterwards, because a search still returns
+# something.
+_okf_embed_refusal_probe() {
+  _okf_index_block . '{"embedding_url": "http://embeddings.invalid/v1/embeddings", "embedding_dim": 4}' \
+    || return 1
+
+  OKF_FAKE_CURL_STATUS=503 OKF_FAKE_CURL_DIM=4 _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "a non-2xx status is a refusal"
+  assert_contains "$OKF_EMBED_ERR" "503" "naming the status that came back"
+  assert_eq "1" "$(_okf_embed_request_count)" \
+    "and the run stops there rather than sending the rest of the bundle"
+
+  OKF_FAKE_CURL_EXIT=7 _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "an endpoint that could not be reached is a refusal"
+  assert_contains "$OKF_EMBED_ERR" "curl exited 7" "reported in curl's own terms"
+
+  OKF_FAKE_CURL_BODY='<html>not json</html>' _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "a response that is not JSON is a refusal"
+
+  OKF_FAKE_CURL_BODY='{"data": [{"index": 0, "embedding": [0.1, 0.2, 0.3, 0.4]}]}' _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "fewer embeddings than there were inputs is a refusal"
+  assert_contains "$OKF_EMBED_ERR" "asked for" "saying how many were asked for"
+
+  OKF_FAKE_CURL_DIM=5 _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "an embedding of the wrong width is a refusal"
+  assert_contains "$OKF_EMBED_ERR" "embedding_dim" \
+    "naming the setting the width has to agree with"
+
+  OKF_FAKE_CURL_BODY='{"data": [{"embedding": ["a", "b", "c", "d"]}, {"embedding": [1, 2, 3, 4]}]}' \
+    _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "an embedding that is not numbers is a refusal"
+
+  # A 200 with nothing in it, which jq answers with nothing and a zero status —
+  # the one malformed response that could otherwise pass for a good one.
+  OKF_FAKE_CURL_BODY='' _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "a 2xx carrying an empty body is a refusal"
+
+  # curl exiting 0 with no status written is not something curl does, so what
+  # answered was not curl — said plainly, rather than as something about the
+  # endpoint.
+  OKF_FAKE_CURL_NO_STATUS=1 OKF_FAKE_CURL_DIM=4 _okf_embed || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "an answer carrying no HTTP status is a refusal"
+
+  # Arguments SPEC.md §7 does not give this subcommand, refused before a single
+  # request is made.
+  _okf_embed src/kitchen/Router || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "embed takes no operand, so one is refused"
+  assert_eq "0" "$(_okf_embed_request_count)" "before anything is sent"
+  _okf_embed --everything || return 1
+  assert_eq "1" "$OKF_EMBED_RC" "and so is a flag SPEC.md §7 does not give it"
+  assert_contains "$OKF_EMBED_ERR" "usage: okf embed [--all]" "with §7's usage line"
+  assert_eq "0" "$(_okf_embed_request_count)" "before anything is sent"
+  return 0
+}
+
+test_okf_embed_refuses_an_answer_it_cannot_use() {
+  _okf_preconditions || return 1
+  with_fixture_repo chunks _okf_embed_refusal_probe
+}
+
+# SPEC.md §7 gives `okf embed` one flag and no operand, so `--all` is okf's to
+# define: it is defined against SPEC.md §8's drift, and this is where that is
+# pinned down.
+_okf_embed_drift_probe() {
+  _okf_index_block . \
+    '{"embedding_url": "http://embeddings.invalid/v1/embeddings", "embedding_dim": 4}' \
+    || return 1
+
+  OKF_FAKE_CURL_DIM=4 _okf_embed || return 1
+  assert_eq "4" "$(_okf_embed_request_count)" \
+    "with nothing drifted, every concept with chunks is embedded"
+
+  # One source changed, so its concept's stored code.content_hash no longer
+  # describes it — SPEC.md §8's drift, and prose about a version of the file
+  # that is gone.
+  if ! printf '%s\n' '// a line the concept does not know about' >> src/kitchen/Router.java; then
+    _fail "$CURRENT_TEST can change a fixture source" "could not append to src/kitchen/Router.java"
+    return 1
+  fi
+
+  OKF_FAKE_CURL_DIM=4 _okf_embed || return 1
+  assert_eq "0" "$OKF_EMBED_RC" "a drifted concept is not an error"
+  assert_eq "3" "$(_okf_embed_request_count)" "but it is left out of a plain okf embed"
+  assert_contains "$OKF_EMBED_ERR" "drifted" "which is said on stderr, not left to be noticed"
+  assert_contains "$OKF_EMBED_ERR" "--all" "along with the flag that embeds it anyway"
+  assert_contains "$OKF_EMBED_OUT" "from 3 concepts" "and the report counts what was sent"
+
+  local sent
+  sent="$(cat "$OKF_EMBED_REQUESTS"/req-*.json 2> /dev/null)"
+  case "$sent" in
+    *"Chooses the handler"* | *"answers which one serves a"*)
+      _fail "no drifted prose is sent" \
+        "the drifted concept's text is in a request body anyway"
+      ;;
+    *) _pass "no drifted prose is sent" ;;
+  esac
+
+  OKF_FAKE_CURL_DIM=4 _okf_embed --all || return 1
+  assert_eq "0" "$OKF_EMBED_RC" "okf embed --all exits 0"
+  assert_eq "4" "$(_okf_embed_request_count)" "and embeds the drifted concept too"
+  sent="$(cat "$OKF_EMBED_REQUESTS"/req-*.json 2> /dev/null)"
+  assert_contains "$sent" "answers which one serves a" \
+    "so its prose does reach the endpoint under --all"
+  return 0
+}
+
+test_okf_embed_leaves_out_drifted_concepts_unless_all_is_given() {
+  _okf_preconditions || return 1
+  with_fixture_repo chunks _okf_embed_drift_probe
+}
+
+# The fallbacks in bin/okf are SPEC.md §6's example, which is the one place the
+# defaults are written down for a reader. Read out of §6's own JSON block, so
+# the two cannot drift apart unnoticed.
+test_okf_embed_defaults_are_the_spec_ones() {
+  _okf_preconditions || return 1
+
+  local spec
+  spec="$(_okf_spec_config_json)"
+  if [ -z "$spec" ]; then
+    _fail "SPEC.md §6 shows the okf.json defaults" \
+      "extracted no JSON block from the okf.json section"
+    return 1
+  fi
+
+  local key var
+  for key in embedding_url embedding_model embedding_dim; do
+    var="OKF_DEFAULT_$(printf '%s' "$key" | tr '[:lower:]' '[:upper:]')"
+    assert_eq "$(printf '%s\n' "$spec" | jq -r --arg key "$key" '.index[$key] | tostring')" \
+      "$(_okf_bin_scalar "$var")" \
+      "bin/okf's $var is what SPEC.md §6 writes for index.$key"
+  done
+
+  # SPEC.md §3 gives Tier B one tool to speak HTTP with, and SPEC.md §10 has the
+  # suite fake exactly that one. A second way out — bash's own /dev/tcp, or a
+  # wget — would be a request no fake curl on PATH could intercept, and so a
+  # test run that reached the network while reporting that it had not.
+  local okf="$TOOLKIT_ROOT/bin/okf" way
+  for way in '/dev/tcp' '/dev/udp' 'wget'; do
+    if grep -Fq -- "$way" "$okf"; then
+      _fail "bin/okf reaches the network only through curl" \
+        "it mentions $way, which no fake curl on PATH can stand in for"
+    else
+      _pass "bin/okf does not reach the network through $way"
+    fi
+  done
 }
 
 # install.sh (PLAN.md Phase 6)

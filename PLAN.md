@@ -73,7 +73,7 @@ there). Items are ordered so none depends on a later one. Every item verifies wi
 
 ## Phase 10 — Tier B: embedding and search
 
-- [ ] Implement okf embed in bin/okf to request embeddings from the OpenAI-shaped /v1/embeddings endpoint configured in okf.json using curl, with tests driving a fake curl placed on PATH and asserting the request body, never touching the network per SPEC.md §10 (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
+- [x] Implement okf embed in bin/okf to request embeddings from the OpenAI-shaped /v1/embeddings endpoint configured in okf.json using curl, with tests driving a fake curl placed on PATH and asserting the request body, never touching the network per SPEC.md §10 (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Extend okf embed in bin/okf to create the Qdrant collection over its REST API with cosine distance and embedding_dim when it does not already exist, asserted against a fake curl on PATH (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Extend okf embed in bin/okf to upsert one point per chunk carrying the SPEC.md §9 payload and a deterministic UUIDv5-shaped point id, asserted against a fake curl on PATH (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Implement okf search in bin/okf to embed the query text and search Qdrant over REST with a --k limit, driven by a fake curl placed on PATH (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
