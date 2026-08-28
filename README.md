@@ -138,6 +138,42 @@ requirement was never confirmed. The bundle is the product — any reader, inclu
 server in any language, can be added later against the same files without touching the
 format.
 
+### Standing up Tier B
+
+Tier B needs two services: a vector store and an embeddings server. A
+`docker-compose.yml` at the repo root brings up both, and the defaults `okf init`
+writes point at it, so a bundle created afterwards needs no edits.
+
+```sh
+docker compose up -d      # qdrant on :6333, embeddings on :7997
+```
+
+Then add an `index` block to the bundle's `okf.json` — `okf init` deliberately
+leaves it out, so Tier B stays opt-in:
+
+```json
+{
+  "index": {}
+}
+```
+
+An empty block is enough: every key falls back to the default, which is this
+stack. Set a key only to depart from it.
+
+Two things worth knowing before you embed anything:
+
+- **A collection is bound to one embedding model.** Qdrant fixes a collection's
+  dimension when it is created, so switching models later means a new collection,
+  not a config edit. The default here and Ollama's `nomic-embed-text` are both
+  768-dim, so those two are interchangeable; most others are not.
+- **The endpoint shape is the contract, not its path.** Anything OpenAI-shaped
+  works. Infinity serves `/embeddings`, Ollama and HuggingFace TEI serve
+  `/v1/embeddings`; `okf` sends whatever full URL you configure.
+
+To use something you already run instead — Ollama, TEI, a hosted provider — skip
+the compose file and set `embedding_url`, `embedding_model` and `embedding_dim`
+to match it.
+
 ### Subcommands
 
 ```
@@ -187,8 +223,8 @@ hard dependency and bash has no TOML parser. Every field defaults if absent.
 | `index.repo` | Tier B: the repo name stamped on every point, so cross-repo search is a filter |
 | `index.qdrant_url` | Tier B: Qdrant REST endpoint (e.g. `http://localhost:6333`) |
 | `index.collection` | Tier B: collection name (e.g. `okf_concepts`) |
-| `index.embedding_url` | Tier B: OpenAI-shaped `/v1/embeddings` endpoint |
-| `index.embedding_model` | Tier B: embedding model (documented default: Ollama `nomic-embed-text`) |
+| `index.embedding_url` | Tier B: OpenAI-shaped embeddings endpoint (the shape is the contract, not the path) |
+| `index.embedding_model` | Tier B: embedding model (default: `nomic-ai/nomic-embed-text-v1.5`, served by `docker-compose.yml`) |
 | `index.embedding_dim` | Tier B: vector dimension, and the collection's (768 for the default) |
 
 The whole `index` block is what makes Tier B opt-in: omit it and Tier A is unaffected.
@@ -227,6 +263,23 @@ Copies everything in `bin/` — `ralph` and `okf` — to `~/.local/bin/`, each
 `~/.claude/settings.json` (see **Permissions** below). Safe to re-run. Verify with
 `ralph --help` and `okf --help`.
 
+`./install.sh --dry-run` prints every change it would make and writes nothing —
+worth a look before letting someone else's script edit your `settings.json`.
+
+Every destination is overridable from the environment, so you can install under a
+different prefix, into a staging directory, or somewhere disposable to try it out:
+
+| Variable | Default | |
+|---|---|---|
+| `BIN_DIR` | `~/.local/bin` | where `ralph` and `okf` go |
+| `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code's own variable; honoured if you set it |
+| `COMMANDS_DIR` | `$CLAUDE_CONFIG_DIR/commands` | where the slash commands go |
+| `SETTINGS_FILE` | `$CLAUDE_CONFIG_DIR/settings.json` | the file `permissions.json` merges into |
+
+```sh
+BIN_DIR=/tmp/t/bin CLAUDE_CONFIG_DIR=/tmp/t/claude ./install.sh
+```
+
 ## Permissions
 
 `install.sh` unions `permissions.json`'s `permissions.allow` entries into
@@ -258,16 +311,24 @@ git pull
 ## Uninstall
 
 ```sh
-rm ~/.local/bin/ralph ~/.local/bin/okf
-rm ~/.claude/commands/onboard.md ~/.claude/commands/ralph-spec.md \
-   ~/.claude/commands/tdd-audit.md ~/.claude/commands/tdd-plan.md \
-   ~/.claude/commands/tdd-generate.md ~/.claude/commands/adversarial-pair.md \
-   ~/.claude/commands/clarify.md ~/.claude/commands/explain.md \
-   ~/.claude/commands/critique.md ~/.claude/commands/tighten.md \
-   ~/.claude/commands/okf-init.md ~/.claude/commands/okf-generate.md \
-   ~/.claude/commands/okf-refresh.md ~/.claude/commands/okf-verify.md \
-   ~/.claude/commands/okf-search.md
+cd ~/claude-toolkit
+./uninstall.sh
 ```
+
+Removes whatever is in this checkout's `bin/` and `commands/` from wherever
+`install.sh` put it — it mirrors the install loops rather than naming files, so
+adding a script or a command leaves nothing here to keep in step. It takes the
+same `--dry-run` flag and the same environment overrides as `install.sh`.
+
+Only files whose names match this checkout are touched; `~/.local/bin` and
+`~/.claude/commands` are shared with other tools and are never removed wholesale.
+
+`settings.json` is left alone by default. The install is a *union*, so an entry
+in `permissions.allow` may equally be one you added yourself, and silently
+removing it would be a surprise. Pass `--purge-permissions` to remove the entries
+listed in `permissions.json`.
+
+The checkout itself is untouched — delete it to finish.
 
 An OKF bundle is left behind on purpose: `okf.json`, the `index.md` files and the
 co-located concepts are committed repo content, not installed state, and they stay

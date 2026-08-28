@@ -225,8 +225,8 @@ JSON, not TOML, because `jq` is already a hard dependency and bash has no TOML p
     "repo": "claude-toolkit",
     "qdrant_url": "http://localhost:6333",
     "collection": "okf_concepts",
-    "embedding_url": "http://localhost:11434/v1/embeddings",
-    "embedding_model": "nomic-embed-text",
+    "embedding_url": "http://localhost:7997/embeddings",
+    "embedding_model": "nomic-ai/nomic-embed-text-v1.5",
     "embedding_dim": 768
   }
 }
@@ -286,8 +286,14 @@ tags, status, trust_tier, content_hash, commit
 
 Every point carries `repo`, so cross-repo search is a filter change, not a schema change.
 
-**Embeddings** go to an OpenAI-shaped `/v1/embeddings` endpoint — Ollama
-`nomic-embed-text`, 768-dim, is the documented default.
+**Embeddings** go to an OpenAI-shaped embeddings endpoint. The *shape* is the
+contract, not the path: `okf` validates that `embedding_url` is an http(s) URL and
+sends the whole thing, so `/embeddings` and `/v1/embeddings` are equally fine.
+
+The documented default is the `docker-compose.yml` stack at the repo root --
+Infinity serving `nomic-ai/nomic-embed-text-v1.5` on `localhost:7997/embeddings`,
+768-dim, alongside Qdrant. Ollama's `nomic-embed-text` is also 768-dim, so a
+bundle embedded against either can share a collection.
 
 **HyDE.** `okf` never calls an LLM. `okf search --hyde-prompt` prints a prompt and exits;
 the slash command answers it and passes the hypothetical body back as the query text. The
@@ -334,7 +340,21 @@ concepts they should produce.
   review.
 - **`install.sh`** copies `bin/okf` to `$HOME/.local/bin/okf` alongside `ralph`, reports it
   in the same style, and warns (without failing) about any missing runtime prerequisite
-  from §3.
+  from §3. Every destination is overridable from the environment — `BIN_DIR`,
+  `COMMANDS_DIR`, `SETTINGS_FILE`, and `CLAUDE_CONFIG_DIR` (Claude Code's own variable,
+  which the other two derive from). Hard-coded destinations meant the installer could not
+  be exercised without writing into the real `~/.claude`; honouring `CLAUDE_CONFIG_DIR` is
+  a correctness matter, not a convenience, since a user who sets it would otherwise get
+  the commands somewhere Claude Code never looks. `--dry-run` prints every change and
+  writes nothing; all writes route through one `run()` helper so the dry path cannot
+  drift from the real one.
+- **`uninstall.sh`** mirrors those loops rather than naming files: it removes whatever is
+  in this checkout's `bin/` and `commands/` from wherever `install.sh` put it, takes the
+  same flag and the same overrides, and touches only names that match this checkout —
+  never a whole directory, which is shared with other tools. `settings.json` is left alone
+  unless `--purge-permissions` is passed, because the install is a union and an entry may
+  equally be one the user added. A hand-maintained removal list was the alternative, and
+  it had already drifted five commands behind.
 - **`permissions.json`** gains the read-only `okf` subcommands: `okf list`, `okf hash`,
   `okf fanin`, `okf check`, `okf search`.
 
