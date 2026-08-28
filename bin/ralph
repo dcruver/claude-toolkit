@@ -458,6 +458,98 @@ item_concept_prompt() { # $1 = a checklist item's text
   fi
 }
 
+# The prompt section telling an attempt to carry its own concepts forward, or
+# nothing at all when okf is not installed.
+#
+# This is SPEC.md §11's other instruction to ralph — the docs go into the prompt
+# above, and what the attempt changes comes back out in the same commit. It is
+# an instruction and never an edit ralph makes itself: only the attempt knows
+# what its own change made false, and a `code.content_hash` advanced past prose
+# nobody re-read leaves the concept reporting itself clean for ever while saying
+# something untrue about the code.
+#
+# Prints nothing, and succeeds, when okf is absent. There is no bundle to keep
+# in step on that machine and no `okf hash` to restamp with, so a paragraph
+# about concepts would only send the attempt hunting for files that are not
+# there — and the prompt stays byte for byte the prompt ralph has always sent.
+# That is §11's silent skip, and it is silent in both directions: nothing is
+# printed to the attempt and nothing is logged about it either, because okf's
+# absence is a fact about the machine and not a fault in the run.
+#
+# Two things §11 pins down about the prose an attempt writes here, and both are
+# spelled out to it rather than left to the concept-authoring commands, which
+# may not be installed beside okf. The actor is `ralph/<model>`, never
+# `claude-code/<model>`: a reader of a concept has to be able to tell prose an
+# unattended loop wrote from prose someone was sitting in front of. And it never
+# gains a `verified` entry — a loop that could forge review would make SPEC.md
+# §8's trust tiers mean nothing, and that prohibition is exactly what makes
+# refreshing unattended safe in the first place.
+concept_refresh_prompt() { # $1 = the model ralph was given, empty when unset
+  have_okf || return 0
+  local model="${1-}"
+
+  printf '%s\n' \
+    'CONCEPT UPKEEP — this repository is an OKF bundle: a documented source has a' \
+    'concept doc beside it, in the same directory under the same stem with a .md' \
+    'suffix, opening with a --- frontmatter block whose `resource:` names that' \
+    'source. A doc still describing a file as it was before your change is worse' \
+    'than no doc at all — the next attempt is handed it as orientation and works' \
+    'from prose that stopped being true the moment you committed. So, as part of' \
+    'this attempt and not as a follow-up:'
+  # A bare newline first: `printf '\n%s\n'` with a list reruns the whole format
+  # once per argument, which would blank-line every bullet apart.
+  printf '\n'
+  printf '%s\n' \
+    '  - For every source file you modified, look beside it for that doc. Where' \
+    '    there is one, rewrite what your change made false, leave standing what is' \
+    '    still true, and restamp its frontmatter in the same edit: `code.commit` to' \
+    '    `git rev-parse --short HEAD`, `code.content_hash` to the output of `okf' \
+    '    hash <the source>` stored verbatim and quoted, `generated.at` to `date -u' \
+    '    +%Y-%m-%dT%H:%M:%SZ`, `status: draft`, and delete any `stale_after`. Carry' \
+    '    every other key across untouched.'
+
+  # The one line the flags actually change. With --model the actor is settled
+  # here, because ralph knows it and a prompt that hands over a template invites
+  # the literal `<model>` being written into a file. Without it, claude is
+  # running as its own default and ralph cannot name it, so the attempt is asked
+  # for the substitution and told plainly not to leave the placeholder behind.
+  if [ -n "$model" ]; then
+    printf '%s\n' \
+      "  - Stamp \`generated.by: ralph/$model\` — that exact string. ralph is running" \
+      '    this attempt with that model, and prose written unattended by this loop is' \
+      '    stamped `ralph/<model>` and never `claude-code/<model>`, which belongs to' \
+      '    prose written with a person watching.'
+  else
+    printf '%s\n' \
+      '  - Stamp `generated.by: ralph/<model>`, with the model you are actually' \
+      '    running as substituted in — `ralph/opus-5`, say. ralph was given no' \
+      '    --model, so it cannot name yours for you; never leave the literal' \
+      '    `<model>` in the file. Prose written unattended by this loop is stamped' \
+      '    `ralph/<model>` and never `claude-code/<model>`, which belongs to prose' \
+      '    written with a person watching.'
+  fi
+
+  printf '%s\n' \
+    '  - Never add, edit, remove or reorder a `verified:` entry, and never run `okf' \
+    '    verify`. Such an entry records that a named actor read this concept at an' \
+    '    instant; you are an unattended loop and cannot be that actor for prose you' \
+    '    have just written. Copy any block that is already there across byte for' \
+    '    byte. This refresh is safe to run unattended precisely because it cannot' \
+    '    forge review.' \
+    '  - A source you changed with no concept beside it has nothing to refresh:' \
+    '    leave it. Authoring one from nothing is /okf-generate'"'"'s and is not part of' \
+    '    the task above.' \
+    '  - Commit the refreshed docs together with the code change itself, in the one' \
+    '    commit, so no revision of this repository holds a source and a concept that' \
+    '    disagree.' \
+    '  - This is upkeep on what you were already changing and never a task of its' \
+    '    own: it does not widen the item above, it is never a reason to edit a' \
+    '    source, and if a doc cannot be refreshed, commit the code anyway and say so' \
+    '    in the commit message rather than leaving the work uncommitted.'
+  printf '\n%s\n' \
+    '`/okf-refresh` is these same rules in full, if that command is installed here.'
+}
+
 # Sourced rather than executed — which is how tests/toolkit.sh calls the helpers
 # above directly, the same way it sources bin/okf — stop here. Everything below
 # this line is one run of the loop: it reads a command line, writes into
@@ -562,6 +654,17 @@ mvn_item_fields() {
 MODEL_FLAG=()
 [[ -n "$MODEL" ]] && MODEL_FLAG=(--model "$MODEL")
 
+# SPEC.md §11's refresh instruction. Built once, unlike the concept docs above
+# it: this section is a function of the command line and of whether okf is
+# installed, neither of which moves while the loop runs, and rebuilding it per
+# attempt would only invite it drifting from one attempt to the next. Empty when
+# okf is absent, which leaves the prompt below exactly the prompt ralph has
+# always sent. [mvn] items never reach it — they spawn no LLM at all.
+REFRESH_BLOCK="$(concept_refresh_prompt "$MODEL")"
+if [[ -n "$REFRESH_BLOCK" ]]; then
+  REFRESH_BLOCK=$'\n'"$REFRESH_BLOCK"$'\n'
+fi
+
 echo "ralph: starting. $(remaining_items) unchecked item(s) in $PLAN." | tee -a "$RUN_LOG"
 
 ITEMS_DONE=0
@@ -650,7 +753,7 @@ $CONCEPT_BLOCK
 $REVIEW_STEP
 5. If everything in steps 3-4 that applies is clean: check off this item in $PLAN (change its '- [ ] $ITEM_TEXT' to '- [x] $ITEM_TEXT'), and commit everything with a specific message. This repo may also have a SPEC.md — the Design Reference this task's item may point to. Treat SPEC.md as strictly read-only: never edit it, and never check anything off in it. All checklist state belongs only in $PLAN.
 6. If it does NOT pass after your best effort this attempt: commit whatever partial progress is safe to commit, with a clear message describing exactly what you tried, what's still failing (test failures or unresolved review findings), so the next attempt isn't starting from zero. Do NOT check off the item.
-
+$REFRESH_BLOCK
 Work on ONLY this task. Do not start any other item, do not refactor unrelated code."
 
       claude -p "$PROMPT" --permission-mode auto "${MODEL_FLAG[@]}" > "$LOG_FILE" 2>&1 || true

@@ -10862,6 +10862,138 @@ test_ralph_leaves_out_a_concept_too_large_for_one_prompt() {
   with_fixture_repo items _ralph_oversized_concept_probe
 }
 
+# ---------------------------------------------------------------------------
+# bin/ralph: the refresh instruction an attempt's prompt carries (SPEC.md §11)
+# ---------------------------------------------------------------------------
+
+# The other half of what SPEC.md §11 asks of ralph: the docs go into the prompt,
+# and what the attempt changed comes back out in the same commit. This section
+# is the instruction that asks for it, obtained by sourcing bin/ralph and
+# calling concept_refresh_prompt the way the sections above call its siblings.
+#
+# The model is an argument rather than an environment variable because it is one
+# in ralph too: the run passes whatever --model it was given, and the two
+# answers — a settled actor, or the substitution the attempt has to make itself
+# — are the only thing on this section's command line that changes it.
+#
+# Same replaced PATH as the sections above, for the same reason: "okf is not
+# installed" is only honestly staged by an okf that is on no PATH at all.
+_ralph_refresh_block() { # $1 = with-okf | without-okf, $2 = the model, may be empty
+  local mode="$1" model="$2" bindir probe
+  bindir="$(_ralph_mode_bindir "$mode")"
+
+  probe="$HARNESS_STATE/ralph-refresh-probe.sh"
+  if [ ! -f "$probe" ]; then
+    cat > "$probe" <<'PROBE'
+#!/usr/bin/env bash
+ralph="$1"
+model="$2"
+# Cleared before the source: a sourced script sees its caller's positional
+# parameters, and bin/ralph's own flag parsing must never be handed these.
+set --
+# shellcheck source=/dev/null
+. "$ralph"
+concept_refresh_prompt "$model"
+PROBE
+  fi
+
+  PATH="$bindir" bash "$probe" "$TOOLKIT_ROOT/bin/ralph" "$model"
+}
+
+_ralph_refresh_block_probe() {
+  local block
+
+  assert_exit 0 _ralph_refresh_block with-okf ""
+  block="$(last_output)"
+
+  # What the instruction is for. An attempt that changed a documented source and
+  # left the doc behind is the case the whole of §11 exists to prevent: the next
+  # attempt is handed that doc as orientation, by the section above, and works
+  # from prose that stopped being true at the previous commit.
+  assert_contains "$block" "For every source file you modified" \
+    "the attempt is told to refresh the concept of everything it changed"
+  assert_contains "$block" "in the same directory under the same stem with a .md" \
+    "and where the doc it must refresh sits"
+  assert_contains "$block" "Commit the refreshed docs together with the code change itself" \
+    "and that they go in with that change, in one commit"
+
+  # SPEC.md §11's two pinned facts. The actor separates prose an unattended loop
+  # wrote from prose someone was sitting in front of, and the prohibition is
+  # what makes the unattended refresh safe at all: a loop that could append a
+  # verified entry would make SPEC.md §8's trust tiers mean nothing.
+  assert_contains "$block" 'generated.by: ralph/' \
+    "the prose it writes is stamped as ralph's"
+  assert_contains "$block" "Never add, edit, remove or reorder a \`verified:\` entry" \
+    "and never gains a verified entry"
+  assert_contains "$block" "never run \`okf" \
+    "nor is the command that would append one to be run"
+
+  # Not the neighbouring actor string. `claude-code/<model>` is named here only
+  # to be ruled out, so a check for the substring alone would pass on a prompt
+  # that told the attempt to use it.
+  _refute_contains "$block" 'generated.by: claude-code/' \
+    "and never as claude-code's"
+
+  # Refreshing is not authoring: a source with no concept beside it is
+  # /okf-generate's, and writing one here would widen the checklist item into
+  # documenting files nobody asked about.
+  assert_contains "$block" "has nothing to refresh" \
+    "a changed source with no concept is left alone"
+}
+
+test_ralph_tells_an_attempt_to_refresh_what_it_changed() {
+  with_fixture_repo items _ralph_refresh_block_probe
+}
+
+_ralph_refresh_actor_probe() {
+  local block
+
+  # With --model, ralph knows the actor and settles it here. A prompt that
+  # handed over the template instead would invite the literal `<model>` being
+  # written into a concept, where nothing would ever report it wrong.
+  assert_exit 0 _ralph_refresh_block with-okf "opus-5"
+  block="$(last_output)"
+  assert_contains "$block" 'generated.by: ralph/opus-5' \
+    "--model settles the actor string in the prompt itself"
+  _refute_contains "$block" 'generated.by: ralph/<model>' \
+    "so no placeholder is left for the attempt to fill in"
+
+  # Without it, claude runs as its own default and ralph cannot name it, so the
+  # substitution is asked for explicitly — and the placeholder is explicitly not
+  # to be left behind.
+  assert_exit 0 _ralph_refresh_block with-okf ""
+  block="$(last_output)"
+  assert_contains "$block" 'generated.by: ralph/<model>' \
+    "with no --model the actor carries a placeholder"
+  assert_contains "$block" "with the model you are actually" \
+    "which the attempt is told to substitute for itself"
+  assert_contains "$block" "never leave the literal" \
+    "and told not to leave the placeholder in the file"
+}
+
+test_ralph_stamps_refreshed_prose_as_ralph_over_the_running_model() {
+  with_fixture_repo items _ralph_refresh_actor_probe
+}
+
+_ralph_refresh_without_okf_probe() {
+  # SPEC.md §11's silent skip, and silent in both directions: nothing for the
+  # attempt and nothing on stderr either, since last_output holds both streams.
+  # On a machine without okf there is no bundle to keep in step and no `okf
+  # hash` to restamp with, so an instruction to refresh concepts would only send
+  # the attempt hunting for files that are not there.
+  assert_exit 0 _ralph_refresh_block without-okf ""
+  assert_eq "" "$(last_output)" \
+    "no okf, no refresh instruction and no complaint about its absence"
+
+  assert_exit 0 _ralph_refresh_block without-okf "opus-5"
+  assert_eq "" "$(last_output)" \
+    "and naming a model does not conjure one"
+}
+
+test_ralph_says_nothing_about_concepts_when_okf_is_absent() {
+  with_fixture_repo items _ralph_refresh_without_okf_probe
+}
+
 # --- a whole ralph attempt, with claude and mvn stood in for -----------------
 
 # The stand-ins bin/ralph spawns during a run. `claude` records the prompt it
@@ -11057,6 +11189,65 @@ _ralph_mvn_untouched_probe() {
 
 test_ralph_mvn_items_are_untouched_by_the_concept_injection() {
   with_fixture_repo items _ralph_mvn_untouched_probe
+}
+
+_ralph_prompt_refresh_probe() {
+  local item='Extend install.sh with a shell helper. Verify: ./tests/toolkit.sh'
+  local prompt
+  _ralph_write_plan "$item"
+
+  assert_exit 2 _ralph_run --max-attempts 1
+  prompt="$(_ralph_captured_prompt)"
+
+  assert_contains "$prompt" "For every source file you modified" \
+    "a real attempt is told to refresh the concepts of what it changed"
+  assert_contains "$prompt" 'generated.by: ralph/<model>' \
+    "stamped as ralph's, the model left for the attempt to fill in"
+  assert_contains "$prompt" "Never add, edit, remove or reorder a \`verified:\` entry" \
+    "and never allowed a verified entry"
+
+  # Below the numbered steps and above the closing line: it is upkeep on the
+  # commit steps 5 and 6 make, so it has to be read after them, and it must not
+  # have displaced the last line of the prompt either.
+  assert_contains "${prompt%%CONCEPT UPKEEP*}" "6. If it does NOT pass" \
+    "the instruction sits below the numbered steps"
+  assert_contains "$prompt" "$(printf 'installed here.\n\nWork on ONLY this task.')" \
+    "and above the closing line, which still closes the prompt"
+
+  # This item names one source and the attempt may touch several, so the
+  # instruction is about what the attempt modified and not about what the item
+  # named. The concepts pasted in above it are the other way round, and both
+  # must reach the same prompt.
+  assert_contains "$prompt" "----- BEGIN CONCEPT install.md #" \
+    "the item's concepts are still injected alongside it"
+}
+
+test_ralph_asks_a_real_attempt_to_refresh_the_concepts_it_touches() {
+  with_fixture_repo items _ralph_prompt_refresh_probe
+}
+
+_ralph_prompt_refresh_model_probe() {
+  local prompt
+  _ralph_write_plan 'Rewrite src/helper.ts, which nothing documents. Verify: ./tests/toolkit.sh'
+
+  # An item whose sources have no concepts still gets the instruction: the
+  # attempt may modify a documented file this item never named, and a doc left
+  # behind is a doc the next attempt is handed as truth.
+  assert_exit 2 _ralph_run --max-attempts 1 --model opus-5
+  prompt="$(_ralph_captured_prompt)"
+
+  _refute_contains "$prompt" "CONCEPT DOCS" \
+    "an item whose sources have no concepts still carries no pasted docs"
+  assert_contains "$prompt" "For every source file you modified" \
+    "but is still told to refresh whatever it does change"
+  assert_contains "$prompt" 'generated.by: ralph/opus-5' \
+    "with the model ralph was run with already in the actor string"
+  _refute_contains "$prompt" 'ralph/<model>`, with the model you are actually' \
+    "and nothing left for the attempt to substitute"
+}
+
+test_ralph_puts_the_run_s_model_in_the_actor_it_asks_for() {
+  with_fixture_repo items _ralph_prompt_refresh_model_probe
 }
 
 # --- add new test_* functions above this line ------------------------------
