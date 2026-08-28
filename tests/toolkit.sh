@@ -8260,6 +8260,359 @@ test_okf_trust_tier_answers_for_an_unverified_concept() {
 }
 
 # ---------------------------------------------------------------------------
+# okf chunk (SPEC.md §4, §9)
+# ---------------------------------------------------------------------------
+
+# okf chunk's stdout, its stderr and its exit status, kept apart for the reason
+# _okf_verify keeps verify's apart: the JSON array is stdout, the reason a
+# concept could not be split is stderr, and the status says which happened.
+OKF_CHUNK_OUT=""
+OKF_CHUNK_ERR=""
+OKF_CHUNK_RC=0
+_okf_chunk() { # $1.. = arguments after `chunk`
+  local stderr="$HARNESS_STATE/okf-chunk-stderr"
+  : > "$stderr"
+  # `${1+"$@"}` and not a bare `"$@"`: this is called with no arguments at all —
+  # `okf chunk` on its own is one of the refusals below — and an empty `"$@"`
+  # under `set -u` aborts the whole run on bash 3.2.
+  OKF_CHUNK_OUT="$("$TOOLKIT_ROOT/bin/okf" chunk ${1+"$@"} 2> "$stderr")"
+  OKF_CHUNK_RC=$?
+  OKF_CHUNK_ERR="$(cat "$stderr" 2> /dev/null)"
+  return 0
+}
+
+# The one JSON array okf chunk printed, compacted, in OKF_CHUNK_JSON.
+#
+# Parsed with `jq -s` and checked to be exactly one document, which is
+# _okf_check_json's guard and is here for the same reason: a subcommand that
+# printed two arrays, or an array followed by a stray line, would satisfy every
+# `assert_contains` below while emitting something no caller could read.
+OKF_CHUNK_JSON=""
+_okf_chunk_json() { # $1.. = arguments after `chunk`
+  _okf_chunk "$@"
+  OKF_CHUNK_JSON=""
+
+  local slurped
+  if ! slurped="$(printf '%s\n' "$OKF_CHUNK_OUT" | jq -s -c . 2> /dev/null)"; then
+    local -a detail=("okf chunk $* did not print JSON" "stdout:")
+    local line
+    while IFS= read -r line; do detail+=("$line"); done < <(_detail_lines "$OKF_CHUNK_OUT")
+    detail+=("stderr:")
+    while IFS= read -r line; do detail+=("$line"); done < <(_detail_lines "$OKF_CHUNK_ERR")
+    _fail "okf chunk $* prints one JSON document" "${detail[@]}"
+    return 1
+  fi
+
+  local count
+  count="$(printf '%s\n' "$slurped" | jq -c 'length')"
+  if [ "$count" != "1" ]; then
+    _fail "okf chunk $* prints one JSON document" \
+      "stdout parsed as $count JSON documents, not one" "stdout:" "$OKF_CHUNK_OUT"
+    return 1
+  fi
+
+  OKF_CHUNK_JSON="$(printf '%s\n' "$slurped" | jq -c '.[0]')"
+  return 0
+}
+
+# One field off every chunk in the array, in order, one per line — the shape
+# every ordering assertion below is made against.
+_okf_chunk_column() { # $1 = a field name
+  printf '%s\n' "$OKF_CHUNK_JSON" | jq -r --arg key "$1" '.[] | .[$key]'
+}
+
+# One field off one chunk, by position.
+_okf_chunk_field() { # $1 = an index, $2 = a field name
+  printf '%s\n' "$OKF_CHUNK_JSON" \
+    | jq -r --argjson i "$1" --arg key "$2" '.[$i] | .[$key] // ""'
+}
+
+# PLAN.md's Phase 9 chunking item, first half: a Tier 1 concept carrying several
+# methods.
+#
+# tests/fixtures/chunks/src/kitchen/Router.md is SPEC.md §4's Tier 1 body in
+# full — `# Responsibilities` and `# Collaborators`, then `# Methods` with a
+# `## <signature>` per member — which is the shape the table in §4 is written
+# for.
+_okf_chunk_methods_probe() {
+  _okf_chunk_json src/kitchen/Router || return 1
+
+  assert_eq "0" "$OKF_CHUNK_RC" "okf chunk exits 0 on a concept it could split"
+  assert_eq "" "$OKF_CHUNK_ERR" "and says nothing on stderr"
+
+  # SPEC.md §9's order, which is also the order a reader wants them in: what the
+  # concept is, then each thing it does.
+  assert_eq "$(printf '%s\n' summary method method method)" \
+    "$(_okf_chunk_column chunk_kind)" \
+    "the body splits into one summary and one method chunk per ## signature"
+
+  # SPEC.md §5's concept ID — the bundle-relative path minus `.md` — on every
+  # chunk, so a point in the index names the concept it came out of.
+  assert_eq "$(printf '%s\n' src/kitchen/Router src/kitchen/Router \
+    src/kitchen/Router src/kitchen/Router)" \
+    "$(_okf_chunk_column concept_id)" \
+    "every chunk carries the concept ID, which is the path minus .md"
+
+  assert_eq "$(printf '%s\n' "" "public void add(String, Handler)" \
+    "public Handler route(String)" "public int size()")" \
+    "$(_okf_chunk_column heading)" \
+    "each method chunk is headed by its own signature, in document order"
+
+  # The summary is both §4 sections and neither method: the headings it is fed
+  # are named in the table, and `# Methods` is a container the table gives no
+  # chunk of its own.
+  local summary
+  summary="$(_okf_chunk_field 0 text)"
+  assert_contains "$summary" "# Responsibilities" \
+    "the summary chunk keeps the Responsibilities heading"
+  assert_contains "$summary" "answers which one serves a" \
+    "and the prose under it"
+  assert_contains "$summary" "# Collaborators" \
+    "the summary chunk folds in the Collaborators section too"
+  assert_contains "$summary" "the key a caller builds a path from" \
+    "and the prose under that"
+  case "$summary" in
+    *"# Methods"*)
+      _fail "the summary chunk leaves out the # Methods heading" \
+        "SPEC.md §4 gives # Methods no chunk of its own — it is the container" \
+        "for the ## headings under it" "summary:" "$summary"
+      ;;
+    *) _pass "the summary chunk leaves out the # Methods heading" ;;
+  esac
+  case "$summary" in
+    *"Registers a handler"*)
+      _fail "the summary chunk holds no method's prose" \
+        "the body of ## public void add(String, Handler) is in the summary" \
+        "summary:" "$summary"
+      ;;
+    *) _pass "the summary chunk holds no method's prose" ;;
+  esac
+
+  # Each method chunk is its own heading and the prose under it, and stops at
+  # the next `## `. A splitter that ran on would put every method in the first
+  # chunk and leave the rest empty.
+  local first second
+  first="$(_okf_chunk_field 1 text)"
+  second="$(_okf_chunk_field 2 text)"
+  assert_eq "## public void add(String, Handler)" \
+    "$(printf '%s\n' "$first" | head -1)" \
+    "a method chunk opens with the ## line that names it"
+  assert_contains "$first" "replacing any handler already registered" \
+    "and carries the prose under that heading"
+  case "$first" in
+    *"public Handler route"*)
+      _fail "a method chunk stops at the next ## heading" \
+        "the add(...) chunk runs on into route(...)" "chunk:" "$first"
+      ;;
+    *) _pass "a method chunk stops at the next ## heading" ;;
+  esac
+  assert_contains "$second" "or the fallback the router was" \
+    "the next method chunk carries its own prose"
+
+  # A class is not a record, so there is no schema section and no schema chunk
+  # invented for it.
+  assert_eq "0" \
+    "$(printf '%s\n' "$OKF_CHUNK_JSON" | jq '[.[] | select(.chunk_kind == "schema")] | length')" \
+    "a concept with no # Schema section yields no schema chunk"
+
+  # SPEC.md §5 takes the ID from where the concept *is*, so the spelling the
+  # caller reached it by cannot change it. SPEC.md §9 builds the Qdrant point ID
+  # out of `{repo}|{concept_id}|...` "so upserts are idempotent and deletes
+  # targeted" — two IDs for one concept would be two points for one concept, and
+  # a delete that cleared neither.
+  _okf_chunk_json ./src/kitchen/Router.md || return 1
+  assert_eq "src/kitchen/Router" "$(_okf_chunk_field 0 concept_id)" \
+    "a ./ prefix is the same concept, and gets the same concept ID"
+  _okf_chunk_json "$PWD/src/kitchen/Router.md" || return 1
+  assert_eq "src/kitchen/Router" "$(_okf_chunk_field 0 concept_id)" \
+    "an absolute path is the same concept, and gets the same concept ID"
+  # And the ID is relative to the root this run is using, which is what -C moves.
+  _okf_chunk_json -C src kitchen/Router || return 1
+  assert_eq "kitchen/Router" "$(_okf_chunk_field 0 concept_id)" \
+    "the ID is bundle-relative, so -C moves what it is relative to"
+  return 0
+}
+
+test_okf_chunk_splits_a_concept_into_summary_and_method_chunks() {
+  _okf_preconditions || return 1
+  with_fixture_repo chunks _okf_chunk_methods_probe
+}
+
+# PLAN.md's Phase 9 chunking item, second half: a record carrying a `# Schema`.
+#
+# `# Schema` is the one heading SPEC.md §4 marks "records/DTOs", and the fixture
+# puts `# Examples` *below* it — which is where a record's examples naturally
+# go, and which is what makes the summary a chunk assembled out of sections that
+# are not adjacent in the file.
+_okf_chunk_schema_probe() {
+  _okf_chunk_json src/kitchen/RouteKey || return 1
+
+  assert_eq "0" "$OKF_CHUNK_RC" "okf chunk exits 0 on a record it could split"
+  assert_eq "" "$OKF_CHUNK_ERR" "and says nothing on stderr"
+
+  assert_eq "$(printf '%s\n' summary schema)" "$(_okf_chunk_column chunk_kind)" \
+    "a record with a # Schema section yields a summary and a schema chunk"
+  assert_eq "$(printf '%s\n' src/kitchen/RouteKey src/kitchen/RouteKey)" \
+    "$(_okf_chunk_column concept_id)" \
+    "both chunks carry the record's concept ID"
+
+  local schema summary
+  schema="$(_okf_chunk_field 1 text)"
+  summary="$(_okf_chunk_field 0 text)"
+
+  assert_eq "# Schema" "$(printf '%s\n' "$schema" | head -1)" \
+    "the schema chunk opens with the heading that names it"
+  assert_contains "$schema" "The request path, leading slash included." \
+    "and carries the table under it"
+  assert_contains "$schema" "neither may be null" \
+    "to the end of the section"
+  case "$schema" in
+    *"# Examples"*)
+      _fail "the schema chunk stops at the next # heading" \
+        "the schema chunk runs on into # Examples" "chunk:" "$schema"
+      ;;
+    *) _pass "the schema chunk stops at the next # heading" ;;
+  esac
+
+  # SPEC.md §4 sends `# Examples` to the summary, and it sits below `# Schema`
+  # here: the summary is one chunk made of sections the file does not keep
+  # together.
+  assert_contains "$summary" "# Responsibilities" \
+    "the summary chunk keeps the Responsibilities section"
+  assert_contains "$summary" "# Examples" \
+    "and the Examples section that SPEC.md §4 also sends to the summary"
+  assert_contains "$summary" '{"path": "/health", "verb": "GET"}' \
+    "including the fenced example itself"
+  case "$summary" in
+    *"leading slash included"*)
+      _fail "the summary chunk holds none of the schema" \
+        "the schema table is in the summary as well as in its own chunk" \
+        "summary:" "$summary"
+      ;;
+    *) _pass "the summary chunk holds none of the schema" ;;
+  esac
+  return 0
+}
+
+test_okf_chunk_gives_a_records_schema_section_its_own_chunk() {
+  _okf_preconditions || return 1
+  with_fixture_repo chunks _okf_chunk_schema_probe
+}
+
+# SPEC.md §4 calls these headings "structural, not cosmetic", which cuts both
+# ways: a line inside a fenced code block *looks* like one and is content. A
+# splitter blind to fences would cut a concept along the headings quoted in its
+# own examples — and concepts about a format are exactly the ones that quote
+# them.
+_okf_chunk_fence_probe() {
+  _okf_chunk_json src/kitchen/Fenced || return 1
+
+  assert_eq "0" "$OKF_CHUNK_RC" "okf chunk exits 0 on a body full of fenced headings"
+  assert_eq "$(printf '%s\n' summary method)" "$(_okf_chunk_column chunk_kind)" \
+    "a fenced # Schema line opens no schema chunk"
+  assert_eq "$(printf '%s\n' "" "public String render()")" \
+    "$(_okf_chunk_column heading)" \
+    "and a fenced ## line opens no second method chunk"
+
+  local method summary
+  method="$(_okf_chunk_field 1 text)"
+  summary="$(_okf_chunk_field 0 text)"
+  assert_contains "$method" "# Schema" \
+    "the fenced heading stays in the chunk it was written in"
+  assert_contains "$method" "## public String notAMethod()" \
+    "and so does the fenced ## line"
+  assert_contains "$method" "Everything between those fences is a string" \
+    "the prose after the closing fence is still that method's"
+
+  # The tilde-fenced block: a backtick fence inside it is content, and the
+  # block closes on a longer run of tildes than opened it.
+  assert_contains "$summary" '~~~' \
+    "the tilde-fenced example survives into the summary"
+  assert_contains "$summary" "# Methods" \
+    "with the heading-shaped line inside it kept as content"
+
+  # And a fence indented under a list item, which is the ordinary shape of a
+  # fenced block inside a bullet — markdown lets a fence be indented, and a
+  # splitter that only saw fences at column 0 would cut this concept on the
+  # `# Schema` inside one.
+  assert_contains "$summary" "## public String alsoNotAMethod()" \
+    "an indented fence is a fence, so the headings inside it stay content"
+  return 0
+}
+
+test_okf_chunk_reads_fenced_headings_as_content() {
+  _okf_preconditions || return 1
+  with_fixture_repo chunks _okf_chunk_fence_probe
+}
+
+_okf_chunk_refusal_probe() {
+  # A markdown file whose frontmatter block was never closed. Everything below
+  # its `---` is unclosed YAML rather than a body, so there is nothing here to
+  # chunk and saying so beats embedding half a frontmatter block.
+  _okf_chunk src/route/Interrupted
+  assert_eq "1" "$OKF_CHUNK_RC" "a concept whose frontmatter never closes is refused"
+  assert_eq "" "$OKF_CHUNK_OUT" "and nothing is printed on stdout"
+  assert_contains "$OKF_CHUNK_ERR" "is not a concept" "with the reason on stderr"
+
+  # Prose that happens to sit beside sources. cmd_verify refuses it for the same
+  # reason and in the same words.
+  _okf_chunk src/route/README.md
+  assert_eq "1" "$OKF_CHUNK_RC" "a markdown file with no frontmatter at all is refused"
+  assert_contains "$OKF_CHUNK_ERR" "is not a concept" "with the reason on stderr"
+
+  _okf_chunk src/route/Nope
+  assert_eq "1" "$OKF_CHUNK_RC" "a concept that is not there is refused"
+  assert_contains "$OKF_CHUNK_ERR" "no such concept" "with the reason on stderr"
+
+  # SPEC.md §4's bundle-absolute spelling, which names no file on disk. The
+  # other spelling is offered rather than silently acted on.
+  _okf_chunk /src/route/RouteSource
+  assert_eq "1" "$OKF_CHUNK_RC" "a bundle-absolute path is refused"
+  assert_contains "$OKF_CHUNK_ERR" "did you mean src/route/RouteSource ?" \
+    "and the filesystem spelling is offered"
+
+  # A directory named like a concept. "No such concept" would read as okf
+  # having failed to see something the caller can see perfectly well.
+  _okf_chunk src/route
+  assert_eq "1" "$OKF_CHUNK_RC" "a directory is refused"
+  assert_contains "$OKF_CHUNK_ERR" "is not a regular file" \
+    "and is named as what it is"
+
+  _okf_chunk
+  assert_eq "1" "$OKF_CHUNK_RC" "chunk with no concept at all is refused"
+  assert_contains "$OKF_CHUNK_ERR" "usage: okf chunk <concept>" "with the usage line"
+
+  # One concept, not a list: the answer is a single JSON array, and there is no
+  # field on a chunk yet that would say which of several concepts it came from.
+  _okf_chunk src/route/RouteSource src/route/Legacy
+  assert_eq "1" "$OKF_CHUNK_RC" "chunk refuses a second concept"
+  assert_contains "$OKF_CHUNK_ERR" "chunk takes one concept" "saying so"
+
+  _okf_chunk --force src/route/RouteSource
+  assert_eq "1" "$OKF_CHUNK_RC" "chunk refuses a flag it does not have"
+  assert_contains "$OKF_CHUNK_ERR" "unknown flag: --force" "naming it"
+
+  # A concept above the root, which SPEC.md §5 has no bundle-relative path for.
+  # Refused rather than answered with a `../` ID: that would name a concept this
+  # bundle does not contain, and would name it differently from every other root
+  # the same file can be reached from.
+  cp src/route/RouteSource.md Outside.md || {
+    _fail "a concept outside the bundle is refused" "could not stage Outside.md"
+    return 1
+  }
+  _okf_chunk -C src ../Outside.md
+  assert_eq "1" "$OKF_CHUNK_RC" "a concept above the root is refused"
+  assert_eq "" "$OKF_CHUNK_OUT" "and nothing is printed on stdout"
+  assert_contains "$OKF_CHUNK_ERR" "is outside the bundle" "with the reason on stderr"
+  return 0
+}
+
+test_okf_chunk_refuses_what_it_cannot_split() {
+  _okf_preconditions || return 1
+  with_fixture_repo concepts _okf_chunk_refusal_probe
+}
+
+# ---------------------------------------------------------------------------
 # install.sh (PLAN.md Phase 6)
 # ---------------------------------------------------------------------------
 

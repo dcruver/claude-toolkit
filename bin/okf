@@ -5453,6 +5453,125 @@ concept_trust_tier() { # $1 = a concept path
   return 0
 }
 
+# The `<concept>` operand, resolved to the path of a file that is actually
+# there, in OKF_CONCEPT. Dies with the reason when there is no such concept.
+#
+# Shared by every subcommand that names one concept, because the refusals are
+# the useful half of this and a second copy of them is a second place for the
+# "did you mean" to go quietly out of date.
+# SPEC.md §5's concept ID for a concept file: "the bundle-relative path minus
+# `.md`, so concept ID, file path, and link target are the same fact". Left in
+# OKF_CONCEPT_ID.
+#
+# Worked out from where the file *is* rather than from how the caller spelled
+# it, because the spelling is not the caller's answer to anything: `okf chunk
+# src/Router.md`, `okf chunk ./src/Router.md` and `okf chunk
+# /tmp/repo/src/Router.md` all name one concept from one root, and an ID taken
+# from the argument would be three. SPEC.md §9 builds the Qdrant point ID out of
+# `{repo}|{concept_id}|{chunk_kind}|{symbol}` precisely "so upserts are
+# idempotent and deletes targeted" — three IDs for one concept is three points
+# for one concept, and a delete that clears none of them.
+#
+# The root itself does move the ID, and has to: `-C src` says the bundle root is
+# `src`, and §5's "bundle-relative path" is relative to whatever the bundle root
+# is. That is a different bundle, not a different spelling of this one, and §9's
+# `{repo}` is the field that keeps two bundles' IDs apart. What this function
+# rules out is one root answering two ways.
+#
+# The bundle root is the repo root: load_settings refuses any other
+# `bundle.root` outright, and says so.
+#
+# Both sides are resolved with `pwd -P`, physically, so the comparison cannot
+# turn on which of `pwd` and `pwd -P` each side happened to be built with — a
+# symlinked directory component is exactly how one file comes to have two
+# absolute paths, and OKF_ROOT is the logical one.
+OKF_CONCEPT_ID=""
+concept_id_of() { # $1 = a path to a concept file
+  local path="$1" dir base root relative
+
+  dir="${path%/*}"
+  if [ "$dir" = "$path" ]; then
+    dir="."
+  elif [ -z "$dir" ]; then
+    dir="/"
+  fi
+  base="${path##*/}"
+
+  # CDPATH cleared and stderr silenced for the reasons every other cd here is.
+  dir="$(CDPATH= cd -- "$dir" 2> /dev/null && pwd -P)" \
+    || die "cannot resolve the directory holding $path"
+  root="$(CDPATH= cd -- "$OKF_ROOT" 2> /dev/null && pwd -P)" \
+    || die "cannot resolve the repo root: $OKF_ROOT"
+
+  # The root with exactly one trailing slash, which is what makes "below the
+  # root" a prefix test. Spelled out rather than written `"$root"/*` inline
+  # because a root of `/` would make that pattern `//*`, which matches nothing
+  # under it — and every concept in the bundle would be refused as outside it.
+  local prefix="$root"
+  [ "$prefix" = "/" ] || prefix="$root/"
+
+  if [ "$dir" = "$root" ]; then
+    relative="$base"
+  else
+    case "$dir" in
+      "$prefix"*) relative="${dir#"$prefix"}/$base" ;;
+      *)
+        # Outside the bundle, so §5's "bundle-relative path" does not exist for
+        # it. Refused rather than answered with a `../` or an absolute path,
+        # neither of which is an ID: it would name a concept this bundle does
+        # not contain, and it would name it differently from every other root
+        # the same file could be reached from.
+        die "$path is outside the bundle" \
+          "SPEC.md §5 makes a concept ID the bundle-relative path minus .md," \
+          "and a file above the root has no such path" \
+          "the root this run is using is $(display_path "$OKF_ROOT")" \
+          "use -C DIR to run against the root that concept belongs to"
+        ;;
+    esac
+  fi
+
+  OKF_CONCEPT_ID="${relative%.md}"
+}
+
+OKF_CONCEPT=""
+resolve_concept() { # $1 = the subcommand asking, $2 = the operand as typed
+  local sub="$1" given="$2"
+  OKF_CONCEPT=""
+
+  if [ -f "$given" ]; then
+    # The path as typed, which is `<concept>.md` and also the way a `drifted:`
+    # line from `okf check` spells it.
+    OKF_CONCEPT="$given"
+    return 0
+  fi
+  if [ -f "$given.md" ]; then
+    # SPEC.md §5's concept ID: the bundle-relative path minus `.md`.
+    OKF_CONCEPT="$given.md"
+    return 0
+  fi
+
+  # SPEC.md §4 spells path-valued fields bundle-absolute — a leading `/` that
+  # means the bundle root and not the filesystem's — so a `resource` or a
+  # link target handed straight to this names a file that is almost never
+  # there. cmd_hash's line, for cmd_hash's reason: the argument stays a
+  # filesystem path, and the guess is spent on naming the other spelling
+  # rather than on quietly acting for it.
+  local rooted="${given#/}"
+  if [ "$rooted" != "$given" ] && { [ -f "$rooted" ] || [ -f "$rooted.md" ]; }; then
+    die "no such concept: $given" \
+      "paths are read as the filesystem's, not as SPEC.md §4's bundle-absolute form" \
+      "did you mean $rooted ?"
+  fi
+  if [ -e "$given" ]; then
+    # There, and not a regular file: a directory named like a concept, or a
+    # device. "No such concept" would read as okf having failed to see
+    # something the caller can see perfectly well.
+    die "$sub takes a concept file, but $given is not a regular file"
+  fi
+  die "no such concept: $given" \
+    "a concept is a markdown file carrying SPEC.md §4 frontmatter, named <concept>.md"
+}
+
 # okf verify <concept> [--by ACTOR] — append a verified entry
 #
 # SPEC.md §8's trust half, written the only way a shell script honestly can: okf
@@ -5547,36 +5666,9 @@ cmd_verify() {
   # can leave a file half-written.
   require_clock verify
 
-  local given="${rest[0]}" concept=""
-  if [ -f "$given" ]; then
-    # The path as typed, which is `<concept>.md` and also the way a `drifted:`
-    # line from `okf check` spells it.
-    concept="$given"
-  elif [ -f "$given.md" ]; then
-    # SPEC.md §5's concept ID: the bundle-relative path minus `.md`.
-    concept="$given.md"
-  else
-    # SPEC.md §4 spells path-valued fields bundle-absolute — a leading `/` that
-    # means the bundle root and not the filesystem's — so a `resource` or a
-    # link target handed straight to this names a file that is almost never
-    # there. cmd_hash's line, for cmd_hash's reason: the argument stays a
-    # filesystem path, and the guess is spent on naming the other spelling
-    # rather than on quietly acting for it.
-    local rooted="${given#/}"
-    if [ "$rooted" != "$given" ] && { [ -f "$rooted" ] || [ -f "$rooted.md" ]; }; then
-      die "no such concept: $given" \
-        "paths are read as the filesystem's, not as SPEC.md §4's bundle-absolute form" \
-        "did you mean $rooted ?"
-    fi
-    if [ -e "$given" ]; then
-      # There, and not a regular file: a directory named like a concept, or a
-      # device. "No such concept" would read as okf having failed to see
-      # something the caller can see perfectly well.
-      die "verify takes a concept file, but $given is not a regular file"
-    fi
-    die "no such concept: $given" \
-      "a concept is a markdown file carrying SPEC.md §4 frontmatter, named <concept>.md"
-  fi
+  local given="${rest[0]}"
+  resolve_concept verify "$given"
+  local concept="$OKF_CONCEPT"
 
   if [ "$seen_by" -eq 1 ]; then
     if ! is_actor_string "$by"; then
@@ -5632,8 +5724,372 @@ cmd_verify() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Chunking (SPEC.md §4, §9)
+# ---------------------------------------------------------------------------
+
+# The chunks one concept body splits into, filled by split_concept_body: three
+# arrays read in step, one entry per chunk, in the order SPEC.md §9 names them
+# — the summary, then one method chunk per `## ` under `# Methods` in document
+# order, then the schema.
+#
+# Three parallel arrays rather than one array of records because bash has no
+# records, and the alternative — a delimiter packed into one string — would put
+# a separator inside text that is somebody's prose and can contain anything.
+OKF_CHUNK_KIND=()
+OKF_CHUNK_HEADING=()
+OKF_CHUNK_TEXT=()
+
+# The method chunks as they are met, held back until the summary has been
+# recorded. The summary is assembled from sections scattered the length of the
+# body — SPEC.md §4 feeds it `# Responsibilities`, `# Collaborators`,
+# `# Invariants`, `# Failure Modes` and `# Examples`, and `# Examples` commonly
+# sits below `# Methods` — so it is only complete at the end of the file, while
+# SPEC.md §9 names it first.
+OKF_METHOD_HEADING=()
+OKF_METHOD_TEXT=()
+
+# Everything but the blank lines at either end of a block.
+#
+# Either end only. A blank line *between* two paragraphs is the paragraph break,
+# and a chunk that lost those would reach the embedding endpoint as one run-on
+# wall of text.
+OKF_TRIMMED=""
+trim_blank_lines() { # $1 = a block of text
+  local text="$1"
+  # `${text%%$'\n'*}` is the first line and `${text##*$'\n'}` the last; each
+  # loop drops one end line at a time for as long as that end line is empty. A
+  # block with no newline in it at all leaves both patterns unmatched, and so
+  # both loops on their first test, which is the answer for a one-line chunk.
+  while [ -n "$text" ] && [ -z "${text%%$'\n'*}" ]; do
+    text="${text#$'\n'}"
+  done
+  while [ -n "$text" ] && [ -z "${text##*$'\n'}" ]; do
+    text="${text%$'\n'}"
+  done
+  OKF_TRIMMED="$text"
+}
+
+# The run of backticks or tildes a line opens with, when it is three or more of
+# them — markdown's fenced code block — and empty when the line is not one.
+#
+# Fences are tracked because SPEC.md §4's headings are "structural, not
+# cosmetic": they are the chunk boundaries, and a fenced block is the one place
+# in a body where a `# Schema` or a `## something` line is content rather than a
+# boundary. A splitter blind to fences would cut a concept that documents this
+# very format into chunks along the headings in its own examples.
+OKF_FENCE=""
+fence_run() { # $1 = a line, already stripped of its trailing whitespace
+  local line="$1" ch run=""
+  case "$line" in
+    '```'*) ch='`' ;;
+    '~~~'*) ch='~' ;;
+    *)
+      OKF_FENCE=""
+      return 0
+      ;;
+  esac
+  while [ "${line#"$ch"}" != "$line" ]; do
+    run="$run$ch"
+    line="${line#"$ch"}"
+  done
+  OKF_FENCE="$run"
+}
+
+# One chunk onto the three arrays, with the blank lines trimmed off its text.
+#
+# A chunk whose text is empty once trimmed is dropped rather than recorded, and
+# that is the only thing dropped here. Every kind but the summary carries its
+# own heading line inside its text, so the guard is in practice about the one
+# case that has no heading either: a concept with no body at all, which comes
+# back as `[]` rather than as an empty summary shell.
+#
+# A section that is thin rather than empty — a `# Schema` with nothing yet under
+# it, a `## <signature>` with no prose — is kept, deliberately. Chunks are what
+# `okf search` can return, so dropping one hides a section the concept really
+# has: a stub schema would become a record whose schema cannot be found at all,
+# which reads as "there is no schema" rather than as "it has not been written".
+# That is split_concept_body's rule about unnamed prose, applied to thin
+# sections.
+chunk_record() { # $1 = kind, $2 = heading, $3 = text
+  trim_blank_lines "$3"
+  [ -n "$OKF_TRIMMED" ] || return 0
+  OKF_CHUNK_KIND+=("$1")
+  OKF_CHUNK_HEADING+=("$2")
+  OKF_CHUNK_TEXT+=("$OKF_TRIMMED")
+}
+
+# Splits one concept's body on SPEC.md §4's body headings, leaving the result in
+# OKF_CHUNK_KIND, OKF_CHUNK_HEADING and OKF_CHUNK_TEXT.
+#
+#   0  the body was read, and the arrays hold what it split into
+#   1  the file is not a concept — no frontmatter block, or one never closed
+#
+# SPEC.md §4's table gives three destinations and names five headings for the
+# first of them. Everything it sends to `summary` is folded into one chunk;
+# `# Methods` is a container whose own line belongs to no chunk, and each `## `
+# under it is a chunk; `# Schema` is a chunk.
+#
+# A heading the table does not name feeds the summary, and so does prose above
+# the first heading and prose between `# Methods` and its first `## `. That is a
+# deliberate default rather than an omission: the table is a taxonomy for
+# generated concepts, but a bundle is a text file anybody may add a paragraph
+# to, and the alternative to folding unnamed prose into the summary is dropping
+# it — a sentence that is in the concept, is in no chunk, and so cannot be found
+# by the search the chunks exist to feed.
+split_concept_body() { # $1 = a path to a concept file
+  local path="$1" line trimmed stripped indent emit
+  local opened=0 closed=0
+  local fence="" section="summary"
+  local summary="" schema="" method="" method_heading="" method_open=0
+
+  OKF_CHUNK_KIND=()
+  OKF_CHUNK_HEADING=()
+  OKF_CHUNK_TEXT=()
+  OKF_METHOD_HEADING=()
+  OKF_METHOD_TEXT=()
+
+  # Asked before the redirection, for read_frontmatter's reason: a redirection
+  # that fails is a failure of the `while` itself, and under `set -e` that ends
+  # the script instead of returning the 1 the caller is written to handle.
+  if [ ! -f "$path" ] || [ ! -r "$path" ]; then
+    return 1
+  fi
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#$'\xef\xbb\xbf'}"
+    line="${line%$'\r'}"
+
+    # The frontmatter, skipped rather than read: read_frontmatter has already
+    # had the fields out of it. Both ends are still checked, because a file
+    # whose block never closes has no body — everything below the `---` is
+    # unclosed YAML — and chunking it would embed half a frontmatter block.
+    if [ "$opened" -eq 0 ]; then
+      [ "$line" = "---" ] || break
+      opened=1
+      continue
+    fi
+    if [ "$closed" -eq 0 ]; then
+      [ "$line" = "---" ] && closed=1
+      continue
+    fi
+
+    # The line without its trailing whitespace, which is what every comparison
+    # below is made against: `# Methods ` is the same heading as `# Methods`,
+    # and a line of nothing but spaces is a blank line. The line itself is kept
+    # as it came for the chunk text, so two trailing spaces — markdown's hard
+    # line break — survive into what is embedded.
+    trimmed="${line%"${line##*[![:space:]]}"}"
+    [ -n "$trimmed" ] || line=""
+    emit=1
+
+    # The same line with up to three leading spaces taken off, which is what the
+    # fence tests below are made against. Markdown lets a fence sit up to three
+    # spaces in — inside a list item one always does — and stops at three,
+    # because a fourth space makes the line an indented code block instead.
+    #
+    # The heading tests keep the untrimmed `trimmed` and so still want column 0.
+    # That asymmetry is deliberate: an indented line mistaken for a fence leaves
+    # the headings inside it as content, while an indented line mistaken for a
+    # heading cuts a chunk in half. Only one of those two errors loses text, and
+    # SPEC.md §4's own examples put every heading at column 0.
+    stripped="$trimmed"
+    indent=0
+    while [ "$indent" -lt 3 ] && [ "${stripped# }" != "$stripped" ]; do
+      stripped="${stripped# }"
+      indent=$((indent + 1))
+    done
+
+    if [ -n "$fence" ]; then
+      # Inside a fence, so no line here is a heading. Only the fence's own
+      # close is looked for: markdown closes on the same character, at least as
+      # many of them, and nothing else on the line.
+      fence_run "$stripped"
+      if [ -n "$OKF_FENCE" ] && [ "$stripped" = "$OKF_FENCE" ] \
+        && [ "${OKF_FENCE:0:1}" = "${fence:0:1}" ] \
+        && [ "${#OKF_FENCE}" -ge "${#fence}" ]; then
+        fence=""
+      fi
+    else
+      fence_run "$stripped"
+      if [ -n "$OKF_FENCE" ]; then
+        fence="$OKF_FENCE"
+      elif [ "${trimmed#"# "}" != "$trimmed" ] \
+        || { [ "$section" = "methods" ] && [ "${trimmed#"## "}" != "$trimmed" ]; }; then
+        # A boundary: either a top-level heading, which ends whatever section
+        # was open, or a `## ` while `# Methods` is open, which ends the
+        # previous method. Both close the method being accumulated, which is
+        # why the two are one branch and the flush below is written once.
+        if [ "$method_open" -eq 1 ]; then
+          OKF_METHOD_HEADING+=("$method_heading")
+          OKF_METHOD_TEXT+=("$method")
+        fi
+        method=""
+        method_heading=""
+        method_open=0
+
+        case "$trimmed" in
+          "# Methods")
+            section="methods"
+            # The one line in a body that belongs to no chunk. `# Methods` is a
+            # container for the `## ` headings under it, and SPEC.md §4's table
+            # gives it no chunk of its own — putting it in the summary would
+            # announce methods the summary does not contain.
+            emit=0
+            ;;
+          "# Schema") section="schema" ;;
+          "# "*) section="summary" ;;
+          *)
+            method_open=1
+            method_heading="${trimmed#"## "}"
+            while [ "${method_heading# }" != "$method_heading" ]; do
+              method_heading="${method_heading# }"
+            done
+            ;;
+        esac
+      fi
+    fi
+
+    # Blank lines run together outside a fence, because markdown reads any run
+    # of them as one paragraph break and because a line lifted out from between
+    # two of them — `# Methods`, whose own line belongs to no chunk — would
+    # otherwise leave the gap it came from behind in the summary. Inside a
+    # fence they are kept every one, being somebody's code.
+    if [ "$emit" -eq 1 ] && [ -z "$fence" ] && [ -z "$line" ]; then
+      local so_far=""
+      case "$section" in
+        methods)
+          if [ "$method_open" -eq 1 ]; then so_far="$method"; else so_far="$summary"; fi
+          ;;
+        schema) so_far="$schema" ;;
+        *) so_far="$summary" ;;
+      esac
+      # Nothing yet, or a blank line already at the end of it.
+      if [ -z "$so_far" ] || [ "${so_far%$'\n\n'}" != "$so_far" ]; then
+        emit=0
+      fi
+    fi
+
+    [ "$emit" -eq 1 ] || continue
+    case "$section" in
+      methods)
+        if [ "$method_open" -eq 1 ]; then
+          method="$method$line"$'\n'
+        else
+          summary="$summary$line"$'\n'
+        fi
+        ;;
+      schema) schema="$schema$line"$'\n' ;;
+      *) summary="$summary$line"$'\n' ;;
+    esac
+  done 2> /dev/null < "$path"
+
+  if [ "$opened" -eq 0 ] || [ "$closed" -eq 0 ]; then
+    return 1
+  fi
+
+  # The last method, which has no heading after it to close it.
+  if [ "$method_open" -eq 1 ]; then
+    OKF_METHOD_HEADING+=("$method_heading")
+    OKF_METHOD_TEXT+=("$method")
+  fi
+
+  chunk_record summary "" "$summary"
+  local i=0 methods="${#OKF_METHOD_TEXT[@]}"
+  while [ "$i" -lt "$methods" ]; do
+    chunk_record method "${OKF_METHOD_HEADING[$i]}" "${OKF_METHOD_TEXT[$i]}"
+    i=$((i + 1))
+  done
+  chunk_record schema "" "$schema"
+  return 0
+}
+
 # okf chunk <concept> — Tier B: emit JSON chunks for one concept
-cmd_chunk() { not_implemented chunk; }
+#
+# Local work, and no HTTP: see OKF_HTTP_SUBCOMMANDS for why this one is Tier B
+# without being one of the subcommands that needs curl.
+cmd_chunk() {
+  local usage="usage: okf chunk <concept>"
+  local endflags=0
+  local -a rest=()
+
+  # cmd_verify's loop without its `--by`: flags are still read across the whole
+  # line, because SPEC.md §7's global -C and --config may follow the operand and
+  # a parser that stopped at the first non-flag would refuse them here.
+  while [ $# -gt 0 ]; do
+    if [ "$endflags" -eq 1 ]; then
+      rest+=("$1")
+      shift
+      continue
+    fi
+    case "$1" in
+      --) endflags=1 ;;
+      -*) die "chunk: unknown flag: $1" "$usage" ;;
+      *) rest+=("$1") ;;
+    esac
+    shift
+  done
+
+  local count="${#rest[@]}"
+  [ "$count" -gt 0 ] || die "chunk needs a concept to split" "$usage"
+  # One concept, for cmd_verify's reason turned around: the answer here is a
+  # single JSON array, and a run over several would have to decide whether that
+  # array is the chunks of all of them — one document whose entries no longer
+  # say which concept each came from — or several arrays, which is not one
+  # document at all. A caller who wants several has a loop.
+  [ "$count" -eq 1 ] || die "chunk takes one concept, but was given $count: ${rest[*]}" \
+    "$usage"
+
+  resolve_concept chunk "${rest[0]}"
+  local concept="$OKF_CONCEPT"
+
+  # A markdown file is not a concept until it carries SPEC.md §4's block, and
+  # asking read_frontmatter is how the rest of okf decides that. It is asked
+  # here for the refusal rather than for the fields: everything this emits comes
+  # out of the body alone.
+  read_frontmatter "$concept" \
+    || die "$concept is not a concept" \
+      "a concept opens with --- on line 1 and closes with the next line that is exactly ---" \
+      "SPEC.md §4 calls that layout a contract rather than a preference"
+
+  split_concept_body "$concept" \
+    || die "$concept: its body could not be read, so there are no chunks to emit"
+
+  concept_id_of "$concept"
+  local concept_id="$OKF_CONCEPT_ID"
+
+  local total="${#OKF_CHUNK_KIND[@]}"
+  if [ "$total" -eq 0 ]; then
+    # A body with nothing in it. `[]` and not silence, for the reason
+    # `check --json` spells out at length: a caller parsing this is running jq,
+    # and jq given an empty stream fails rather than reporting an empty answer.
+    printf '[]\n'
+    return 0
+  fi
+
+  # The three arrays flattened into one NUL-separated stream and put back
+  # together by jq, which is json_string_array's trick for its reason: a chunk's
+  # text is somebody's prose and may hold quotes, backslashes, tabs and
+  # newlines, and NUL is the one byte `read` cannot have left in it.
+  local -a fields=()
+  local i=0
+  while [ "$i" -lt "$total" ]; do
+    fields+=("${OKF_CHUNK_KIND[$i]}" "${OKF_CHUNK_HEADING[$i]}" "${OKF_CHUNK_TEXT[$i]}")
+    i=$((i + 1))
+  done
+
+  # `heading` is empty for the summary and the schema on purpose. There is one
+  # of each per concept, so neither needs telling apart from a sibling; a method
+  # chunk does, and its `## ` line is the signature that does it.
+  printf '%s\0' "${fields[@]}" | jq -Rs --arg concept_id "$concept_id" '
+      split("\u0000")[:-1] as $f
+      | [ range(0; ($f | length); 3)
+          | { concept_id: $concept_id,
+              chunk_kind: $f[.],
+              heading: $f[. + 1],
+              text: $f[. + 2] } ]
+    ' || die "the chunks for $concept could not be rendered as JSON"
+}
 
 # okf embed [--all] — Tier B: embed and upsert to Qdrant
 cmd_embed() { not_implemented embed; }
