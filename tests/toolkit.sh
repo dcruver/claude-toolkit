@@ -9186,6 +9186,431 @@ test_install_sh_announces_every_command() {
     sed 's|^/||' | sort -u)
 }
 
+# SPEC.md §6's tier thresholds, by name, read back out of its okf.json block
+# rather than restated here: /okf-generate makes its tier decision against these
+# exact keys, so one renamed in the spec and not in the command leaves the
+# command reading a setting nothing ever writes.
+_okf_spec_tier_threshold_keys() {
+  _okf_spec_config_json | jq -r '.tiers // {} | keys[]' 2> /dev/null
+}
+
+# SPEC.md §4's reserved OKF filenames, read back out of the paragraph that
+# declares them. A source file's stem can land on one of these — scope is by
+# extension, so `index.ts` and `log.ts` are ordinary in-scope sources — and the
+# concept written at `<stem>.md` would then sit where the per-directory
+# `type: Package` index belongs, or where OKF's own `log.md` semantics do.
+_okf_spec_reserved_filenames() {
+  awk '
+    /^## 4\./ { in_section = 1; next }
+    in_section && /^## / { exit }
+    in_section && /^Reserved OKF filenames:/ { in_para = 1 }
+    in_para && /^$/ { exit }
+    in_para {
+      n = split($0, part, "`")
+      # Backticks come in pairs, so the quoted spans are the even indices.
+      for (i = 2; i <= n; i += 2) if (part[i] ~ /\.md$/) print part[i]
+    }
+  ' "$TOOLKIT_ROOT/SPEC.md" | sort -u
+}
+
+# A commands/*.md with its frontmatter block cut off. Checks about the
+# instructions read this rather than the whole file: a command's `description`
+# summarises what it does, so a grep over the whole file goes on passing with
+# every instruction below it deleted.
+_command_body() { # $1 = path to a commands/*.md
+  awk '{ sub(/\r$/, "") }
+       NR == 1 && $0 == "---" { in_front = 1; next }
+       in_front && $0 == "---" { in_front = 0; next }
+       !in_front { print }' "$1"
+}
+
+# The first fenced ```yaml block in a document, fences excluded.
+_first_yaml_block() { # $1 = path
+  awk '{ sub(/\r$/, "") }
+       !in_block && /^```yaml$/ { in_block = 1; next }
+       in_block && /^```$/ { exit }
+       in_block { print }' "$1"
+}
+
+# Grounds the reserved-filename rule in commands/okf-generate.md: a source whose
+# stem is one of SPEC.md §4's reserved names really is reported as work to do,
+# so the collision that rule exists for is one a run actually meets. Without
+# this the rule is a paragraph about a case that might never arise, and a
+# rewrite could drop it with nothing to say so.
+_okf_reserved_stem_probe() { # $@ = reserved filenames from SPEC.md §4
+  local okf="$TOOLKIT_ROOT/bin/okf" reserved stem missing
+  for reserved in "$@"; do
+    stem="${reserved%.md}"
+    printf 'export const x = 1\n' > "src/$stem.ts" || return 1
+  done
+  # Scope comes from git ls-files, so an uncommitted file is invisible to okf
+  # however well it matches the globs — the listing would be empty for a reason
+  # that has nothing to do with what is being checked.
+  git add src > /dev/null 2>&1 || return 1
+  git commit -qm 'sources whose stems are reserved names' > /dev/null 2>&1 || return 1
+
+  missing="$("$okf" list --missing 2> /dev/null)"
+  for reserved in "$@"; do
+    stem="${reserved%.md}"
+    if printf '%s\n' "$missing" | grep -Fqx "src/$stem.ts"; then
+      _pass "okf list --missing reports src/$stem.ts, whose stem is reserved"
+    else
+      _fail "okf list --missing reports src/$stem.ts, whose stem is reserved" \
+        "the collision commands/okf-generate.md's naming rule exists for does" \
+        "not arise here, so nothing checks that rule"
+    fi
+  done
+
+  # And the reason that rule has to be "skip it" rather than "write it under
+  # another name": has_concept deliberately matches only `<stem>.md`, which is
+  # the one name reserved out from under these sources. A concept written at
+  # SPEC.md §5's additional-type spelling is a real file that takes the source
+  # off nobody's list, so a command that invented one would write it again on
+  # every run, for good.
+  for reserved in "$@"; do
+    stem="${reserved%.md}"
+    printf -- '---\ntype: Module\ntitle: %s\nresource: /src/%s.ts\nstatus: draft\n---\n' \
+      "$stem" "$stem" > "src/$stem.Router.md" || return 1
+  done
+  git add src > /dev/null 2>&1 || return 1
+  git commit -qm 'concepts under the disambiguating name' > /dev/null 2>&1 || return 1
+
+  missing="$("$okf" list --missing 2> /dev/null)"
+  for reserved in "$@"; do
+    stem="${reserved%.md}"
+    if printf '%s\n' "$missing" | grep -Fqx "src/$stem.ts"; then
+      _pass "a concept at src/$stem.Router.md still leaves src/$stem.ts undocumented"
+    else
+      _fail "a concept at src/$stem.Router.md still leaves src/$stem.ts undocumented" \
+        "bin/okf now takes a reserved-stem source off okf list --missing when a" \
+        "<stem>.<TypeName>.md sits beside it, so commands/okf-generate.md should" \
+        "write that file rather than skipping the source"
+    fi
+  done
+  return 0
+}
+
+# Grounds the interrupted-write rule in commands/okf-generate.md. `has_concept`
+# requires SPEC.md §4 frontmatter, so a file that opens like a concept and stops
+# does not count as one and its source stays on the work list — which is what
+# makes "overwrite that one" right, and a blanket "skip any file that is already
+# there" wrong: nothing else can reach such a file, since `okf check` needs the
+# same closed frontmatter before it will call a concept drifted.
+_okf_interrupted_write_probe() {
+  local okf="$TOOLKIT_ROOT/bin/okf" missing
+
+  printf 'export const half = 1\n' > src/half.ts || return 1
+  # Opens like a concept and stops: no closing `---`.
+  printf -- '---\ntype: Module\ntitle: half\n' > src/half.md || return 1
+  git add src > /dev/null 2>&1 || return 1
+  git commit -qm 'an interrupted concept write' > /dev/null 2>&1 || return 1
+
+  missing="$("$okf" list --missing 2> /dev/null)"
+  if printf '%s\n' "$missing" | grep -Fqx src/half.ts; then
+    _pass "an interrupted concept write leaves its source on okf list --missing"
+  else
+    _fail "an interrupted concept write leaves its source on okf list --missing" \
+      "bin/okf now counts a file with unclosed frontmatter as a concept, so the" \
+      "re-run commands/okf-generate.md tells you to finish it with would never" \
+      "be offered the source"
+  fi
+  return 0
+}
+
+# SPEC.md §11 again, for the command that does the authoring. The division of
+# labour in §1 puts the numbers on the shell's side and the prose on Claude's,
+# so what is pinned here is the seam: the `okf` calls it makes, the SPEC.md §5
+# tier rules it decides by, and the SPEC.md §4 frontmatter contract the files it
+# writes have to obey — asserted by running bin/okf's own reader over the
+# skeleton the document tells the reader to copy, since a template the shell
+# cannot parse is a whole repo of concepts `okf check` cannot see.
+#
+# The frontmatter of the document itself is checked for every command file by
+# test_commands_have_frontmatter_description; only what is specific to this one
+# is asserted here.
+test_okf_generate_command_authors_tiered_concepts() {
+  local doc="$TOOLKIT_ROOT/commands/okf-generate.md"
+  if [ ! -f "$doc" ]; then
+    _fail "commands/okf-generate.md exists" "no such file: $doc"
+    return 1
+  fi
+  _okf_preconditions || return 1
+
+  local body_text
+  body_text="$(_command_body "$doc")"
+  if [ -z "$body_text" ]; then
+    _fail "commands/okf-generate.md has a body below its frontmatter" \
+      "nothing follows the frontmatter block in $doc"
+    return 1
+  fi
+
+  # It narrows its run with $ARGUMENTS, and SPEC.md §11 asks for an
+  # argument-hint from any command that takes arguments — it is what Claude
+  # Code shows the user at the prompt, so an undocumented argument is an
+  # invisible one. CR stripped first, as the sibling frontmatter check does.
+  if grep -q '\$ARGUMENTS' "$doc"; then
+    if awk '{ sub(/\r$/, "") }
+            NR == 1 && $0 != "---" { exit 1 }
+            NR > 1 && $0 == "---" { exit 1 }
+            NR > 1 && /^argument-hint:[[:space:]]*[^[:space:]]/ { found = 1; exit 0 }
+            END { exit found ? 0 : 1 }' "$doc"; then
+      _pass "commands/okf-generate.md documents its arguments with an argument-hint"
+    else
+      _fail "commands/okf-generate.md documents its arguments with an argument-hint" \
+        "it takes \$ARGUMENTS but its frontmatter has no non-empty" \
+        "argument-hint line"
+    fi
+  fi
+
+  # The three shell calls this command exists to sit on top of: what to
+  # document, the ranking signal that tiers it, and the digest `okf check`
+  # will later compare against.
+  assert_contains "$body_text" 'okf list --missing' \
+    "it takes its work list from okf list --missing"
+  assert_contains "$body_text" 'okf fanin' \
+    "it calls okf fanin for the ranking signal"
+  assert_contains "$body_text" 'okf hash' \
+    "it takes code.content_hash from okf hash"
+
+  # Every subcommand it names has to be one bin/okf actually dispatches, and
+  # one that is not still a stub. Same collection rule as the /okf-init check:
+  # only backticked `okf <name>` mentions, in either voice, because a
+  # prohibition written as code is still a name a reader may go and run.
+  local -a named=()
+  local sub
+  while IFS= read -r sub; do
+    [ -n "$sub" ] && named+=("$sub")
+  done < <(printf '%s\n' "$body_text" | grep -oE '`okf [a-z][a-z-]*' |
+    awk '{print $2}' | sort -u)
+  if [ "${#named[@]}" -eq 0 ]; then
+    _fail "commands/okf-generate.md names the okf subcommands it runs" \
+      "no 'okf <subcommand>' mention found in the document"
+    return 1
+  fi
+  local okf="$TOOLKIT_ROOT/bin/okf"
+  local dispatched
+  dispatched="$(_okf_dispatch_subcommands)"
+  if [ -z "$dispatched" ]; then
+    _fail "bin/okf lists the subcommands it dispatches" \
+      "no OKF_SUBCOMMANDS array in bin/okf, or it is empty"
+    return 1
+  fi
+  for sub in "${named[@]}"; do
+    if ! printf '%s\n' "$dispatched" | grep -Fqx -- "$sub"; then
+      _fail "commands/okf-generate.md names a working subcommand: okf $sub" \
+        "bin/okf's OKF_SUBCOMMANDS does not list $sub, so dispatch would" \
+        "reject it as an unknown subcommand"
+    elif ! grep -qE "^cmd_$sub\(\)" "$okf"; then
+      _fail "commands/okf-generate.md names a working subcommand: okf $sub" \
+        "bin/okf has no cmd_$sub function, so this document tells the reader" \
+        "to run a subcommand that does not exist"
+    elif grep -qE "(^|[^_[:alnum:]])not_implemented[[:space:]]+$sub([^_[:alnum:]]|\$)" "$okf"; then
+      _fail "commands/okf-generate.md names a working subcommand: okf $sub" \
+        "cmd_$sub in bin/okf is still a not_implemented stub" \
+        "if the mention is not an instruction to run it, name it as a bare" \
+        "word — only backticked 'okf <name>' mentions are collected"
+    else
+      _pass "commands/okf-generate.md names a working subcommand: okf $sub"
+    fi
+  done
+
+  # SPEC.md §5's tier rules are decided against okf.json's thresholds, so the
+  # document has to name them: a tier assigned from remembered defaults ignores
+  # every repo that tuned them, which is the only reason they are settings.
+  local -a thresholds=()
+  local key
+  while IFS= read -r key; do
+    [ -n "$key" ] && thresholds+=("$key")
+  done < <(_okf_spec_tier_threshold_keys)
+  if [ "${#thresholds[@]}" -eq 0 ]; then
+    _fail "SPEC.md §6 declares the tier thresholds" \
+      "extracted no keys from the tiers block of §6's okf.json"
+    return 1
+  fi
+  local value
+  for key in "${thresholds[@]}"; do
+    assert_contains "$body_text" "$key" \
+      "it decides the tier against okf.json's $key"
+    # The document writes the default out in full, because SPEC.md ships with
+    # claude-toolkit and not with the repo the command runs in — there is
+    # nothing there to look it up in. That makes it a copy, so it is pinned to
+    # the original: a threshold retuned in SPEC.md §6 and not here would have
+    # every bundle without a `tiers` block tiered against the old number.
+    value="$(_okf_spec_config_json | jq -r --arg k "$key" '.tiers[$k]')"
+    assert_contains "$body_text" "$key: $value" \
+      "and it writes $key's default out as SPEC.md §6 has it"
+  done
+  # And all three tiers exist in it. Tier 0 is a demotion and never an
+  # exclusion, so a document naming only two of them is one that drops files.
+  local tier
+  for tier in 0 1 2; do
+    if printf '%s\n' "$body_text" | grep -qE "Tier $tier"; then
+      _pass "commands/okf-generate.md assigns Tier $tier"
+    else
+      _fail "commands/okf-generate.md assigns Tier $tier" \
+        "SPEC.md §5 defines Tier 0, 1 and 2 and this document never mentions" \
+        "Tier $tier"
+    fi
+  done
+
+  # SPEC.md §4 reserves index.md and log.md, and `<stem>.md beside the source`
+  # walks straight into both. The document has to name them: a concept written
+  # at src/core/index.md displaces the per-directory Package index, step 6's
+  # `okf index` overwrites it, and the source stays on `--missing` forever, so
+  # every re-run repeats the work.
+  local -a reserved_names=()
+  local reserved
+  while IFS= read -r reserved; do
+    [ -n "$reserved" ] && reserved_names+=("$reserved")
+  done < <(_okf_spec_reserved_filenames)
+  if [ "${#reserved_names[@]}" -eq 0 ]; then
+    _fail "SPEC.md §4 reserves some OKF filenames" \
+      "extracted no reserved filename from §4's \"Reserved OKF filenames\" paragraph"
+    return 1
+  fi
+  for reserved in "${reserved_names[@]}"; do
+    assert_contains "$body_text" "$reserved" \
+      "it says what to do when a source's stem collides with $reserved"
+  done
+  with_fixture_repo scoped _okf_reserved_stem_probe "${reserved_names[@]}"
+
+  # The other half of step 5's skip rule: what it must *not* skip.
+  assert_contains "$body_text" 'interrupted write' \
+    "it says an unfinished concept is finished by a re-run, not skipped"
+  with_fixture_repo scoped _okf_interrupted_write_probe
+
+  # The skeleton the document tells the reader to copy. Everything below is
+  # asked of that block rather than of the prose around it: a formatting
+  # contract restated in a sentence and contradicted by the template is
+  # contradicted, and the template is what gets copied.
+  local skeleton="$HARNESS_STATE/okf-generate-skeleton.md"
+  _first_yaml_block "$doc" > "$skeleton"
+  if [ ! -s "$skeleton" ]; then
+    _fail "commands/okf-generate.md shows the frontmatter it writes" \
+      "no fenced yaml block in $doc, so there is no template to check"
+    return 1
+  fi
+
+  # SPEC.md §4: no tabs anywhere. The shell reads this layout with awk, which
+  # counts leading spaces.
+  if awk 'index($0, "\t") { found = 1 } END { exit found ? 0 : 1 }' "$skeleton"; then
+    _fail "commands/okf-generate.md's frontmatter template has no tabs" \
+      "SPEC.md §4 forbids a tab anywhere in the block and the template has one"
+  else
+    _pass "commands/okf-generate.md's frontmatter template has no tabs"
+  fi
+
+  # The real check on the formatting contract: bin/okf's own reader, over the
+  # template. A concept written to a layout read_frontmatter cannot parse is
+  # invisible to `okf check` for the rest of its life, and nothing about it
+  # looks wrong.
+  #
+  # A full concept is read first, so an empty field below means the template
+  # has not got one rather than that nothing was ever read.
+  local out
+  out="$(_okf_frontmatter_probe \
+    "$FIXTURES_DIR/concepts/src/route/RouteRegistry.md" "$skeleton" \
+    type resource status generated.by generated.at 'verified[].at' \
+    code.language code.symbol code.tier code.content_hash)"
+  assert_eq "0" "$(_okf_frontmatter_status "$out")" \
+    "bin/okf reads the frontmatter template in commands/okf-generate.md"
+
+  local field
+  for field in type resource status generated.by generated.at \
+    code.language code.symbol code.tier code.content_hash; do
+    if [ -n "$(_okf_frontmatter_field "$out" "$field")" ]; then
+      _pass "the template carries $field where bin/okf reads it"
+    else
+      _fail "the template carries $field where bin/okf reads it" \
+        "read_frontmatter found no $field in the template — either the key is" \
+        "absent or it is laid out where SPEC.md §4's extraction rule cannot" \
+        "see it"
+    fi
+  done
+
+  # `resource` is bundle-absolute, which is what makes a concept survive a file
+  # move. `okf list` prints repo-relative paths, so this is the one field a
+  # writer copying that output gets wrong by default.
+  local resource
+  resource="$(_okf_frontmatter_field "$out" resource)"
+  case "$resource" in
+    /*) _pass "the template's resource is bundle-absolute" ;;
+    *) _fail "the template's resource is bundle-absolute" \
+      "SPEC.md §4 gives path-valued fields a leading / and the template has" \
+      "resource: $resource" ;;
+  esac
+
+  # The digest is stored with the prefix `okf hash` prints, because that is the
+  # string `okf check` compares against.
+  local stored_hash
+  stored_hash="$(_okf_frontmatter_field "$out" code.content_hash)"
+  case "$stored_hash" in
+    sha256:?*) _pass "the template stores code.content_hash as okf hash prints it" ;;
+    *) _fail "the template stores code.content_hash as okf hash prints it" \
+      "expected a sha256:-prefixed digest, got: $stored_hash" ;;
+  esac
+
+  # SPEC.md §11: generated prose is stamped claude-code/<model> — the model
+  # actually running, not the literal placeholder, which would make every
+  # concept in the bundle claim the same nonexistent actor.
+  local by
+  by="$(_okf_frontmatter_field "$out" generated.by)"
+  case "$by" in
+    'claude-code/<model>' | 'claude-code/')
+      _fail "the template stamps generated.by claude-code/<model>" \
+        "the template leaves the placeholder in as a literal value: $by" ;;
+    claude-code/?*)
+      _pass "the template stamps generated.by claude-code/<model>" ;;
+    *)
+      _fail "the template stamps generated.by claude-code/<model>" \
+        "SPEC.md §4's actor string for this command is claude-code/<model>," \
+        "and the template says: $by" ;;
+  esac
+
+  # And nothing this command writes carries a verified entry. Asked of the
+  # template as well as of the prose: a document that forbids one in a sentence
+  # and then shows one in the block people copy has shown one. SPEC.md §11 is
+  # explicit that unattended regeneration is safe precisely because it cannot
+  # forge review.
+  if [ -z "$(_okf_frontmatter_field "$out" 'verified[].at')" ]; then
+    _pass "the template carries no verified entry"
+  else
+    _fail "the template carries no verified entry" \
+      "read_frontmatter found a verified[].at in the frontmatter template —" \
+      "only okf verify appends those, and never for generated prose"
+  fi
+  if printf '%s\n' "$body_text" | grep -qiE 'no .{0,3}verified'; then
+    _pass "commands/okf-generate.md says it writes no verified entry"
+  else
+    _fail "commands/okf-generate.md says it writes no verified entry" \
+      "nothing in the document states the prohibition, so the template being" \
+      "clean is a coincidence a rewrite would lose"
+  fi
+
+  # The house-style pair from commands/onboard.md.
+  if printf '%s\n' "$body_text" | grep -qi 'stop there'; then
+    _pass "commands/okf-generate.md has an explicit stopping point"
+  else
+    _fail "commands/okf-generate.md has an explicit stopping point" \
+      "no 'Stop there' in the document — SPEC.md §11 asks every okf-* command" \
+      "for one, in the style of commands/onboard.md"
+  fi
+  if printf '%s\n' "$body_text" | grep -qi 'non-goal'; then
+    _pass "commands/okf-generate.md states its non-goals explicitly"
+  else
+    _fail "commands/okf-generate.md states its non-goals explicitly" \
+      "the words 'non-goal' appear nowhere in the document"
+  fi
+
+  # The two handoffs that keep this command from growing into the others:
+  # re-authoring a drifted concept is /okf-refresh's, confirming one is
+  # /okf-verify's.
+  assert_contains "$body_text" '/okf-refresh' \
+    "it hands re-authoring drifted concepts on to /okf-refresh"
+  assert_contains "$body_text" '/okf-verify' \
+    "it hands confirming the drafts on to /okf-verify"
+}
+
 # --- add new test_* functions above this line ------------------------------
 
 # ---------------------------------------------------------------------------
