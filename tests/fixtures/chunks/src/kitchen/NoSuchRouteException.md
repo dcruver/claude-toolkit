@@ -7,6 +7,9 @@ status: draft
 generated:
   by: claude-code/opus-5
   at: 2026-08-26T14:02:11Z
+verified:
+  - by: process:okf/0.2
+    at: 2026-08-26T16:40:00Z
 code:
   language: java
   symbol: com.example.kitchen.NoSuchRouteException

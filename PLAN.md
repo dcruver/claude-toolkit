@@ -68,7 +68,7 @@ there). Items are ordered so none depends on a later one. Every item verifies wi
 
 - [x] Implement okf chunk in bin/okf to split one concept into a JSON array of summary, method and schema chunks on the body headings defined in SPEC.md §4, with tests for a Tier 1 concept carrying several methods and for a record with a Schema section (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [x] Extend okf chunk in bin/okf to emit exactly one summary chunk built from title, description and code.signature when a Tier 0 concept has no body (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
-- [ ] Extend okf chunk in bin/okf to carry the full SPEC.md §9 payload field set on every chunk, including the computed trust tier (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
+- [x] Extend okf chunk in bin/okf to carry the full SPEC.md §9 payload field set on every chunk, including the computed trust tier (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 - [ ] Add the Tier B configuration guard to bin/okf so okf chunk, okf embed and okf search each exit 2 with a single line naming the missing keys when okf.json has no index block, per SPEC.md §6 (see SPEC.md's Design Reference). Verify: ./tests/toolkit.sh
 
 ## Phase 10 — Tier B: embedding and search

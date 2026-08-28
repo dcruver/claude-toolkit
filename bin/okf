@@ -1570,6 +1570,20 @@ clear_frontmatter() {
   OKF_FM_CODE_LANGUAGE=""
   # SPEC.md §9's third stub field — see OKF_FM_TITLE.
   OKF_FM_CODE_SIGNATURE=""
+  # SPEC.md §9's payload carries `tags`, `lines` and `commit` on every point,
+  # and none of the three is on §4's shell-read list — read here for the reason
+  # OKF_FM_TITLE above is read here, so that opening a concept stays the one
+  # pass over its block that this function is.
+  #
+  # `tags` is a list where every other extension field is a scalar, so it comes
+  # back as an array; §4 writes it `[routing, cache]`, and a block sequence
+  # under a bare `tags:` is the same document and is read too.
+  OKF_FM_TAGS=()
+  # `code.lines` exactly as written, `[28, 214]` and all. What SPEC.md §9 wants
+  # on the payload is the pair, and turning a pair into JSON is the renderer's
+  # job rather than the reader's — see chunk_lines_json.
+  OKF_FM_CODE_LINES=""
+  OKF_FM_CODE_COMMIT=""
   # A list where the others are scalars, because SPEC.md §8 says verified
   # entries are never stripped: a concept accumulates them, and the last one is
   # not the only one that matters. Document order.
@@ -1659,6 +1673,189 @@ frontmatter_scalar() { # $1 = everything after a frontmatter key's colon
   OKF_FRONTMATTER_SCALAR="$value"
 }
 
+# One item onto OKF_FLOW_ITEMS. An item that is empty is dropped rather than
+# recorded: `[routing, ]` is a trailing comma somebody left behind, and an empty
+# tag is not a tag.
+#
+# Nothing is trimmed here, because by this point there is nothing left to trim
+# and no way to tell what would be safe to: yaml_flow_items drops the whitespace
+# that sits *outside* an item's quotes as it goes, which is the only whitespace
+# that was never part of the value. Trimming here instead would take the spaces
+# out of `[" a "]` — the one thing the quotes in it were for.
+flow_item_push() { # $1 = one item, with its quotes already off
+  [ -n "$1" ] || return 0
+  OKF_FLOW_ITEMS+=("$1")
+}
+
+# One YAML flow sequence — `[routing, cache]`, `[28, 214]` — as its items, left
+# in OKF_FLOW_ITEMS. Returns 1 when the value is not a flow sequence at all,
+# with the array empty, so a caller can tell `tags: []` from `tags: routing`.
+#
+# SPEC.md §4 writes both of the fields this exists for — `tags` and
+# `code.lines` — in flow form on one line, and §4's formatting contract rules
+# out the alternative for anything the shell reads: "no multi-line or folded
+# scalars". So one short line is the whole of what has to be parsed, and a
+# character loop over it costs no subprocess.
+#
+# Quotes come off an item the way frontmatter_scalar takes them off a scalar,
+# and a comma inside them separates nothing: a tag is whatever somebody typed,
+# and `["routing, cached"]` is one tag. Nothing else of YAML's flow syntax is
+# implemented, because the two fields this reads hold identifiers and integers:
+# a nested sequence is refused outright rather than misread, and the escapes
+# understood are the two YAML defines inside quotes — `\"` in a double-quoted
+# item and `''` in a single-quoted one.
+#
+# Given the value as the line spells it, `[` and `]` and any trailing comment
+# included, rather than what frontmatter_scalar makes of it. That function ends
+# a scalar at the first ` #`, which is right for every field but this one: a `#`
+# inside a quoted item — `tags: [alpha, "beta #gamma"]` — is part of the tag,
+# and a value cut there stops being a sequence at all. So the closing `]` is
+# found here, by the same scan that already has to know where the quotes are,
+# and whatever follows it is the comment.
+OKF_FLOW_ITEMS=()
+yaml_flow_items() { # $1 = a YAML flow sequence, as the line spells it
+  local value="$1" inner="" item="" seg="" pending="" quote="" ch at closed=0
+  OKF_FLOW_ITEMS=()
+
+  value="${value#"${value%%[![:space:]]*}"}"
+  case "$value" in
+    "["*) ;;
+    *) return 1 ;;
+  esac
+
+  for ((at = 1; at < ${#value}; at++)); do
+    ch="${value:at:1}"
+    if [ -n "$quote" ]; then
+      # A backslash inside a double-quoted item takes the next character with
+      # it, which is YAML's rule and is the whole of why this branch exists: a
+      # `\"` read as a closing quote puts the rest of the sequence outside the
+      # quotes, and the first `]` in it ends a sequence that had not ended.
+      # Single quotes have no backslash escape in YAML, so this is asked of
+      # double ones only.
+      if [ "$quote" = '"' ] && [ "$ch" = "\\" ] && [ $((at + 1)) -lt ${#value} ]; then
+        at=$((at + 1))
+        continue
+      fi
+      # YAML's escape inside single quotes, which is a doubled quote and not a
+      # backslash: `'it''s'` is one item. Read as a close followed by an open,
+      # everything after it would be outside the quotes it is inside.
+      if [ "$quote" = "'" ] && [ "$ch" = "'" ] \
+        && [ "${value:at+1:1}" = "'" ]; then
+        at=$((at + 1))
+        continue
+      fi
+      [ "$ch" = "$quote" ] && quote=""
+      continue
+    fi
+    case "$ch" in
+      # A nested sequence, which this does not read — see the header. Refused
+      # outright rather than ended at the inner `]`, which would drop every item
+      # after it and put a `[a` on the payload as though it were a tag.
+      "[") return 1 ;;
+      # Only where an item begins — the parse loop below applies the same rule,
+      # and the two must agree or this scan ends the sequence somewhere that
+      # loop does not. `seg` is this scan's view of the item so far, holds no
+      # whitespace, and exists only to answer that one question.
+      '"' | "'") [ -n "$seg" ] || quote="$ch" ;;
+      "]")
+        closed=1
+        break
+        ;;
+      ,)
+        seg=""
+        continue
+        ;;
+      [[:space:]]) continue ;;
+    esac
+    seg="$seg$ch"
+  done
+
+  # A `[` that is never closed is not a sequence, whatever it was meant to be.
+  # Answered with the 1 that says "not a flow sequence" rather than with the
+  # items found so far, which would be a list okf finished on the author's
+  # behalf out of a line that was cut off.
+  [ "$closed" -eq 1 ] || return 1
+  inner="${value:1:at-1}"
+
+  # `[]`, or `[  ]`: a sequence, and an empty one. Told apart here from a value
+  # that is not a sequence at all, which is the 1 above — an empty `tags` list
+  # is a decision somebody wrote down, and a missing one is not.
+  case "$inner" in
+    *[![:space:]]*) ;;
+    *) return 0 ;;
+  esac
+
+  quote=""
+  item=""
+  for ((at = 0; at < ${#inner}; at++)); do
+    ch="${inner:at:1}"
+    if [ -n "$quote" ]; then
+      # The escape the scan above already had to understand, here taking the
+      # escaped character into the value: `"a\"b"` is one item holding a quote.
+      if [ "$quote" = '"' ] && [ "$ch" = "\\" ] && [ $((at + 1)) -lt ${#inner} ]; then
+        at=$((at + 1))
+        item="$item${inner:at:1}"
+        continue
+      fi
+      # The single-quoted escape the scan above also understands: two quotes
+      # stand for one, and the item goes on.
+      if [ "$quote" = "'" ] && [ "$ch" = "'" ] \
+        && [ "${inner:at+1:1}" = "'" ]; then
+        at=$((at + 1))
+        item="$item'"
+        continue
+      fi
+      if [ "$ch" = "$quote" ]; then
+        quote=""
+      else
+        item="$item$ch"
+      fi
+      continue
+    fi
+
+    # Whitespace outside an item's quotes is held back rather than added, and
+    # added only once something else follows it inside the same item. That is
+    # what separates `[a, b]` from `[" a "]`: the spaces around a value are
+    # never part of it, the spaces inside its quotes always are, and a trim
+    # applied afterwards could no longer tell which had been which.
+    case "$ch" in
+      [[:space:]])
+        pending="$pending$ch"
+        continue
+        ;;
+    esac
+    # The comma ends the item ahead of the flush, so whitespace held back at the
+    # end of one — `[ alpha , beta ]` — is dropped with the item rather than
+    # written into it.
+    if [ "$ch" = "," ]; then
+      flow_item_push "$item"
+      item=""
+      pending=""
+      continue
+    fi
+
+    [ -z "$item" ] || item="$item$pending"
+    pending=""
+
+    case "$ch" in
+      # A quote opens a quoted scalar only where an item begins, which is YAML's
+      # rule and is what keeps an apostrophe inside a word from opening one:
+      # `[don't, care]` is two tags, and a quote taken at face value there would
+      # swallow the comma and answer one.
+      '"' | "'")
+        if [ -z "$item" ]; then
+          quote="$ch"
+        else
+          item="$item$ch"
+        fi
+        ;;
+      *) item="$item$ch" ;;
+    esac
+  done
+  flow_item_push "$item"
+  return 0
+}
+
 # Reads one concept's SPEC.md §4 frontmatter into the OKF_FM_ variables above.
 #
 # Returns 0 when the file carries a block — `---` on line 1, closed by the next
@@ -1725,6 +1922,12 @@ read_frontmatter() { # $1 = a path to a concept file
   local f_type="" f_title="" f_description="" f_resource="" f_status=""
   local f_stale_after="" f_generated_at="" f_generated_by=""
   local f_content_hash="" f_tier="" f_symbol="" f_language="" f_signature=""
+  local f_commit="" f_lines=""
+  # Whether a `tags:` key has been met, which the other fields answer with
+  # `[ -z "$f_tags" ]` and a list cannot: an empty `tags: []` is a value
+  # somebody wrote, and a second `tags:` line below it must not overwrite it.
+  local tags_seen=0
+  local -a f_tags=()
   local f_verified_count=0
   local -a f_verified_at=() f_verified_by=()
 
@@ -1795,6 +1998,34 @@ read_frontmatter() { # $1 = a path to a concept file
               block="verified"
             fi
             ;;
+          # SPEC.md §4 writes this `tags: [routing, cache]`, and so does every
+          # writer in this repo; a block sequence under a bare `tags:` is the
+          # same document, and both are read. Which one it is decides here: a
+          # value after the colon is the flow form, and no value at all opens a
+          # block for the `- item` lines the indented branch below collects.
+          "tags:"*)
+            if [ "$tags_seen" -eq 0 ]; then
+              tags_seen=1
+              # The sequence is read off the line as written, because
+              # frontmatter_scalar would end the value at a `#` inside a quoted
+              # item — see yaml_flow_items. Only what is not a sequence falls
+              # through to it, and there the `#` is a comment again.
+              if yaml_flow_items "${line#"tags:"}"; then
+                f_tags=(${OKF_FLOW_ITEMS[@]+"${OKF_FLOW_ITEMS[@]}"})
+              else
+                frontmatter_scalar "${line#"tags:"}"
+                if [ -n "$OKF_FRONTMATTER_SCALAR" ]; then
+                  # `tags: routing` — one tag, written without the brackets.
+                  # YAML calls that a scalar rather than a list, and a bundle
+                  # whose author meant one tag is better served by the tag than
+                  # by an empty list and no complaint.
+                  f_tags=("$OKF_FRONTMATTER_SCALAR")
+                else
+                  block="tags"
+                fi
+              fi
+            fi
+            ;;
           "type:"*)
             if [ -z "$f_type" ]; then
               frontmatter_scalar "${line#"type:"}"
@@ -1849,6 +2080,23 @@ read_frontmatter() { # $1 = a path to a concept file
         # licence — they must be indented past their key — so this is the whole
         # of the exception.
         case "$block" in
+          tags)
+            # A block sequence's items, at whatever column the writer put them
+            # in: a `-` flush left is the same document as one indented under
+            # its key, which is the licence the outer case already grants a
+            # `verified:` entry. Nothing nested is read, because a tag is a
+            # string — so an item's own indentation carries no meaning here, and
+            # none is tracked.
+            prefix="${line%%[![:space:]]*}"
+            rest="${line#"$prefix"}"
+            case "$rest" in
+              -*)
+                frontmatter_scalar "${rest#-}"
+                [ -z "$OKF_FRONTMATTER_SCALAR" ] \
+                  || f_tags+=("$OKF_FRONTMATTER_SCALAR")
+                ;;
+            esac
+            ;;
           code)
             case "$line" in
               "  content_hash: "*)
@@ -1873,6 +2121,21 @@ read_frontmatter() { # $1 = a path to a concept file
                 if [ -z "$f_language" ]; then
                   frontmatter_scalar "${line#"  language:"}"
                   f_language="$OKF_FRONTMATTER_SCALAR"
+                fi
+                ;;
+              "  commit: "*)
+                if [ -z "$f_commit" ]; then
+                  frontmatter_scalar "${line#"  commit:"}"
+                  f_commit="$OKF_FRONTMATTER_SCALAR"
+                fi
+                ;;
+              # Two spaces here for the reason `signature` below wants them:
+              # §4 gives every `code.members` entry a `lines:` of its own, four
+              # spaces in, and the range this field means is the type's.
+              "  lines: "*)
+                if [ -z "$f_lines" ]; then
+                  frontmatter_scalar "${line#"  lines:"}"
+                  f_lines="$OKF_FRONTMATTER_SCALAR"
                 fi
                 ;;
               # Exactly two spaces, as §4's extraction rule has it, and here
@@ -2041,6 +2304,9 @@ read_frontmatter() { # $1 = a path to a concept file
   OKF_FM_CODE_SYMBOL="$f_symbol"
   OKF_FM_CODE_LANGUAGE="$f_language"
   OKF_FM_CODE_SIGNATURE="$f_signature"
+  OKF_FM_TAGS=(${f_tags[@]+"${f_tags[@]}"})
+  OKF_FM_CODE_LINES="$f_lines"
+  OKF_FM_CODE_COMMIT="$f_commit"
   OKF_FM_VERIFIED_AT=(${f_verified_at[@]+"${f_verified_at[@]}"})
   OKF_FM_VERIFIED_BY=(${f_verified_by[@]+"${f_verified_by[@]}"})
   OKF_FM_VERIFIED_COUNT="$f_verified_count"
@@ -6079,6 +6345,379 @@ stub_summary_text() {
   OKF_STUB_SUMMARY="$text"
 }
 
+# SPEC.md §9's `repo`, the payload field "every point carries … so cross-repo
+# search is a filter change, not a schema change". Left in OKF_INDEX_REPO.
+#
+# `index.repo` out of okf.json, which is where SPEC.md §6 puts it, and the
+# bundle's own directory name when the settings name none — §6's "every field
+# defaults if absent", answered with the same default `okf init` gives the
+# bundle-root index.md its title, so that the two documents a bundle carries
+# agree on what the bundle is called. Points carrying an empty `repo` would be
+# points no filter could single out, which is the one thing this field is for.
+#
+# Shared with `okf embed` and `okf search` when they arrive: the field has to
+# mean the same thing on the point that is written and in the filter that finds
+# it again, and two readings of one setting is how that stops being true.
+OKF_INDEX_REPO=""
+index_repo() {
+  load_settings
+
+  local repo
+  # stderr folded into the value so jq's own complaint about a wrong shape is
+  # what gets reported, the way settings_strings reports one about a list.
+  #
+  # `getpath` and an explicit `null` test rather than `// empty`, which is
+  # settings_strings' choice for settings_strings' reason: `//` reads `false` as
+  # absent, so `"repo": false` would fall through to the directory name while
+  # `7` and `[]` were refused. Every wrong shape is a wrong shape.
+  repo="$(printf '%s\n' "$OKF_SETTINGS" | jq -r '
+      getpath(["index", "repo"]) as $r
+      | if $r == null then ""
+        elif ($r | type) != "string" then
+          error("must be a string, found " + ($r | type))
+        elif $r == "" then error("must not be empty")
+        elif ($r | contains("\n")) then error("must not have a newline in it")
+        else $r end' 2>&1)" \
+    || die "$(display_path "$OKF_CONFIG"): index.repo ${repo#jq: error*: }"
+
+  if [ -z "$repo" ]; then
+    # cmd_init's line and its reason: the bundle is named for the directory it
+    # is in, and that name is empty only when the root is `/`, which is then
+    # also its own best name.
+    repo="${OKF_ROOT##*/}"
+    [ -n "$repo" ] || repo="$OKF_ROOT"
+  fi
+  OKF_INDEX_REPO="$repo"
+}
+
+# SPEC.md §9's `lines`, as the JSON a payload carries: the pair `code.lines`
+# holds, rendered as numbers in OKF_CHUNK_LINES_JSON — and `null` when the
+# field is absent, is not a flow sequence, or holds anything but digits.
+#
+# JSON numbers and not the string `"[28, 214]"`, because a payload field exists
+# to be filtered on and no range query can read a string. `null` and not `[]`
+# for the same reason turned around: an empty list is a claim that the concept
+# covers no lines, where an absent field claims nothing.
+OKF_CHUNK_LINES_JSON="null"
+chunk_lines_json() { # $1 = code.lines, exactly as the frontmatter spells it
+  local raw="$1" item out="" first=1
+  OKF_CHUNK_LINES_JSON="null"
+
+  [ -n "$raw" ] || return 0
+  # The flow form is the only one this field has, where `tags` is read in both.
+  # The asymmetry is SPEC.md §4's: `code.X` is defined by an extraction rule —
+  # "the first line matching `^  X: ` after the `^code:` line" — which is a rule
+  # about a scalar on one line, and §4's own example writes `lines: [28, 214]`.
+  # A block sequence under `  lines:` would also have to be told apart from the
+  # `code.members` items §4 puts at the same depth. `tags` is a top-level key
+  # with no such rule and no such neighbour.
+  yaml_flow_items "$raw" || return 0
+
+  # Two items, because SPEC.md §4 writes this field `lines: [28, 214]` and a
+  # range is its two ends. A `[28]` rendered as it stands would be a range whose
+  # end okf had lost, and a `[1, 2, 3]` one it could not place at all — both
+  # read by a consumer as a range, and neither one.
+  [ "${#OKF_FLOW_ITEMS[@]}" -eq 2 ] || return 0
+
+  # Rendered into a local, so that an item found unusable halfway through leaves
+  # OKF_CHUNK_LINES_JSON at the null it started as: half a pair is worse than
+  # none, and `[28, ?]` must not come out as `[28]`.
+  for item in "${OKF_FLOW_ITEMS[@]}"; do
+    case "$item" in
+      "" | *[!0-9]*) return 0 ;;
+    esac
+
+    # Leading zeros off, because `08` is not JSON — and off as text rather than
+    # through `$((10#$item))`, which is arithmetic and would silently wrap at
+    # 64 bits, putting a number nobody wrote on the payload.
+    item="${item#"${item%%[!0]*}"}"
+    [ -n "$item" ] || item=0
+
+    # And a ceiling on what is left, because past it okf cannot promise to carry
+    # the value through unchanged: jq before 1.7 re-encodes a literal too big
+    # for a double, so `99999999999999999999` would reach the payload as
+    # `1e+20`. Fifteen digits is more than any file has lines, so anything
+    # longer was never a line number, and null — this function's answer for
+    # every other value it cannot use — says so without inventing one.
+    [ "${#item}" -le 15 ] || return 0
+
+    [ "$first" -eq 1 ] || out="$out,"
+    first=0
+    out="$out$item"
+  done
+  OKF_CHUNK_LINES_JSON="[$out]"
+}
+
+# SPEC.md §9's `symbol` for one chunk: the concept's own `code.symbol` for a
+# summary or a schema, and the member's — `<symbol>#<name><params>`, javadoc's
+# own way of naming a member — for a method chunk. Left in OKF_CHUNK_SYMBOL.
+#
+# Per chunk rather than per concept, and §9's point ID is what forces that: the
+# ID is a digest of `{repo}|{concept_id}|{chunk_kind}|{symbol}`, "so upserts are
+# idempotent and deletes targeted". Every method chunk of one concept agrees on
+# the first three of those four, so a `symbol` that stayed the type's would give
+# all of them one ID — and every multi-method concept in the bundle would
+# collapse to a single point on upsert, silently.
+#
+# The parameter list is part of the symbol for the same reason, one level down:
+# overloads share a name, and `add(String)` and `add(String, Handler)` are two
+# members of one type. Kept to the parentheses and their contents — the matching
+# `)` ends it — so that a return type written after them, `size(): number` or
+# `resolve(&self) -> Option<Route>`, is not part of a member's identity.
+#
+# All of it is read off the `## ` heading rather than looked up in
+# `code.members`, because the heading is the one thing certainly there: §4 makes
+# it the chunk boundary, while `members` is optional and can lag the body.
+#
+# Which `(` opens the parameter list is the only real question, and three rules
+# answer it, each one for a shape the one before it gets wrong:
+#
+#   * The first `(` at the top level that immediately follows an identifier
+#     character. Top level, so a nested `(` in a parameter type — `new(x:
+#     Foo(Bar))` — cannot cut early; identifier-hugging, so Go's receiver is
+#     skipped and `func (r *Router) Add(` names Add rather than func.
+#   * …unless the identifier in front of it is an annotation's, which is a
+#     name preceded by `@` or by `[`: `@Deprecated(since="1") public void
+#     add(String)` and `[Obsolete("x")] public void Add(string)` and
+#     `#[deprecated(note="x")] pub fn new()` all put a parenthesised name ahead
+#     of the member's own. Skipped rather than taken, and the scan goes on to
+#     the next candidate. Not simply "the last one", which would name a Rust
+#     signature after its return type: `fn f(x: u32) -> impl Fn(u32)`.
+#   * Failing all of those, the first `(` anywhere, which reads a signature
+#     written with a space before its parameters: `public void add (String,
+#     Handler)` has no identifier-hugging `(` at all, and cutting at the only
+#     one there is names `add` where the first rule alone would have gone on to
+#     the last word of the parameter list.
+#
+# A heading with no `(` in it is not a signature — §4 asks for "one `## <signature>`
+# per member" — so nothing is guessed about which of its words is a name: the
+# heading is taken whole. That keeps a TypeScript property, `## name: string`,
+# from being named `string`, and leaves an out-of-place prose heading visibly
+# prose in the index rather than quietly wearing some word out of the middle of
+# it as a member name.
+OKF_CHUNK_SYMBOL=""
+chunk_symbol() { # $1 = code.symbol, $2 = the chunk's kind, $3 = its heading
+  local symbol="$1" kind="$2" heading="$3"
+  local name="" params="" prev="" ch at cut=-1 first=-1 depth=0 start
+  local annotation=0
+
+  if [ "$kind" != "method" ]; then
+    OKF_CHUNK_SYMBOL="$symbol"
+    return 0
+  fi
+
+  for ((at = 0; at < ${#heading}; at++)); do
+    ch="${heading:at:1}"
+    case "$ch" in
+      "(")
+        if [ "$depth" -eq 0 ]; then
+          case "$prev" in
+            [A-Za-z0-9_])
+              # Back over the name this `(` hugs, dots included so that a
+              # qualified annotation — `@javax.annotation.Generated(` — is one
+              # name and not three, and then one character further: an `@` or a
+              # `[` in front of it says the parentheses are the annotation's.
+              start="$at"
+              while [ "$start" -gt 0 ]; do
+                case "${heading:start-1:1}" in
+                  [A-Za-z0-9_.]) start=$((start - 1)) ;;
+                  *) break ;;
+                esac
+              done
+              if [ "$start" -eq 0 ]; then
+                cut="$at"
+              else
+                case "${heading:start-1:1}" in
+                  # An annotation's own parentheses, which are neither the
+                  # member's parameter list nor a candidate for the fallback:
+                  # `first` is left alone so that a signature carrying both an
+                  # annotation and a space before its parameters still lands on
+                  # the space.
+                  "@" | "[") annotation=1 ;;
+                  *) cut="$at" ;;
+                esac
+              fi
+              ;;
+          esac
+          if [ "$annotation" -eq 0 ] && [ "$first" -lt 0 ]; then
+            first="$at"
+          fi
+          annotation=0
+          [ "$cut" -lt 0 ] || break
+        fi
+        depth=$((depth + 1))
+        ;;
+      ")") [ "$depth" -eq 0 ] || depth=$((depth - 1)) ;;
+    esac
+    prev="$ch"
+  done
+  [ "$cut" -ge 0 ] || cut="$first"
+
+  if [ "$cut" -lt 0 ]; then
+    # No parentheses at all: the whole heading, trimmed, and no guess about
+    # which of its words is the name.
+    name="${heading#"${heading%%[![:space:]]*}"}"
+    name="${name%"${name##*[![:space:]]}"}"
+  else
+    name="${heading:0:cut}"
+    name="${name%"${name##*[![:space:]]}"}"
+    name="${name##*[[:space:]]}"
+
+    # Reset, because the scan above stops wherever it found its answer and may
+    # have left parentheses open behind it — and the count below is what decides
+    # where the parameter list ends.
+    depth=0
+
+    # The parameter list, up to the `)` that closes the `(` above. Counted
+    # rather than searched for, because a parameter type may carry parentheses
+    # of its own — `new(x: Foo(Bar))` — and the first `)` closes the inner one.
+    # An unbalanced heading runs to the end of the line, which is the only
+    # answer left and is at least the whole of what was written.
+    for ((at = cut; at < ${#heading}; at++)); do
+      ch="${heading:at:1}"
+      params="$params$ch"
+      case "$ch" in
+        "(") depth=$((depth + 1)) ;;
+        ")")
+          depth=$((depth - 1))
+          [ "$depth" -gt 0 ] || break
+          ;;
+      esac
+    done
+  fi
+
+  # A "name" holding no identifier character is not a name — `const add = (a, b)
+  # => a + b` puts an `=` where the last word before the parameters ought to be.
+  # The whole heading, trimmed, rather than a symbol built out of punctuation:
+  # it is longer and it is what the concept says, and two members written that
+  # way stay two symbols.
+  case "$name" in
+    *[A-Za-z0-9_]*) ;;
+    *)
+      name="${heading#"${heading%%[![:space:]]*}"}"
+      name="${name%"${name##*[![:space:]]}"}"
+      params=""
+      ;;
+  esac
+
+  # A heading with nothing in it, or a concept carrying no `code.symbol`:
+  # whichever half is there is the whole answer, because a `#` with nothing on
+  # one side of it names nothing at all.
+  if [ -z "$name$params" ]; then
+    OKF_CHUNK_SYMBOL="$symbol"
+  elif [ -z "$symbol" ]; then
+    OKF_CHUNK_SYMBOL="$name$params"
+  else
+    OKF_CHUNK_SYMBOL="$symbol#$name$params"
+  fi
+}
+
+# The symbol of every chunk of one concept, in step with OKF_CHUNK_KIND, left
+# in OKF_CHUNK_SYMBOLS — chunk_symbol's answer for each, and then whatever it
+# takes to make sure no two of them are the same.
+#
+# SPEC.md §9's point ID is a digest of
+# `{repo}|{concept_id}|{chunk_kind}|{symbol}`, and across the chunks of one
+# concept `repo` and `concept_id` are equal. So two chunks collide when their
+# `chunk_kind` and their `symbol` are both equal — which is two chunks sharing
+# one point: the second upsert replaces the first, and half a concept leaves the
+# index with nothing anywhere reporting it.
+#
+# `chunk_kind` is part of that test and not an afterthought. A summary and a
+# schema both take the concept's bare `code.symbol`, so a comparison on `symbol`
+# alone would rename the schema chunk of every record in the bundle to settle a
+# collision the ID does not have.
+#
+# chunk_symbol reads that symbol out of a `## ` heading, and a heading is prose
+# somebody's slash command wrote — SPEC.md §4 asks for a signature there, and
+# nothing enforces it. So uniqueness is not left to the reading. Any symbol that
+# came out twice is replaced, on every chunk that produced it, by one built from
+# the heading itself, which is what told those chunks apart to begin with.
+#
+# Both passes run before anything is rewritten, so that a substitution cannot
+# hide the duplicate that justified it: rewriting chunk i as the loop goes would
+# leave chunk j comparing against the new value and looking unique.
+#
+# Deterministic, which is what §9's "upserts are idempotent" needs: the
+# substitution reads nothing but the concept's own headings, so one file yields
+# one set of symbols on every run.
+OKF_CHUNK_SYMBOLS=()
+chunk_symbols() { # $1 = code.symbol
+  local base="$1" total="${#OKF_CHUNK_KIND[@]}" i j collided=0
+  local -a dup=()
+  OKF_CHUNK_SYMBOLS=()
+
+  for ((i = 0; i < total; i++)); do
+    chunk_symbol "$base" "${OKF_CHUNK_KIND[$i]}" "${OKF_CHUNK_HEADING[$i]}"
+    OKF_CHUNK_SYMBOLS[i]="$OKF_CHUNK_SYMBOL"
+    dup[i]=0
+  done
+
+  for ((i = 0; i < total; i++)); do
+    for ((j = i + 1; j < total; j++)); do
+      [ "${OKF_CHUNK_KIND[$i]}" = "${OKF_CHUNK_KIND[$j]}" ] || continue
+      [ "${OKF_CHUNK_SYMBOLS[$i]}" = "${OKF_CHUNK_SYMBOLS[$j]}" ] || continue
+      collided=1
+      # Only where the headings differ, because the heading is what the
+      # substitution below has to offer: two chunks whose `## ` lines are
+      # textually equal would swap one symbol they share for another, losing the
+      # readable one for nothing. Those are left to the numbering pass.
+      [ "${OKF_CHUNK_HEADING[$i]}" != "${OKF_CHUNK_HEADING[$j]}" ] || continue
+      dup[i]=1
+      dup[j]=1
+    done
+  done
+
+  for ((i = 0; i < total; i++)); do
+    [ "${dup[$i]}" -eq 1 ] || continue
+    # A chunk with no heading has nothing left to be told apart by. Only the
+    # summary and the schema are headed by nothing, there is one of each per
+    # concept, and `chunk_kind` already tells those two apart in the ID — so
+    # this is unreachable, and leaving the symbol alone is better than inventing
+    # a name nobody could reproduce.
+    [ -n "${OKF_CHUNK_HEADING[$i]}" ] || continue
+    if [ -n "$base" ]; then
+      OKF_CHUNK_SYMBOLS[i]="$base#${OKF_CHUNK_HEADING[$i]}"
+    else
+      OKF_CHUNK_SYMBOLS[i]="${OKF_CHUNK_HEADING[$i]}"
+    fi
+  done
+
+  # And a last pass for what the heading itself cannot settle: two `## ` lines
+  # that are textually equal. That is a concept naming one member twice, which
+  # is a mistake — but it is a mistake in a file, and it must not cost the index
+  # a chunk, so the duplicates are numbered in document order. `~2` because
+  # neither `#` nor a bare digit could be told from part of a signature.
+  #
+  # Each symbol is compared against the ones already settled ahead of it, and
+  # the suffix counts up until it clears all of them rather than counting how
+  # many it saw: a concept whose third heading repeats the first would otherwise
+  # be handed the `~2` the second one had just been given.
+  # Skipped outright when the pass above found nothing to settle, which is every
+  # ordinary concept: this is a second quadratic sweep, and there is no point
+  # walking it to confirm what has already been established.
+  [ "$collided" -eq 1 ] || return 0
+
+  local candidate n taken
+  for ((i = 1; i < total; i++)); do
+    n=1
+    candidate="${OKF_CHUNK_SYMBOLS[$i]}"
+    while :; do
+      taken=0
+      for ((j = 0; j < i; j++)); do
+        [ "${OKF_CHUNK_KIND[$j]}" = "${OKF_CHUNK_KIND[$i]}" ] || continue
+        [ "${OKF_CHUNK_SYMBOLS[$j]}" = "$candidate" ] || continue
+        taken=1
+        break
+      done
+      [ "$taken" -eq 1 ] || break
+      n=$((n + 1))
+      candidate="${OKF_CHUNK_SYMBOLS[$i]}~$n"
+    done
+    OKF_CHUNK_SYMBOLS[i]="$candidate"
+  done
+}
+
 # okf chunk <concept> — Tier B: emit JSON chunks for one concept
 #
 # Local work, and no HTTP: see OKF_HTTP_SUBCOMMANDS for why this one is Tier B
@@ -6119,14 +6758,59 @@ cmd_chunk() {
   local concept="$OKF_CONCEPT"
 
   # A markdown file is not a concept until it carries SPEC.md §4's block, and
-  # asking read_frontmatter is how the rest of okf decides that. It is asked
-  # here for the refusal and for three fields: a body splits into chunks on its
-  # own, and a concept with no body is the one case where the frontmatter is all
-  # there is to build a chunk out of.
-  read_frontmatter "$concept" \
+  # reading that block is how the rest of okf decides. Three things come out of
+  # it here: the refusal below, SPEC.md §9's payload — nine of its thirteen
+  # fields are frontmatter read straight off — and the one case where the
+  # frontmatter is all there is to build a chunk out of, a concept with no body.
+  #
+  # Asked *through* concept_trust_tier, which reads the block itself and returns
+  # 1 for exactly the reason read_frontmatter does: there was no block to read.
+  # So the refusal and §9's `trust_tier` come out of one pass over the file,
+  # where the obvious two calls would be two passes over every concept in a
+  # bundle — and `okf chunk` is the subcommand run over all of them in a loop.
+  # It leaves the OKF_FM_ variables set, as any successful read does; nothing
+  # between here and stub_summary_text below disturbs them.
+  #
+  # §9's `trust_tier` is computed rather than read: §8 defines it out of the
+  # `verified` entries, `generated.at` and whether the concept has drifted, and
+  # no field in the file holds the answer. It is the one payload field that
+  # opens a second file — the resource, to hash it — and a concept whose source
+  # is gone is still gradeable, because §8 makes drift a comparison that was
+  # made and came out unequal rather than one that could not be made at all.
+  #
+  # OKF_TRUST_NOTE is deliberately not warned about here, where `okf verify`
+  # prints it. Verify is one person asking about one concept; this is a
+  # subcommand whose stdout somebody is piping into jq, and the tier itself
+  # travels on every chunk.
+  concept_trust_tier "$concept" \
     || die "$concept is not a concept" \
       "a concept opens with --- on line 1 and closes with the next line that is exactly ---" \
       "SPEC.md §4 calls that layout a contract rather than a preference"
+  local p_trust="$OKF_TRUST_TIER"
+
+  # The concept-level half of §9's payload, copied out of the read above rather
+  # than read again — and copied now, so that a later edit does not have to know
+  # that stub_summary_text below reads the same variables.
+  local p_type="$OKF_FM_TYPE" p_status="$OKF_FM_STATUS"
+  local p_path="$OKF_FM_RESOURCE" p_language="$OKF_FM_CODE_LANGUAGE"
+  local p_hash="$OKF_FM_CODE_CONTENT_HASH" p_commit="$OKF_FM_CODE_COMMIT"
+  local base_symbol="$OKF_FM_CODE_SYMBOL"
+
+  # `path` is the source the concept documents and not the concept file, which
+  # is what `concept_id` already names. §9 puts `lines` beside it on the same
+  # payload, and a line range is a range in the source.
+  #
+  # `tags` and `lines` reach the payload as JSON of their own — a list of
+  # strings, a pair of numbers — rather than as the text §4 spells them in: a
+  # payload field exists to be filtered on, and `"[28, 214]"` is a value no
+  # filter can read.
+  local p_tags p_lines
+  p_tags="$(json_string_array ${OKF_FM_TAGS[@]+"${OKF_FM_TAGS[@]}"})"
+  chunk_lines_json "$OKF_FM_CODE_LINES"
+  p_lines="$OKF_CHUNK_LINES_JSON"
+
+  index_repo
+  local p_repo="$OKF_INDEX_REPO"
 
   split_concept_body "$concept" \
     || die "$concept: its body could not be read, so there are no chunks to emit"
@@ -6151,27 +6835,59 @@ cmd_chunk() {
     return 0
   fi
 
-  # The three arrays flattened into one NUL-separated stream and put back
+  # The per-chunk fields flattened into one NUL-separated stream and put back
   # together by jq, which is json_string_array's trick for its reason: a chunk's
   # text is somebody's prose and may hold quotes, backslashes, tabs and
-  # newlines, and NUL is the one byte `read` cannot have left in it.
+  # newlines, and NUL is the one byte `read` cannot have left in it. The
+  # concept-level fields go as `--arg` instead, being one value apiece rather
+  # than one per chunk.
+  chunk_symbols "$base_symbol"
+
   local -a fields=()
   local i=0
   while [ "$i" -lt "$total" ]; do
-    fields+=("${OKF_CHUNK_KIND[$i]}" "${OKF_CHUNK_HEADING[$i]}" "${OKF_CHUNK_TEXT[$i]}")
+    fields+=("${OKF_CHUNK_KIND[$i]}" "${OKF_CHUNK_SYMBOLS[$i]}" \
+      "${OKF_CHUNK_HEADING[$i]}" "${OKF_CHUNK_TEXT[$i]}")
     i=$((i + 1))
   done
 
+  # SPEC.md §9's payload in §9's own order, and then the two fields that are not
+  # payload at all: `text` is what gets embedded rather than something stored
+  # beside the vector, and `heading` is what tells one method chunk from its
+  # siblings before `symbol` is built out of it.
+  #
   # `heading` is empty for the summary and the schema on purpose. There is one
   # of each per concept, so neither needs telling apart from a sibling; a method
   # chunk does, and its `## ` line is the signature that does it.
-  printf '%s\0' "${fields[@]}" | jq -Rs --arg concept_id "$concept_id" '
+  printf '%s\0' "${fields[@]}" | jq -Rs \
+    --arg repo "$p_repo" \
+    --arg concept_id "$concept_id" \
+    --arg path "$p_path" \
+    --argjson lines "$p_lines" \
+    --arg language "$p_language" \
+    --arg type "$p_type" \
+    --argjson tags "$p_tags" \
+    --arg status "$p_status" \
+    --arg trust_tier "$p_trust" \
+    --arg content_hash "$p_hash" \
+    --arg commit "$p_commit" '
       split("\u0000")[:-1] as $f
-      | [ range(0; ($f | length); 3)
-          | { concept_id: $concept_id,
+      | [ range(0; ($f | length); 4)
+          | { repo: $repo,
+              concept_id: $concept_id,
               chunk_kind: $f[.],
-              heading: $f[. + 1],
-              text: $f[. + 2] } ]
+              symbol: $f[. + 1],
+              path: $path,
+              lines: $lines,
+              language: $language,
+              type: $type,
+              tags: $tags,
+              status: $status,
+              trust_tier: $trust_tier,
+              content_hash: $content_hash,
+              commit: $commit,
+              heading: $f[. + 2],
+              text: $f[. + 3] } ]
     ' || die "the chunks for $concept could not be rendered as JSON"
 }
 

@@ -12,7 +12,6 @@ code:
   symbol: com.example.kitchen.Fenced
   kind: class
   visibility: public
-  lines: [3, 7]
   signature: "public final class Fenced"
   members:
     - {name: render, signature: "public String render()", lines: [4, 6]}

@@ -8292,6 +8292,16 @@ _okf_chunk_json() { # $1.. = arguments after `chunk`
   _okf_chunk "$@"
   OKF_CHUNK_JSON=""
 
+  # Every caller of this helper is asking about a run that was meant to work, so
+  # a non-zero status is a failure here rather than something for each of them
+  # to remember to check. Reported only when it happens: a passing check per
+  # call would be the same fact counted twenty times. The refusals have their
+  # own probe, and it calls _okf_chunk directly.
+  if [ "$OKF_CHUNK_RC" -ne 0 ]; then
+    _fail "okf chunk $* exits 0" "exited $OKF_CHUNK_RC" "stderr:" "$OKF_CHUNK_ERR"
+    return 1
+  fi
+
   local slurped
   if ! slurped="$(printf '%s\n' "$OKF_CHUNK_OUT" | jq -s -c . 2> /dev/null)"; then
     local -a detail=("okf chunk $* did not print JSON" "stdout:")
@@ -8701,6 +8711,454 @@ test_okf_chunk_refuses_what_it_cannot_split() {
 }
 
 # ---------------------------------------------------------------------------
+# PLAN.md's Phase 9 payload item: SPEC.md §9's full field set on every chunk,
+# with the trust tier computed.
+#
+# §9 writes the payload out verbatim — "repo, concept_id, chunk_kind, symbol,
+# path, lines, language, type, tags, status, trust_tier, content_hash, commit"
+# — and this is that list, in that order, followed by the two fields that are
+# not payload: `text` is what gets embedded and `heading` is what tells one
+# method chunk from its siblings. Asserted as an ordered list rather than a set
+# because the payload of a Qdrant collection is a schema, and a field arriving
+# under another name, or not arriving, is a filter that silently matches
+# nothing.
+_OKF_PAYLOAD_KEYS='["repo","concept_id","chunk_kind","symbol","path","lines","language","type","tags","status","trust_tier","content_hash","commit","heading","text"]'
+
+# One payload field, asserted to be the same JSON value on every chunk in the
+# array okf chunk last printed — which is what a concept-level field means once
+# it is written onto each chunk separately. `unique` collapses the column, so a
+# field that differed on one chunk out of four comes back as a list of two.
+_assert_chunk_field_everywhere() { # $1 = field, $2 = expected JSON, $3 = message
+  assert_eq "[$2]" \
+    "$(printf '%s\n' "$OKF_CHUNK_JSON" | jq -c --arg key "$1" '[.[] | .[$key]] | unique')" \
+    "$3"
+}
+
+_okf_chunk_payload_probe() {
+  local concept
+
+  # Every concept in the bundle rather than only the one with the fullest
+  # frontmatter: "on every chunk" is the item, and a summary, a method chunk, a
+  # schema chunk and a body-less stub reach the document by different routes.
+  for concept in src/kitchen/Router src/kitchen/RouteKey src/kitchen/Fenced \
+    src/kitchen/NoSuchRouteException; do
+    _okf_chunk_json "$concept" || return 1
+    assert_eq "[$_OKF_PAYLOAD_KEYS]" \
+      "$(printf '%s\n' "$OKF_CHUNK_JSON" | jq -c '[.[] | keys_unsorted] | unique')" \
+      "$concept: every chunk carries SPEC.md §9's payload fields, in §9's order"
+  done
+
+  _okf_chunk_json src/kitchen/Router || return 1
+  assert_eq "0" "$OKF_CHUNK_RC" "okf chunk still exits 0 with the payload on"
+  assert_eq "" "$OKF_CHUNK_ERR" "and still says nothing on stderr"
+
+  # The concept-level fields, each read off the frontmatter and each the same on
+  # all four of Router's chunks.
+  #
+  # `path` is the source the concept documents and not the concept file, which
+  # `concept_id` already names — bundle-absolute, the way SPEC.md §4 spells a
+  # path-valued field, and the file the `lines` beside it are lines of.
+  _assert_chunk_field_everywhere path '"/src/kitchen/Router.java"' \
+    "path is the resource, bundle-absolute as SPEC.md §4 spells it"
+  _assert_chunk_field_everywhere lines '[6,26]' \
+    "lines is code.lines as JSON numbers, which is what a range filter can read"
+  _assert_chunk_field_everywhere language '"java"' "language is code.language"
+  _assert_chunk_field_everywhere type '"Class"' "type is the concept's own type"
+  _assert_chunk_field_everywhere tags '["routing"]' \
+    "tags is the flow sequence, as a JSON list of strings"
+  _assert_chunk_field_everywhere status '"stable"' "status is the concept's status"
+  _assert_chunk_field_everywhere content_hash \
+    '"sha256:a8333c1eb70ab7901dbaa5e04ff81994d438e05c414870972b38932b4bcfc698"' \
+    "content_hash is the stored code.content_hash"
+  _assert_chunk_field_everywhere commit '"0b94c63"' "commit is code.commit"
+
+  # SPEC.md §9 builds the Qdrant point ID out of
+  # `{repo}|{concept_id}|{chunk_kind}|{symbol}` "so upserts are idempotent and
+  # deletes targeted". Every method chunk of one concept agrees on the first
+  # three, so `symbol` is the only field left to tell them apart — a symbol that
+  # stayed the type's would give one concept's three methods one ID between
+  # them, and a bundle that collapsed to a single point per concept on upsert.
+  assert_eq "$(printf '%s\n' com.example.kitchen.Router \
+    'com.example.kitchen.Router#add(String, Handler)' \
+    'com.example.kitchen.Router#route(String)' \
+    'com.example.kitchen.Router#size()')" \
+    "$(_okf_chunk_column symbol)" \
+    "symbol names the member on a method chunk and the type on the summary"
+  assert_eq "4" \
+    "$(printf '%s\n' "$OKF_CHUNK_JSON" | jq '[.[] | .symbol] | unique | length')" \
+    "so the four chunks of one concept have four symbols between them"
+
+  # The bundle names itself when okf.json does not, which is `okf init`'s own
+  # default for the bundle-root index.md title: the directory the root is.
+  assert_eq "${PWD##*/}" "$(_okf_chunk_column repo | sort -u)" \
+    "repo defaults to the bundle's directory name when okf.json names none"
+  _okf_chunk_json -C src kitchen/Router || return 1
+  assert_eq "src" "$(_okf_chunk_column repo | sort -u)" \
+    "-C moves the bundle root, and that default moves with it"
+
+  # SPEC.md §6 puts the setting at `index.repo`, and §9 wants it on every point
+  # so that "cross-repo search is a filter change, not a schema change".
+  printf '%s\n' '{"index": {"repo": "kitchen-sink"}}' > okf.json
+  _okf_chunk_json src/kitchen/Router || return 1
+  assert_eq "kitchen-sink" "$(_okf_chunk_column repo | sort -u)" \
+    "index.repo in okf.json is what SPEC.md §6 names, and it wins"
+
+  printf '%s\n' '{"index": {"repo": 7}}' > okf.json
+  _okf_chunk src/kitchen/Router
+  assert_eq "1" "$OKF_CHUNK_RC" "an index.repo that is not a string is refused"
+  assert_eq "" "$OKF_CHUNK_OUT" "with nothing printed on stdout"
+  assert_contains "$OKF_CHUNK_ERR" "index.repo" "and the key named on stderr"
+
+  # `false` is a wrong shape like any other, and is worth its own check because
+  # jq's `//` reads it as absent: a repo silently named after its directory
+  # while every neighbouring wrong value was refused is the one failure here
+  # that looks like success.
+  printf '%s\n' '{"index": {"repo": false}}' > okf.json
+  _okf_chunk src/kitchen/Router
+  assert_eq "1" "$OKF_CHUNK_RC" "and so is an index.repo of false, rather than defaulting"
+  assert_contains "$OKF_CHUNK_ERR" "must be a string" "saying what was wrong with it"
+  rm -f okf.json
+
+  # A concept carrying none of the optional payload fields. Each absence is
+  # spelled differently on purpose: an empty list is a `tags` somebody wrote
+  # down as empty, an empty string is a `commit` there is none of, and `null` is
+  # a line range that does not exist — where `[]` would be a claim that the
+  # concept covers no lines at all.
+  _okf_chunk_json src/kitchen/Fenced || return 1
+  _assert_chunk_field_everywhere tags '[]' "tags is an empty list when there are none"
+  _assert_chunk_field_everywhere commit '""' "commit is empty when the concept records none"
+  # Fenced carries no `code.lines` and does carry a `code.members` entry with a
+  # `lines:` of its own, four spaces in. SPEC.md §4 puts the type's scalars at
+  # two and its list items at four, and reading the member's range as the type's
+  # would put a method's line numbers on the whole concept's payload.
+  _assert_chunk_field_everywhere lines 'null' \
+    "lines is null when the concept has no code.lines of its own"
+
+  # SPEC.md §8's three tiers, one concept each, computed rather than stored:
+  # nothing in any of these files holds the answer.
+  _okf_chunk_json src/kitchen/Router || return 1
+  _assert_chunk_field_everywhere trust_tier '"Unverified"' \
+    "a concept with no verified entry is Unverified on every chunk"
+  _okf_chunk_json src/kitchen/NoSuchRouteException || return 1
+  assert_eq "1" "$(printf '%s\n' "$OKF_CHUNK_JSON" | jq 'length')" \
+    "the body-less Tier 0 stub is still exactly one chunk"
+  assert_eq "com.example.kitchen.NoSuchRouteException" "$(_okf_chunk_field 0 symbol)" \
+    "and it carries the payload like any other chunk"
+  _assert_chunk_field_everywhere trust_tier '"Machine-confirmed"' \
+    "a concept verified only by a process: actor is Machine-confirmed"
+  _okf_chunk_json src/kitchen/RouteKey || return 1
+  _assert_chunk_field_everywhere trust_tier '"Human-reviewed"' \
+    "a human review later than generated.at, over a source that has not drifted"
+
+  # A record's summary and its schema both take the concept's bare
+  # `code.symbol`, and that is not a collision: SPEC.md §9's point ID carries
+  # `chunk_kind` as well, so the two are already two points. A uniqueness rule
+  # that looked at `symbol` alone would rename the schema chunk of every record
+  # in the bundle to settle a clash the ID has not got.
+  assert_eq "$(printf '%s\n' summary schema)" "$(_okf_chunk_column chunk_kind)" \
+    "a record chunks into a summary and a schema"
+  _assert_chunk_field_everywhere symbol '"com.example.kitchen.RouteKey"' \
+    "and both of them carry the concept's own symbol, unaltered"
+
+  # SPEC.md §8's degradation, which is the half of the rule a stored field could
+  # never carry: the concept is not edited here, its source is, and the tier the
+  # next chunk run reports is one lower. Left until last because it drifts the
+  # fixture.
+  printf '\n// a change nobody re-reviewed\n' >> src/kitchen/RouteKey.java
+  _okf_chunk_json src/kitchen/RouteKey || return 1
+  _assert_chunk_field_everywhere trust_tier '"Machine-confirmed"' \
+    "and it degrades once the source drifts, per SPEC.md §8"
+  return 0
+}
+
+test_okf_chunk_carries_the_spec_9_payload_on_every_chunk() {
+  _okf_preconditions || return 1
+  with_fixture_repo chunks _okf_chunk_payload_probe
+}
+
+# One throwaway concept in the fixture copy, chunked. Written rather than added
+# to tests/fixtures/, because each of these exists to pin one spelling of one
+# field and a fixture file per spelling would be a bundle nobody could read.
+#
+# No co-located source and no `code.content_hash`: SPEC.md §8 makes drift a
+# comparison between two values, so a concept storing neither is not drifted and
+# its trust tier is settled by its `verified` entries alone.
+_okf_chunk_shape() { # $1 = a bundle-relative concept path, $2.. = code: lines
+  local path="$1"
+  shift
+  {
+    printf -- '---\n'
+    printf 'type: Class\n'
+    printf 'title: Shape\n'
+    while [ $# -gt 0 ]; do
+      printf '%s\n' "$1"
+      shift
+    done
+    printf -- '---\n\n# Responsibilities\n\nOne section, so there is one chunk.\n'
+  } > "$path"
+  _okf_chunk_json "${path%.md}"
+}
+
+# The frontmatter spellings SPEC.md §4 allows for the two payload fields that
+# are not plain scalars, each of which reaches the payload through a different
+# branch of the reader.
+_okf_chunk_payload_shapes_probe() {
+  # §4's own spelling, and the one every writer in this repo emits.
+  _okf_chunk_shape src/kitchen/Flow.md 'tags: [routing, cache]' || return 1
+  _assert_chunk_field_everywhere tags '["routing","cache"]' \
+    "a flow sequence is read as its items"
+
+  # The same document written as a block sequence, which is what a YAML library
+  # emits when it is asked to write a list.
+  _okf_chunk_shape src/kitchen/Block.md 'tags:' '  - routing' '  - cache' || return 1
+  _assert_chunk_field_everywhere tags '["routing","cache"]' \
+    "and a block sequence is read as the same two items"
+
+  # A `-` flush left is the same YAML as one indented under its key.
+  _okf_chunk_shape src/kitchen/Flush.md 'tags:' '- routing' 'status: draft' || return 1
+  _assert_chunk_field_everywhere tags '["routing"]' \
+    "a block sequence item flush left belongs to the key above it"
+  _assert_chunk_field_everywhere status '"draft"' \
+    "and the unindented key after it ends the list rather than joining it"
+
+  # `tags: []` is a decision somebody wrote down, and `tags:` with nothing under
+  # it is the same empty list; neither is a concept that has no tags key at all,
+  # but all three carry the same payload, because an empty list is what "none"
+  # looks like once it is JSON.
+  _okf_chunk_shape src/kitchen/Empty.md 'tags: []' || return 1
+  _assert_chunk_field_everywhere tags '[]' "an empty flow sequence is an empty list"
+
+  # `tags: routing` is a scalar rather than a list, and a bundle whose author
+  # meant one tag is better served by the tag than by silence.
+  _okf_chunk_shape src/kitchen/Scalar.md 'tags: routing' || return 1
+  _assert_chunk_field_everywhere tags '["routing"]' \
+    "a bare scalar tag is read as the one tag it names"
+
+  # A quote opens a quoted scalar where an item begins and nowhere else, which
+  # is YAML's own rule: an apostrophe inside a word taken for one would swallow
+  # the comma after it and answer one tag where the concept names two.
+  _okf_chunk_shape src/kitchen/Quoted.md "tags: [don't, care]" || return 1
+  _assert_chunk_field_everywhere tags '["don'"'"'t","care"]' \
+    "an apostrophe inside an item is part of it, not the start of a quote"
+  _okf_chunk_shape src/kitchen/Comma.md 'tags: ["routing, cached", plain]' || return 1
+  _assert_chunk_field_everywhere tags '["routing, cached","plain"]' \
+    "and a comma inside a quoted item separates nothing"
+
+  # A `#` inside a quoted item is part of the tag. The sequence is read off the
+  # line as written for exactly this: the general scalar reader ends a value at
+  # the first ` #`, which would leave `[alpha, "beta` — not a sequence at all,
+  # and so one junk tag on the payload where the concept named two.
+  _okf_chunk_shape src/kitchen/Hashed.md 'tags: [alpha, "beta #gamma"]' || return 1
+  _assert_chunk_field_everywhere tags '["alpha","beta #gamma"]' \
+    "a hash inside a quoted item is part of it, not the start of a comment"
+  _okf_chunk_shape src/kitchen/Trailing.md 'tags: [alpha, beta] # and a note' || return 1
+  _assert_chunk_field_everywhere tags '["alpha","beta"]' \
+    "while a comment after the closing bracket is still a comment"
+  _okf_chunk_shape src/kitchen/Unclosed.md 'tags: [alpha, beta' || return 1
+  _assert_chunk_field_everywhere tags '["[alpha, beta"]' \
+    "and a bracket that never closes is not a sequence okf finishes itself"
+  # The same rule as the hash, one item further in: a `]` inside a quoted item
+  # is part of the tag, so the item after it must not be lost to a sequence read
+  # as having ended early.
+  _okf_chunk_shape src/kitchen/Bracket.md 'tags: [alpha, "b]c", gamma]' || return 1
+  _assert_chunk_field_everywhere tags '["alpha","b]c","gamma"]' \
+    "a bracket inside a quoted item does not close the sequence"
+  # A backslash inside a double-quoted item takes the next character with it,
+  # which is YAML's rule. Read otherwise, the `\"` closes the quote, the `]`
+  # after it ends a sequence that had not ended, and the tags past it are gone.
+  _okf_chunk_shape src/kitchen/Escaped.md 'tags: [alpha, "b\"]c", gamma]' || return 1
+  _assert_chunk_field_everywhere tags '["alpha","b\"]c","gamma"]' \
+    "an escaped quote inside an item is part of it, brackets and all"
+
+  # Whitespace around an item is never part of it, and whitespace inside its
+  # quotes always is. Both at once, because a trim applied after the quotes come
+  # off can no longer tell the two apart.
+  _okf_chunk_shape src/kitchen/Spaced.md 'tags: [ alpha , " beta " ]' || return 1
+  _assert_chunk_field_everywhere tags '["alpha"," beta "]' \
+    "spaces outside an item are dropped and spaces inside its quotes are kept"
+
+  # YAML's other escape: inside single quotes a doubled quote stands for one.
+  _okf_chunk_shape src/kitchen/Doubled.md "tags: ['it''s', beta]" || return 1
+  _assert_chunk_field_everywhere tags '["it'"'"'s","beta"]' \
+    "a doubled quote inside a single-quoted item is the one quote it stands for"
+
+  # A nested sequence is not a shape okf reads. Refused rather than ended at the
+  # inner bracket, which would drop every item after it and put a `[alpha` on
+  # the payload as though somebody had written it as a tag.
+  _okf_chunk_shape src/kitchen/Nested.md 'tags: [[alpha, beta], gamma]' || return 1
+  _assert_chunk_field_everywhere tags '["[[alpha, beta], gamma]"]' \
+    "a nested sequence is left as the text it is rather than half-read"
+
+  # A `code.lines` that is there and is not a pair of numbers: null, the same
+  # answer as absent, because half a range is worse than none — see
+  # chunk_lines_json.
+  _okf_chunk_shape src/kitchen/Ragged.md 'code:' '  lines: [6, ?]' || return 1
+  _assert_chunk_field_everywhere lines 'null' \
+    "a code.lines holding anything but digits is null rather than half a range"
+  _okf_chunk_shape src/kitchen/Bare.md 'code:' '  lines: 6' || return 1
+  _assert_chunk_field_everywhere lines 'null' \
+    "and so is one that is not a sequence at all"
+  _okf_chunk_shape src/kitchen/Padded.md 'code:' '  lines: [06, 26]' || return 1
+  _assert_chunk_field_everywhere lines '[6,26]' \
+    "a leading zero is read as decimal, which is what JSON can carry"
+
+  # SPEC.md §4 writes `lines: [28, 214]`, and a range is its two ends. One end
+  # is a range okf would be finishing on the concept's behalf, and three is one
+  # it cannot place at all — a consumer reads either as a range, and neither is.
+  _okf_chunk_shape src/kitchen/Half.md 'code:' '  lines: [28]' || return 1
+  _assert_chunk_field_everywhere lines 'null' \
+    "a code.lines with one end is null rather than a range okf finished itself"
+  _okf_chunk_shape src/kitchen/Triple.md 'code:' '  lines: [1, 2, 3]' || return 1
+  _assert_chunk_field_everywhere lines 'null' \
+    "and so is one with three"
+
+  # More digits than any file has lines. Neither wrapped by bash arithmetic nor
+  # re-encoded as `1e+20` by a jq older than 1.7 — a value okf cannot carry
+  # through unchanged is one it declines to carry, like every other unusable
+  # code.lines here.
+  _okf_chunk_shape src/kitchen/Huge.md 'code:' \
+    '  lines: [99999999999999999999, 1]' || return 1
+  _assert_chunk_field_everywhere lines 'null' \
+    "a line number too long to survive the round trip is null, not a wrapped one"
+  _okf_chunk_shape src/kitchen/Wide.md 'code:' '  lines: [1, 999999999999999]' || return 1
+  _assert_chunk_field_everywhere lines '[1,999999999999999]' \
+    "while fifteen digits still go through as the number they are"
+  return 0
+}
+
+test_okf_chunk_reads_the_payloads_frontmatter_spellings() {
+  _okf_preconditions || return 1
+  with_fixture_repo chunks _okf_chunk_payload_shapes_probe
+}
+
+# SPEC.md §9's point ID is a digest of
+# `{repo}|{concept_id}|{chunk_kind}|{symbol}`, and on the method chunks of one
+# concept `symbol` is the only one of the four that varies. So a symbol that
+# repeats is a point ID that repeats, and an upsert of the second chunk quietly
+# replaces the first — a concept losing half its methods from the index with
+# nothing anywhere reporting it. These are the headings that would do it.
+_okf_chunk_symbol_probe() {
+  cat > src/kitchen/Awkward.md <<'CONCEPT'
+---
+type: Class
+title: Awkward
+code:
+  symbol: com.example.kitchen.Awkward
+---
+
+# Methods
+
+## public void add(String)
+
+One overload.
+
+## public void add(String, Handler)
+
+The other, which shares a name with it and not a signature.
+
+## public void remove (String path)
+
+A space before the parameter list, which is unusual and is not wrong.
+
+## func (a *Awkward) Sweep(n int)
+
+A receiver, which is where Go puts the first parentheses on the line.
+
+## capacity
+
+## @Deprecated(since = "1") public void purge(String)
+
+An annotation with arguments of its own, in front of the member's.
+
+## @Deprecated(since = "1") public void purge(String, Handler)
+
+Which two members can share, so it cannot be what names either of them.
+
+## #[deprecated(note = "x")] pub fn drain() -> usize
+
+The same fact spelled as a Rust attribute.
+
+## @Deprecated(since = "1") public void trim (String)
+
+An annotation and a space before the parameter list at once, which is the one
+combination where each rule alone lands on the other's parentheses.
+
+## const grow = (n) => n + 1
+
+## const shrink = (n) => n - 1
+
+Two headings whose last word before the parentheses is an `=`, so neither of
+them has a name for a symbol to be built out of.
+
+## func (a *Awkward) Fill (n int)
+
+## func (a *Awkward) Empty (n int)
+
+A receiver and a space before the parameters, which is the shape nothing here
+reads correctly — and so is the shape that proves no two chunks of one concept
+are ever left sharing a symbol.
+
+## flush (a) then (
+
+Parentheses left open behind the one the name was found by, which is where a
+parameter list stops being obvious.
+
+## public void twice(int)
+
+## public void twice(int)
+
+## public void twice(int)
+
+One member written three times. No reading of the heading separates these,
+because the headings are the same string — so the symbol stays the readable one
+and the copies are numbered in document order.
+CONCEPT
+  _okf_chunk_json src/kitchen/Awkward || return 1
+
+  assert_eq "$(printf '%s\n' \
+    'com.example.kitchen.Awkward#add(String)' \
+    'com.example.kitchen.Awkward#add(String, Handler)' \
+    'com.example.kitchen.Awkward#remove(String path)' \
+    'com.example.kitchen.Awkward#Sweep(n int)' \
+    'com.example.kitchen.Awkward#capacity' \
+    'com.example.kitchen.Awkward#purge(String)' \
+    'com.example.kitchen.Awkward#purge(String, Handler)' \
+    'com.example.kitchen.Awkward#drain()' \
+    'com.example.kitchen.Awkward#trim(String)' \
+    'com.example.kitchen.Awkward#const grow = (n) => n + 1' \
+    'com.example.kitchen.Awkward#const shrink = (n) => n - 1' \
+    'com.example.kitchen.Awkward#func (a *Awkward) Fill (n int)' \
+    'com.example.kitchen.Awkward#func (a *Awkward) Empty (n int)' \
+    'com.example.kitchen.Awkward#flush(a)' \
+    'com.example.kitchen.Awkward#twice(int)' \
+    'com.example.kitchen.Awkward#twice(int)~2' \
+    'com.example.kitchen.Awkward#twice(int)~3')" \
+    "$(_okf_chunk_column symbol)" \
+    "a member's symbol is its name and its parameter list, or the heading whole"
+
+  # The invariant the whole exercise is for. A heading is prose a slash command
+  # wrote, so no reading of one is guaranteed to name a member — but two chunks
+  # of one concept sharing a symbol is two chunks sharing a SPEC.md §9 point ID,
+  # and the second upsert would replace the first.
+  local total
+  total="$(printf '%s\n' "$OKF_CHUNK_JSON" | jq 'length')"
+  assert_eq "$total" \
+    "$(printf '%s\n' "$OKF_CHUNK_JSON" | jq '[.[] | .symbol] | unique | length')" \
+    "so no two chunks of one concept ever share a symbol, and none share a point ID"
+
+  # And the substitution is the concept's own headings and nothing else, so a
+  # second run over an unchanged file upserts the same points.
+  local once="$OKF_CHUNK_JSON"
+  _okf_chunk_json src/kitchen/Awkward || return 1
+  assert_eq "$once" "$OKF_CHUNK_JSON" "chunking the same concept twice answers the same"
+  return 0
+}
+
+test_okf_chunk_gives_every_method_chunk_its_own_symbol() {
+  _okf_preconditions || return 1
+  with_fixture_repo chunks _okf_chunk_symbol_probe
+}
+
 # install.sh (PLAN.md Phase 6)
 # ---------------------------------------------------------------------------
 

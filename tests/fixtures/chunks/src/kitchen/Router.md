@@ -21,6 +21,7 @@ code:
     - {name: size, signature: "public int size()", lines: [23, 25]}
   tier: 1
   content_hash: "sha256:a8333c1eb70ab7901dbaa5e04ff81994d438e05c414870972b38932b4bcfc698"
+  commit: "0b94c63"
 ---
 
 # Responsibilities
