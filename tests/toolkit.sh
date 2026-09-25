@@ -14780,12 +14780,18 @@ FAKE
   return 0
 }
 
-# One real bin/ralph run in the current fixture repo, with those stand-ins in
-# front of it. Both captures are removed first, so "claude was never called" is
-# an honestly empty file rather than the leftovers of the run before.
-_ralph_run() { # $@ = flags for bin/ralph
+# One real run of a ralph wrapper in the current fixture repo, with those
+# stand-ins in front of it. Every capture is removed first, so "claude was never
+# called" is an honestly empty file rather than the leftovers of the run before.
+#
+# RALPH_WORKTREES_DIR is pinned under $HARNESS_STATE so that an isolated run's
+# worktree lands somewhere the harness removes at exit, not beside the fixture
+# copy in TMPDIR where with_fixture_repo's cleanup would never see it.
+_ralph_run_with() { # $1 = wrapper under bin/, $@ = flags for it
+  local prog="$1"
+  shift
   local bindir="$HARNESS_STATE/ralph-run-bin"
-  _ralph_probe_bin "$bindir" || _abort "cannot build the stand-ins for a bin/ralph run"
+  _ralph_probe_bin "$bindir" || _abort "cannot build the stand-ins for a bin/$prog run"
   rm -f "$HARNESS_STATE/ralph-prompt" "$HARNESS_STATE/ralph-mvn" \
         "$HARNESS_STATE/ralph-model" "$HARNESS_STATE/ralph-agent"
 
@@ -14797,23 +14803,26 @@ _ralph_run() { # $@ = flags for bin/ralph
   RALPH_MVN_CAPTURE="$HARNESS_STATE/ralph-mvn" \
   RALPH_MODEL_CAPTURE="$HARNESS_STATE/ralph-model" \
   RALPH_AGENT_CAPTURE="$HARNESS_STATE/ralph-agent" \
-    bash "$TOOLKIT_ROOT/bin/ralph" "$@"
+  RALPH_WORKTREES_DIR="$HARNESS_STATE/worktrees" \
+    bash "$TOOLKIT_ROOT/bin/$prog" "$@"
+}
+
+# A bin/ralph run in the fixture copy itself. --here, because these probes read
+# PLAN.md and git log out of the cwd afterwards: they are about what a run says
+# and does, not where it does it. The isolation tests below drop the flag.
+_ralph_run() { # $@ = flags for bin/ralph
+  _ralph_run_with ralph --here "$@"
 }
 
 # The same run, through bin/ralph-uber instead — the wrapper that picks the
 # agent per item rather than the model.
 _ralph_run_uber() { # $@ = flags for bin/ralph-uber
-  local bindir="$HARNESS_STATE/ralph-run-bin"
-  _ralph_probe_bin "$bindir" || _abort "cannot build the stand-ins for a bin/ralph-uber run"
-  rm -f "$HARNESS_STATE/ralph-prompt" "$HARNESS_STATE/ralph-mvn" \
-        "$HARNESS_STATE/ralph-model" "$HARNESS_STATE/ralph-agent"
+  _ralph_run_with ralph-uber --here "$@"
+}
 
-  PATH="$bindir:$PATH" \
-  RALPH_PROMPT_CAPTURE="$HARNESS_STATE/ralph-prompt" \
-  RALPH_MVN_CAPTURE="$HARNESS_STATE/ralph-mvn" \
-  RALPH_MODEL_CAPTURE="$HARNESS_STATE/ralph-model" \
-  RALPH_AGENT_CAPTURE="$HARNESS_STATE/ralph-agent" \
-    bash "$TOOLKIT_ROOT/bin/ralph-uber" "$@"
+# The default run: no --here, so it cuts its own branch and worktree.
+_ralph_run_isolated() { # $1 = wrapper under bin/, $@ = flags for it
+  _ralph_run_with "$@"
 }
 
 _ralph_captured_prompt() { cat "$HARNESS_STATE/ralph-prompt" 2> /dev/null; }
@@ -15226,6 +15235,172 @@ _ralph_uber_distills_per_agent_probe() {
 
 test_ralph_uber_distills_each_item_with_its_own_agent_parser() {
   with_fixture_repo items _ralph_uber_distills_per_agent_probe
+}
+
+# ---------------------------------------------------------------------------
+# Run isolation: a run works on its own branch in its own worktree and leaves
+# the checkout alone.
+#
+# The item is [mvn] with `then=true`, so the stand-in mvn succeeds and ralph
+# itself checks the item off and commits — one real commit, made by ralph, with
+# nothing about where it lands left to a stand-in agent.
+_ralph_isolated_run_probe() { # $1 = wrapper under bin/
+  local prog="$1" before_sha before_branch out branch wt
+  _ralph_write_plan '[mvn] Isolated build :: goal=org.example:demo:1.0:run then=true'
+  git add PLAN.md && git commit -q -m "fixture: plan for an isolated run"
+  before_sha="$(git rev-parse HEAD)"
+  before_branch="$(git rev-parse --abbrev-ref HEAD)"
+
+  assert_exit 0 _ralph_run_isolated "$prog" --max-attempts 1
+  out="$(last_output)"
+
+  # The checkout: same branch, same HEAD, same unchecked plan.
+  assert_eq "$before_branch" "$(git rev-parse --abbrev-ref HEAD)" \
+    "$prog leaves the checkout on the branch it was started from"
+  assert_eq "$before_sha" "$(git rev-parse HEAD)" \
+    "$prog adds no commit to the checkout's branch"
+  assert_contains "$(cat PLAN.md)" '- [ ] [mvn] Isolated build' \
+    "$prog leaves the checkout's PLAN.md unchecked"
+  if [ -e .ralph ]; then
+    _fail "$prog writes no .ralph/ into the checkout" "found $(pwd)/.ralph"
+  else
+    _pass "$prog writes no .ralph/ into the checkout"
+  fi
+
+  # The branch: exactly one, named for the plan, one commit ahead, with the
+  # item checked off in it.
+  branch="$(git for-each-ref --format='%(refname:short)' 'refs/heads/ralph/')"
+  assert_eq 1 "$(printf '%s\n' "$branch" | grep -c .)" \
+    "$prog cuts exactly one ralph/ branch"
+  case "$branch" in
+    ralph/plan-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9])
+      _pass "the branch is ralph/<plan>-<timestamp>" ;;
+    *) _fail "the branch is ralph/<plan>-<timestamp>" "got: $branch" ;;
+  esac
+  assert_eq "$before_sha" "$(git rev-parse "$branch~1" 2> /dev/null)" \
+    "the branch is cut from the checkout's HEAD"
+  assert_contains "$(git log -1 --format=%s "$branch")" 'ralph: [mvn] Isolated build' \
+    "ralph's commit landed on the branch"
+  assert_contains "$(git show "$branch:PLAN.md")" '- [x] [mvn] Isolated build' \
+    "the item is checked off on the branch"
+
+  # The worktree: registered, under RALPH_WORKTREES_DIR, holding the run log.
+  wt="$(git worktree list --porcelain | sed -n 's/^worktree //p' | grep -F "$HARNESS_STATE/worktrees/" | head -n 1)"
+  if [ -n "$wt" ] && [ -d "$wt" ]; then
+    _pass "the run's worktree is registered under RALPH_WORKTREES_DIR"
+  else
+    _fail "the run's worktree is registered under RALPH_WORKTREES_DIR" \
+      "$(git worktree list)"
+  fi
+  assert_eq "$branch" "$(git -C "$wt" rev-parse --abbrev-ref HEAD 2> /dev/null)" \
+    "the worktree has the run's branch checked out"
+  if [ -s "$wt/.ralph/run.log" ]; then
+    _pass "the run log is in the worktree, not the checkout"
+  else
+    _fail "the run log is in the worktree, not the checkout" "no $wt/.ralph/run.log"
+  fi
+
+  # What the run said: the branch to open a PR from, and where the work is.
+  assert_contains "$out" "isolated run — branch $branch" \
+    "$prog announces the branch when it starts"
+  assert_contains "$out" "git push -u origin $branch" \
+    "$prog ends by saying how to open a pull request"
+  assert_contains "$out" "git worktree remove $wt" \
+    "$prog ends by saying how to remove the worktree"
+
+  # Removed here rather than left to the harness: the fixture's .git goes away
+  # with the fixture copy, and a worktree whose repo is gone is just a stray
+  # directory that the next isolated test would find in the same place.
+  git worktree remove --force "$wt" 2> /dev/null || rm -rf "$wt"
+  return 0
+}
+
+test_ralph_isolates_a_run_on_its_own_branch_and_worktree() {
+  with_fixture_repo items _ralph_isolated_run_probe ralph
+}
+
+test_ralph_uber_isolates_a_run_the_same_way() {
+  with_fixture_repo items _ralph_isolated_run_probe ralph-uber
+}
+
+# The worktree is cut from HEAD, so a plan that is not in HEAD would not be in
+# the run at all. Refused before anything is created, on both the untracked
+# and the modified spellings.
+_ralph_uncommitted_plan_probe() {
+  local out
+  _ralph_write_plan '[mvn] Never runs :: goal=org.example:demo:1.0:run then=true'
+
+  assert_exit 1 _ralph_run_isolated ralph --max-attempts 1
+  out="$(last_output)"
+  assert_contains "$out" "PLAN.md is not committed" \
+    "an untracked plan is refused by name"
+  assert_contains "$out" "--here" \
+    "the refusal points at --here as the way to run anyway"
+
+  git add PLAN.md && git commit -q -m "fixture: plan"
+  printf -- '- [ ] one more\n' >> PLAN.md
+  assert_exit 1 _ralph_run_isolated ralph --max-attempts 1
+  assert_contains "$(last_output)" "PLAN.md has uncommitted changes" \
+    "a modified plan is refused by name"
+
+  assert_eq "" "$(git for-each-ref --format='%(refname:short)' 'refs/heads/ralph/')" \
+    "a refused run cuts no branch"
+  assert_eq 1 "$(git worktree list | grep -c .)" \
+    "a refused run adds no worktree"
+  if [ -e .ralph ]; then
+    _fail "a refused run writes no .ralph/" "found $(pwd)/.ralph"
+  else
+    _pass "a refused run writes no .ralph/"
+  fi
+  if [ -e "$HARNESS_STATE/ralph-mvn" ]; then
+    _fail "a refused run runs no item" "mvn was invoked"
+  else
+    _pass "a refused run runs no item"
+  fi
+  return 0
+}
+
+test_ralph_refuses_an_isolated_run_on_an_uncommitted_plan() {
+  with_fixture_repo items _ralph_uncommitted_plan_probe
+}
+
+# --here is the old behaviour, exactly: the checkout's branch, the checkout's
+# tree, and no isolation note at the end.
+_ralph_here_probe() {
+  local before_branch out
+  _ralph_write_plan '[mvn] In place :: goal=org.example:demo:1.0:run then=true'
+  before_branch="$(git rev-parse --abbrev-ref HEAD)"
+
+  assert_exit 0 _ralph_run --max-attempts 1
+  out="$(last_output)"
+  assert_eq "$before_branch" "$(git rev-parse --abbrev-ref HEAD)" \
+    "--here stays on the checkout's branch"
+  assert_contains "$(git log -1 --format=%s)" 'ralph: [mvn] In place' \
+    "--here commits to the checkout's branch"
+  assert_contains "$(cat PLAN.md)" '- [x] [mvn] In place' \
+    "--here checks the item off in the checkout's PLAN.md"
+  assert_eq "" "$(git for-each-ref --format='%(refname:short)' 'refs/heads/ralph/')" \
+    "--here cuts no branch"
+  assert_eq 1 "$(git worktree list | grep -c .)" \
+    "--here adds no worktree"
+  _refute_contains "$out" "isolated run" "--here prints no isolation banner"
+  _refute_contains "$out" "git worktree remove" "--here prints no worktree note"
+}
+
+test_ralph_here_runs_in_the_checkout_as_before() {
+  with_fixture_repo items _ralph_here_probe
+}
+
+# Both the flag and the behaviour are in --help, since --help is where a user
+# who finds an unexpected branch goes to ask why.
+test_ralph_help_documents_run_isolation() {
+  assert_exit 0 _ralph_run --help
+  local out
+  out="$(last_output)"
+  assert_contains "$out" "--here" "--help lists --here"
+  assert_contains "$out" "Run isolation" "--help explains run isolation"
+  assert_contains "$out" "ralph/<plan>-<timestamp>" "--help gives the branch naming"
+  assert_contains "$out" "RALPH_WORKTREES_DIR" "--help names the worktree location override"
 }
 
 # --- add new test_* functions above this line ------------------------------

@@ -399,6 +399,16 @@ passed the current item's tier alongside its own arguments. Everything else (PLA
 parsing, the attempt loop, commit detection, `[mvn]` items, concept refresh) is shared and
 knows nothing about which agent is running.
 
+Run isolation. A run works on its own branch in its own git worktree. `ralph_main` cuts
+`ralph/<plan>-<timestamp>` from `HEAD`, adds a worktree for it beside the checkout
+(`<checkout>.ralph/`, overridable with `RALPH_WORKTREES_DIR`) and moves the process there
+before the loop starts; the loop is written entirely in cwd-relative paths, so nothing
+after that point knows which of the two it is in. The checkout is never touched, and the
+run ends by naming the branch to open a pull request from — the result is a branch, never
+a commit on the caller's branch. Because the worktree starts from `HEAD`, a plan that is
+untracked or modified is refused rather than copied in. Git history is memory within a run
+and not across runs. `--here` is the opt-out and reproduces the pre-isolation behaviour.
+
 Item tiers. A normal item may open with `[cheap]`, `[standard]` or `[deep]`; unmarked means
 `standard`, so a plan written before tiers behaves exactly as it did. The names are
 agent-neutral and a model name never appears in PLAN.md — `ralph_agent_model_for_tier` maps

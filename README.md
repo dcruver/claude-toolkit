@@ -116,7 +116,11 @@ checklist). Read both, then:
 ralph --plan PLAN.md
 ```
 
-Each item gets a fresh session. See `ralph --help` for `--max-attempts`, `--items`,
+Each item gets a fresh session. The run works on its own branch,
+`ralph/<plan>-<timestamp>`, in its own git worktree beside your checkout, and ends by
+naming the branch to open a pull request from. Your checkout is never touched, which
+also means `PLAN.md` must be committed before the run can see it. Pass `--here` to run
+in the checkout instead. See `ralph --help` for `--max-attempts`, `--items`,
 `--review-gate` and `--model`.
 
 ### 4. Optional: semantic search
@@ -310,6 +314,14 @@ both are in scope by default.
 design reference lives separately in `SPEC.md`, written once and never edited by ralph.
 Most items are a genuinely fresh `claude -p` call; git history is the only memory
 between attempts.
+
+Each run is isolated: ralph cuts a branch `ralph/<plan>-<timestamp>` from `HEAD`, adds a
+git worktree for it beside the checkout (`<checkout>.ralph/`, or `$RALPH_WORKTREES_DIR`),
+and does all its work there. The checkout keeps its branch, its working tree and its
+untracked files. The run ends by naming the branch, so the result is always a pull
+request and never a surprise commit on `main`. Because the worktree starts from `HEAD`,
+an uncommitted plan is refused rather than copied in. Attempts share git history within
+a run, not across runs. `--here` opts out and runs the loop in the checkout.
 
 A `[mvn]` item type lets `/ralph-spec` hand off deterministic Maven-plugin work
 (OpenRewrite recipes, Spotless, Checkstyle, dependency bumps) that ralph runs directly —

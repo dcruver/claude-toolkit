@@ -121,10 +121,22 @@ Options:
                           tier markers in the plan (default: unset — each
                           item's own tier picks its model, and an unmarked
                           item inherits the step agent's default)
+  --here                  Run in this checkout, on its current branch,
+                          instead of in an isolated worktree (see below).
   -h, --help              Show this help and exit
 
 Requires a git repo (run /onboard or git init first) — git history is the
 only memory a fresh attempt has of what came before it.
+
+Run isolation: by default a run cuts a branch ralph/<plan>-<timestamp> from
+HEAD, adds a git worktree for it beside this checkout (<checkout>.ralph/, or
+$RALPH_WORKTREES_DIR), and does all its work there. This checkout is never
+touched — not its branch, its working tree, or its untracked files — and the
+run ends by naming the branch to open a pull request from. Because the
+worktree starts from HEAD, the plan must be committed first; an uncommitted
+plan is refused rather than copied. Every run is a new branch: attempts share
+git history within a run, not across runs. --here runs the loop in this
+checkout instead, which is how earlier versions always ran.
 
 Item types (see PLAN.md itself, or the header comment in ralph-common, for
 the full [mvn] field syntax):
@@ -143,7 +155,8 @@ at the end of this help for this one's mapping.
   - [ ] [deep] Hard design work, worth the most capable model
 A tier on a [mvn] item is an error: those items run no LLM to choose for.
 
-Progress: .ralph/run.log (one line per attempt).
+Progress: .ralph/run.log (one line per attempt), in the run's worktree — or
+in this checkout under --here.
 Per attempt, .ralph/logs/ holds:
   item-NNN-attempt-N.jsonl         full JSONL transcript (the real record)
   item-NNN-attempt-N.jsonl.stderr  the step agent's stderr for that attempt
@@ -579,6 +592,106 @@ concept_refresh_prompt() { # $1 = the model ralph was given, empty when unset
     '`/okf-refresh` is these same rules in full, if that command is installed here.'
 }
 
+# ---------------------------------------------------------------------------
+# Run isolation
+# ---------------------------------------------------------------------------
+#
+# A run works on its own branch in its own git worktree, and leaves both behind
+# for a pull request. The checkout ralph was started from is never touched:
+# not its branch, not its working tree, not its untracked files. The loop below
+# is written entirely in paths relative to the current directory — the plan,
+# .ralph/, every git command, and the step agents themselves act on their cwd —
+# so isolation is a `cd` before the loop starts, and nothing after it changes.
+#
+# The worktree starts from HEAD, which is the point: an uncommitted plan, or
+# an uncommitted anything, is not part of the run. That is why an isolated run
+# insists the plan is committed rather than copying it across — a copy would
+# hide exactly the drift the isolation exists to keep out.
+#
+# --here is the opt-out: the loop runs in the current checkout on the current
+# branch, which is how ralph always ran before this section existed.
+
+RALPH_WORKTREE=""   # absolute path of the run's worktree; empty under --here
+RALPH_BRANCH=""     # the run's branch; empty under --here
+RALPH_BASE=""       # what the branch was cut from, for the closing note
+
+# Where run worktrees live: a sibling of the checkout named after it, so that
+# nothing that walks the checkout's tree — okf's `git ls-files`, an editor, a
+# test runner globbing fixtures — ever finds a second copy of the repo inside
+# the first. RALPH_WORKTREES_DIR overrides it.
+ralph_worktrees_dir() { # $1 = the checkout's top-level directory
+  if [[ -n "${RALPH_WORKTREES_DIR:-}" ]]; then
+    printf '%s' "$RALPH_WORKTREES_DIR"
+  else
+    printf '%s.ralph' "$1"
+  fi
+}
+
+# Cuts the run's branch from HEAD, adds a worktree for it, and moves the process
+# there. On return PLAN names the plan relative to the worktree root, and
+# RALPH_WORKTREE / RALPH_BRANCH / RALPH_BASE describe the run. Exits 1 with a
+# reason when the plan is not committed or git cannot add the worktree.
+ralph_enter_worktree() {
+  local toplevel plan_rel stem stamp worktrees_dir
+
+  if ! git ls-files --error-unmatch -- "$PLAN" > /dev/null 2>&1; then
+    echo "ralph: $PLAN is not committed. An isolated run works in a fresh worktree cut from HEAD, so it can only see a plan that is in git — commit $PLAN first, or pass --here to run in this checkout instead." >&2
+    exit 1
+  fi
+  if ! git diff --quiet HEAD -- "$PLAN" 2> /dev/null; then
+    echo "ralph: $PLAN has uncommitted changes. An isolated run works in a fresh worktree cut from HEAD and would not see them — commit $PLAN first, or pass --here to run in this checkout instead." >&2
+    exit 1
+  fi
+
+  toplevel="$(git rev-parse --show-toplevel)" || exit 1
+  plan_rel="$(git ls-files --full-name -- "$PLAN")" || exit 1
+  RALPH_BASE="$(git rev-parse --abbrev-ref HEAD 2> /dev/null || echo HEAD)"
+  [[ "$RALPH_BASE" == "HEAD" ]] && RALPH_BASE="$(git rev-parse --short HEAD)"
+
+  # ralph/<plan>-<timestamp>: the plan's basename minus its extension, with
+  # anything a branch name would choke on folded to a dash.
+  stem="$(basename "$plan_rel")"
+  stem="${stem%.*}"
+  stem="$(printf '%s' "$stem" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9\n' '-')"
+  stem="${stem:-plan}"
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  RALPH_BRANCH="ralph/$stem-$stamp"
+
+  worktrees_dir="$(ralph_worktrees_dir "$toplevel")"
+  RALPH_WORKTREE="$worktrees_dir/${RALPH_BRANCH//\//-}"
+  if ! mkdir -p "$worktrees_dir"; then
+    echo "ralph: cannot create $worktrees_dir for the run's worktree. Set RALPH_WORKTREES_DIR to a writable directory, or pass --here." >&2
+    exit 1
+  fi
+  if ! git worktree add -q -b "$RALPH_BRANCH" "$RALPH_WORKTREE" HEAD; then
+    echo "ralph: git worktree add failed for branch $RALPH_BRANCH at $RALPH_WORKTREE — see git's message above." >&2
+    exit 1
+  fi
+  cd "$RALPH_WORKTREE" || {
+    echo "ralph: cannot enter the run's worktree at $RALPH_WORKTREE" >&2
+    exit 1
+  }
+  PLAN="$plan_rel"
+}
+
+# Ends the run: says where the work is when it lives in a worktree, then exits
+# with the status given. Every exit the loop takes after its worktree exists
+# goes through here, so a run never finishes without telling the user which
+# branch to open a pull request from.
+ralph_finish() { # $1 = exit status
+  if [[ -n "$RALPH_WORKTREE" ]]; then
+    cat <<EOF | tee -a "$RUN_LOG"
+ralph: this run's work is on branch $RALPH_BRANCH (cut from $RALPH_BASE), in the worktree
+ralph:   $RALPH_WORKTREE
+ralph: Your checkout was not touched. To open a pull request:
+ralph:   git push -u origin $RALPH_BRANCH
+ralph: Logs are in $RALPH_WORKTREE/.ralph/. When the branch is merged or abandoned:
+ralph:   git worktree remove $RALPH_WORKTREE
+EOF
+  fi
+  exit "$1"
+}
+
 # One run of the loop: reads a command line, writes into .ralph/, and drives the
 # step agent through the adapter above. Wrapped in a function so that sourcing
 # this file defines it without running it.
@@ -596,10 +709,12 @@ MAX_ATTEMPTS=3
 ITEMS_LIMIT=0   # 0 = unlimited
 MODEL=""
 REVIEW_GATE="full"
+RUN_HERE=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
+    --here) RUN_HERE=true; shift ;;
     --plan) PLAN="$2"; shift 2 ;;
     --max-attempts) MAX_ATTEMPTS="$2"; shift 2 ;;
     --items) ITEMS_LIMIT="$2"; shift 2 ;;
@@ -624,8 +739,19 @@ if ! git rev-parse --git-dir > /dev/null 2>&1; then
   exit 1
 fi
 
+# From here on the process is in the run's worktree unless --here was given,
+# and $PLAN is relative to that worktree's root. Nothing below knows or cares
+# which of the two it is in.
+if [[ "$RUN_HERE" != "true" ]]; then
+  ralph_enter_worktree
+fi
+
 mkdir -p .ralph/logs
 RUN_LOG=".ralph/run.log"
+
+if [[ -n "$RALPH_WORKTREE" ]]; then
+  echo "ralph: isolated run — branch $RALPH_BRANCH (from $RALPH_BASE) in worktree $RALPH_WORKTREE. Pass --here to run in the checkout instead." | tee -a "$RUN_LOG"
+fi
 
 remaining_items() {
   grep -cE '^[[:space:]]*-[[:space:]]\[[[:space:]]\]' "$PLAN" 2>/dev/null || true
@@ -754,11 +880,11 @@ while true; do
   REMAINING=$(remaining_items)
   if [[ "$REMAINING" -eq 0 ]]; then
     echo "ralph: no unchecked items remain in $PLAN. Done." | tee -a "$RUN_LOG"
-    exit 0
+    ralph_finish 0
   fi
   if [[ "$ITEMS_LIMIT" -gt 0 && "$ITEMS_DONE" -ge "$ITEMS_LIMIT" ]]; then
     echo "ralph: completed $ITEMS_DONE item(s) as requested (--items $ITEMS_LIMIT). $REMAINING item(s) still remain — re-invoke to continue." | tee -a "$RUN_LOG"
-    exit 0
+    ralph_finish 0
   fi
 
   ITEM_TEXT=$(next_item_text)
@@ -880,7 +1006,7 @@ Work on ONLY this task. Do not start any other item, do not refactor unrelated c
 
   if [[ "$ITEM_SUCCEEDED" != "true" ]]; then
     echo "ralph: exhausted $MAX_ATTEMPTS attempts on \"$ITEM_TEXT\" without success — stopping for human review. Check $PLAN's notes (and SPEC.md's Design Reference for the item's design constraints) and the .ralph/logs/item-$(printf '%03d' $((ITEMS_DONE+1)))-attempt-*.log files." | tee -a "$RUN_LOG"
-    exit 2
+    ralph_finish 2
   fi
 done
 }
