@@ -1,0 +1,5 @@
+{
+  "packages": [
+    "../../../.pi/extensions/litellm-provider.js"
+  ]
+}

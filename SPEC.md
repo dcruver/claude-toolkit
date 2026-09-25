@@ -38,8 +38,13 @@ pass. The shell never parses source code. It never invokes an LLM either.
 
 ```
 claude-toolkit/
-  bin/ralph                 existing
+  bin/ralph                 compatibility alias for bin/ralph-claude
+  bin/ralph-common          the loop itself; agent-agnostic, sourced not run
+  bin/ralph-claude          step-agent adapter: Claude Code
+  bin/ralph-pi              step-agent adapter: pi
+  bin/ralph-uber            step-agent adapter: pi and Claude Code, per item
   bin/okf                   new — bash, committed, installed like ralph
+  skills/ralph-code-review/ pi's review gate, as a SKILL.md
   commands/okf-*.md         slash commands
   tests/toolkit.sh          shell harness; the verify command for every item
   tests/fixtures/           small fixture repos for okf's own tests
@@ -213,7 +218,8 @@ JSON, not TOML, because `jq` is already a hard dependency and bash has no TOML p
     "root": ".",
     "include": ["src/**", "lib/**"],
     "exclude": ["**/target/**", "**/build/**", "**/node_modules/**", "**/dist/**"],
-    "extensions": ["java", "ts", "tsx", "py", "rs", "go", "js", "mjs"]
+    "extensions": ["java", "ts", "tsx", "py", "rs", "go", "js", "mjs", "yaml", "yml"],
+    "filenames": ["Dockerfile", "Containerfile"]
   },
   "tiers": {
     "tier0_max_members": 2,
@@ -231,6 +237,20 @@ JSON, not TOML, because `jq` is already a hard dependency and bash has no TOML p
   }
 }
 ```
+
+`extensions` matches a path's final extension, exactly as written. `filenames` matches a
+whole basename, exactly as written, and exists because `extensions` cannot reach a file
+that has none: `Dockerfile` has no dot, so it reads as extensionless and is ruled out. The
+two are asked in turn — a path in scope by either is in scope.
+
+They differ on the empty list, deliberately. An empty `extensions` is *no restriction*,
+because it narrows a listing that already exists. An empty `filenames` is *no files*,
+because it only ever widens one; answering for every path would put the whole repo in
+scope the moment a settings file mentioned the key.
+
+`filenames` is a whole name and not a prefix: `Dockerfile.dev` is a different basename and
+needs its own entry. The reverse spelling needs nothing — `web.Dockerfile` has the
+extension `Dockerfile` and is reachable through `extensions`.
 
 Absent `index`, Tier B subcommands exit 2 with one line naming the missing keys. Every
 field defaults if absent.
@@ -314,8 +334,12 @@ into a temp dir, `git init`s it, and runs a callback there. It must:
 
 - pass on a clean checkout at every point in the checklist;
 - validate repo invariants — every `commands/*.md` has YAML frontmatter with a non-empty
-  `description`; `bash -n` passes on `install.sh`, `bin/ralph`, and on `bin/okf` **only if
-  it exists** (it is created later in the checklist, so guard the check on file presence);
+  `description`; `bash -n` passes on `install.sh` and on every script in `bin/`, which is
+  discovered rather than listed (the step-agent split added `bin/ralph-common`,
+  `bin/ralph-claude`, `bin/ralph-pi` and later `bin/ralph-uber` without the harness needing
+  to be told), and on
+  `bin/okf` **only if it exists** (it is created later in the checklist, so guard the check
+  on file presence);
 - run behavioural tests for each `okf` subcommand against `tests/fixtures/`;
 - print a per-check pass/fail summary and exit non-zero if anything fails;
 - **never touch the network.** Tier B tests point `qdrant_url` and `embedding_url` at a
@@ -338,8 +362,9 @@ concepts they should produce.
   commit. Ralph-authored prose is stamped `generated.by: ralph/<model>` and **never** gets
   a `verified` entry — unattended regeneration is safe precisely because it cannot forge
   review.
-- **`install.sh`** copies `bin/okf` to `$HOME/.local/bin/okf` alongside `ralph`, reports it
-  in the same style, and warns (without failing) about any missing runtime prerequisite
+- **`install.sh`** copies `bin/okf` to `$HOME/.local/bin/okf` alongside `ralph`, copies
+  each `skills/*/` to `PI_SKILLS_DIR` (default `$HOME/.pi/agent/skills`) so pi can discover
+  the review gate, reports both in the same style, and warns (without failing) about any missing runtime prerequisite
   from §3. Every destination is overridable from the environment — `BIN_DIR`,
   `COMMANDS_DIR`, `SETTINGS_FILE`, and `CLAUDE_CONFIG_DIR` (Claude Code's own variable,
   which the other two derive from). Hard-coded destinations meant the installer could not
@@ -358,12 +383,70 @@ concepts they should produce.
 - **`permissions.json`** gains the read-only `okf` subcommands: `okf list`, `okf hash`,
   `okf fanin`, `okf check`, `okf search`.
 
-### Note on ralph's review gate
+### Note on ralph's step agent and review gate
 
-`bin/ralph`'s `full`/`light` gates referenced `/review-team`, which does not exist on this
-machine. They were repointed to the built-in `/code-review` skill (`high` for `full`,
-`medium` for `light`) before this plan was written. `/code-review`'s `ultra` level is
-user-triggered and billed and must never be invoked from ralph.
+ralph's step agent is pluggable. The loop lives in `bin/ralph-common`, which is a library:
+it defines the helpers and `ralph_main`, and never starts a run of its own. A wrapper
+supplies the agent — `RALPH_AGENT`, `RALPH_PROG`, `ralph_agent_invoke`,
+`ralph_agent_distill`, `ralph_agent_review_step`, and optionally
+`ralph_agent_usage_notes` — then calls `ralph_main "$@"` from its own
+`[ "${BASH_SOURCE[0]}" = "$0" ]` guard. The guard belongs to the wrapper and never to
+`ralph-common`: an executed wrapper must reach `ralph_main`, which a "sourced?" test inside
+the shared file would always swallow.
+
+Three call sites reach the agent — invoke, distill, and the prompt's step 4 — and each is
+passed the current item's tier alongside its own arguments. Everything else (PLAN.md
+parsing, the attempt loop, commit detection, `[mvn]` items, concept refresh) is shared and
+knows nothing about which agent is running.
+
+Item tiers. A normal item may open with `[cheap]`, `[standard]` or `[deep]`; unmarked means
+`standard`, so a plan written before tiers behaves exactly as it did. The names are
+agent-neutral and a model name never appears in PLAN.md — `ralph_agent_model_for_tier` maps
+a tier to a model the adapter knows, and `ralph_agent_label_for_tier` names the agent behind
+it for the run log. Both are optional; the defaults reproduce the pre-tier behaviour. A tier
+on a `[mvn]` item exits 1, since those items run no LLM to choose for. `--model` overrides
+every tier and says so when the plan carries markers.
+
+Why the tier is an argument and not adapter state: an adapter may route a tier to a
+different **agent**, not just a different model, and then invoke, distill and step 4 must
+agree about one item — the prompt has to carry the review command of the agent that will
+receive it, and the transcript has to be read by the parser of the agent that wrote it.
+Passing the tier keeps all three pure functions of their arguments, so they cannot fall out
+of step. `bin/ralph-uber` is that adapter: it sources `ralph-claude` and `ralph-pi`, whose
+implementations are namespaced `ralph_claude_*` / `ralph_pi_*` precisely so both can live in
+one shell, and rebinds the `ralph_agent_*` names to per-tier dispatchers. Neither agent's
+behaviour is written out a second time. Default routing is `cheap` -> pi, `standard` and
+`deep` -> Claude Code, overridable per run with `RALPH_UBER_AGENT_CHEAP` / `_STANDARD` /
+`_DEEP`; any value but `claude` or `pi` exits 1 rather than falling through.
+
+`bin/ralph` is kept as an alias for `bin/ralph-claude`. It is what existing runs, SPEC.md
+and `tests/toolkit.sh` invoke, and sourcing it must still define `ralph-common`'s helpers,
+which is how the harness calls `item_concept_docs` directly.
+
+The wrappers locate their sibling with parameter expansion rather than `readlink`/`dirname`.
+`tests/toolkit.sh` sources them on a PATH holding nothing but `bash`, deliberately, so a
+helper reaching for an undeclared tool fails instead of passing on a developer's PATH.
+
+Gates by agent:
+
+| `--review-gate` | `ralph-claude` | `ralph-pi` | `ralph-uber` |
+|---|---|---|---|
+| `full` | `/code-review high` | `/skill:ralph-code-review high` | whichever the item's tier routes to |
+| `light` | `/code-review medium` | `/skill:ralph-code-review medium` | whichever the item's tier routes to |
+| `none` | tests only | tests only | tests only |
+
+`bin/ralph`'s gates once referenced `/review-team`, which does not exist on this machine;
+they were repointed to the built-in `/code-review` skill before this plan was written.
+`/code-review`'s `ultra` level is user-triggered and billed and must never be invoked from
+ralph — neither wrapper can reach it.
+
+pi has no built-in review command, so its gate is `skills/ralph-code-review/SKILL.md`, an
+Agent Skills `SKILL.md` shipped with this toolkit and installed into `PI_SKILLS_DIR`. It is
+an equivalent of `/code-review`'s contract — review the working-tree diff, verify every
+candidate adversarially, report only survivors, and print exactly `No surviving findings.`
+when none do — and not a port of its text, which is built into Claude Code and not on disk
+to copy. The skill reviews and reports only: it never edits, commits, or reaches the
+network, because the loop's own attempt does the fixing and re-runs the gate.
 
 ## 12. Non-goals
 

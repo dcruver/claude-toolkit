@@ -14,14 +14,19 @@ CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 COMMANDS_DIR="${COMMANDS_DIR:-$CLAUDE_DIR/commands}"
 SETTINGS_FILE="${SETTINGS_FILE:-$CLAUDE_DIR/settings.json}"
+# pi's own global skill location. ralph-pi's review gate is a skill, so it has
+# to land somewhere pi discovers; ralph-pi also passes --skill explicitly, and
+# prefers a checkout over this when it is running from one.
+PI_SKILLS_DIR="${PI_SKILLS_DIR:-$HOME/.pi/agent/skills}"
 
 DRY_RUN=0
 usage() {
   cat <<'EOF'
 Usage: ./install.sh [-n|--dry-run] [-h|--help]
 
-Installs bin/* to BIN_DIR, commands/*.md to COMMANDS_DIR, and merges
-permissions.json into SETTINGS_FILE. Idempotent; safe to re-run.
+Installs bin/* to BIN_DIR, commands/*.md to COMMANDS_DIR, skills/*/ to
+PI_SKILLS_DIR, and merges permissions.json into SETTINGS_FILE. Idempotent;
+safe to re-run.
 
   -n, --dry-run   print what would change, write nothing
 
@@ -30,6 +35,7 @@ Environment (each falls back to the default shown):
   CLAUDE_CONFIG_DIR  $HOME/.claude          Claude Code's own config dir
   COMMANDS_DIR       $CLAUDE_CONFIG_DIR/commands
   SETTINGS_FILE      $CLAUDE_CONFIG_DIR/settings.json
+  PI_SKILLS_DIR      $HOME/.pi/agent/skills   pi's global skill directory
 EOF
 }
 for arg in "$@"; do
@@ -57,7 +63,7 @@ run() {
 echo "Installing from $TOOLKIT_DIR"
 [ "$DRY_RUN" -eq 1 ] && echo "(dry run — nothing will be written)"
 
-run mkdir -p "$BIN_DIR" "$COMMANDS_DIR"
+run mkdir -p "$BIN_DIR" "$COMMANDS_DIR" "$PI_SKILLS_DIR"
 
 # Every temp file this script renames through, removed on every exit path. $$
 # differs on the next run, so a temp left behind by an interrupted or
@@ -180,6 +186,23 @@ for f in "$TOOLKIT_DIR"/commands/*.md; do
   [ "$DRY_RUN" -eq 1 ] || echo "  $(basename "$f") -> $COMMANDS_DIR/$(basename "$f")"
 done
 
+# Skills are directories — SKILL.md plus anything it references — so each is
+# copied whole rather than file by file, and replaced rather than merged so that
+# a file dropped from a skill upstream does not survive the update. Only a
+# destination that is itself a skill is replaced: anything else there was put
+# there by someone else and is left alone rather than silently deleted.
+for d in "$TOOLKIT_DIR"/skills/*/; do
+  [ -f "$d/SKILL.md" ] || continue
+  skill_name="$(basename "$d")"
+  if [ -e "$PI_SKILLS_DIR/$skill_name" ] && [ ! -f "$PI_SKILLS_DIR/$skill_name/SKILL.md" ]; then
+    echo "WARNING: $PI_SKILLS_DIR/$skill_name exists and is not a skill — leaving it alone" >&2
+    continue
+  fi
+  run rm -rf "$PI_SKILLS_DIR/$skill_name"
+  run cp -R "$d" "$PI_SKILLS_DIR/$skill_name"
+  [ "$DRY_RUN" -eq 1 ] || echo "  $skill_name -> $PI_SKILLS_DIR/$skill_name"
+done
+
 echo
 PERMISSIONS_FILE="$TOOLKIT_DIR/permissions.json"
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -261,5 +284,5 @@ echo
 echo "Done. Verify with: ralph --help and okf --help"
 echo "And in Claude Code: /onboard, /ralph-spec, /tdd-audit, /tdd-plan, /tdd-generate, /adversarial-pair,"
 echo "/clarify, /explain, /critique, /tighten, /okf-init, /okf-generate, /okf-refresh,"
-echo "/okf-verify, /okf-search"
+echo "/okf-verify, /okf-search, /dare-decompose, /dare-audit, /dare-recombine, /dare-experiment"
 echo "should now be available."

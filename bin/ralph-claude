@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# ralph-claude — the ralph loop with Claude Code as the step agent.
+#
+# Everything that is not agent-specific lives in ralph-common; this file is the
+# adapter and nothing else. See THE ADAPTER CONTRACT there.
+#
+# Relies on --permission-mode auto being valid in your environment (verified via
+# `claude --help` at write time) — headless -p calls can't answer interactive
+# prompts, so it is passed explicitly rather than assumed.
+
+# Locating the file this wrapper sources, without shelling out. tests/toolkit.sh
+# sources these wrappers on a PATH carrying nothing but bash, deliberately, so
+# that a helper reaching for a tool ralph has not declared shows up as a
+# failure rather than passing on the developer's own PATH. Parameter expansion
+# is therefore the normal path. readlink is a rescue for a hand-made symlink
+# only, and never reached by a supported install: install.sh copies bin/* onto
+# $PATH rather than symlinking it.
+_ralph_dir="${BASH_SOURCE[0]%/*}"
+[ "$_ralph_dir" = "${BASH_SOURCE[0]}" ] && _ralph_dir="."
+if [ ! -f "$_ralph_dir/ralph-common" ] && command -v readlink > /dev/null 2>&1; then
+  _ralph_self="$(readlink -f "${BASH_SOURCE[0]}")"
+  _ralph_dir="${_ralph_self%/*}"
+fi
+# shellcheck source=/dev/null
+. "$_ralph_dir/ralph-common"
+
+RALPH_AGENT="claude"
+# Assigned only if unset, so bin/ralph can announce itself by its own name
+# before sourcing this file.
+: "${RALPH_PROG:=ralph-claude}"
+
+# Every piece of claude-specific behaviour below is named ralph_claude_*, and the
+# ralph_agent_* names the contract asks for are one-line delegations to them.
+# ralph-uber sources this file alongside ralph-pi and then rebinds the four
+# ralph_agent_* names to its own per-tier dispatchers; the ralph_claude_* names
+# do not collide with ralph_pi_*, so both halves survive being sourced together
+# and neither agent's behaviour has to be written out a second time.
+
+ralph_claude_invoke() { # $1 = prompt, $2 = jsonl path
+  claude -p "$1" --permission-mode auto "${MODEL_FLAG[@]}" \
+    --output-format stream-json --verbose \
+    > "$2" 2> "$2.stderr"
+}
+
+ralph_claude_distill() { # $1 = jsonl path
+  jq -r 'select(.type == "result") | .result' "$1" | tail -1
+}
+
+# The wording is carried over verbatim from bin/ralph: it is what every attempt
+# of every previous run was told, and a reworded gate is a changed gate.
+#
+# /code-review's `ultra` level is user-triggered and billed and must never be
+# invoked from here — which is why neither branch below can reach it.
+ralph_claude_review_step() { # $1 = full|light|none
+  case "$1" in
+    full)
+      printf '%s' '4. Tests passing is necessary but not sufficient. Run `/code-review high` on your changes. If any finding survives its verification pass, fix it, re-run tests, and re-review, all within this same attempt if you can. Only once review comes back with no surviving findings do you move to step 5.'
+      ;;
+    light)
+      printf '%s' '4. Tests passing is necessary but not sufficient. Run `/code-review medium` on your changes. If any finding survives its verification pass, fix it, re-run tests, and re-review, all within this same attempt if you can. Only once review comes back with no surviving findings do you move to step 5.'
+      ;;
+    none)
+      printf '%s' '4. (No review gate configured — tests passing alone is sufficient. Move to step 5.)'
+      ;;
+  esac
+}
+
+# Tier -> model, the claude half of ralph-common's agent-neutral tier names.
+#
+# Aliases rather than full ids on purpose. `claude --model` takes either, and an
+# alias always resolves to the latest model in that family, so this mapping does
+# not quietly rot into naming a superseded model the next time one ships. Pin a
+# full id (`claude-fable-5-1`) through the override below where a run has to be
+# reproducible — at the cost of having to revisit it.
+#
+# Overridable without editing this file, the way RALPH_PI_SKILL_DIR is in
+# ralph-pi: which names a given claude build accepts is not something this file
+# can know for every install.
+#
+# Assigned with `=` and not `:=`, so an override set to the empty string
+# sticks: that is how a run says "leave claude items on the agent's default"
+# rather than being handed the default back again.
+#
+# `standard` maps to nothing on purpose, and that is the whole backward
+# compatibility story: MODEL_FLAG stays empty, the attempt runs as claude's own
+# default, and a plan with no tier markers in it behaves exactly as it did
+# before tiers existed.
+: "${RALPH_CLAUDE_MODEL_CHEAP=sonnet}"
+: "${RALPH_CLAUDE_MODEL_STANDARD=}"
+: "${RALPH_CLAUDE_MODEL_DEEP=fable}"
+
+ralph_claude_model_for_tier() { # $1 = cheap|standard|deep
+  case "$1" in
+    cheap)    printf '%s' "$RALPH_CLAUDE_MODEL_CHEAP" ;;
+    standard) printf '%s' "$RALPH_CLAUDE_MODEL_STANDARD" ;;
+    deep)     printf '%s' "$RALPH_CLAUDE_MODEL_DEEP" ;;
+  esac
+}
+
+ralph_claude_usage_notes() {
+  cat <<'EOF'
+
+Step agent notes (claude):
+  Review gate         full  -> `/code-review high`
+                      light -> `/code-review medium`
+                      none  -> no review command
+                      /code-review's `ultra` level is user-triggered and
+                      billed, and is never launched from here.
+EOF
+  printf '  Item tiers          cheap    -> %s\n' "${RALPH_CLAUDE_MODEL_CHEAP:-(the claude default)}"
+  printf '                      standard -> %s\n' "${RALPH_CLAUDE_MODEL_STANDARD:-(the claude default)}"
+  printf '                      deep     -> %s\n' "${RALPH_CLAUDE_MODEL_DEEP:-(the claude default)}"
+  cat <<'EOF'
+                      Override any of them with RALPH_CLAUDE_MODEL_CHEAP,
+                      _STANDARD or _DEEP. --model overrides all three.
+  Attempts run as     claude -p ... --permission-mode auto
+                      --output-format stream-json --verbose
+EOF
+}
+
+# The contract, bound to the claude implementations above. $3 (the item's tier)
+# reaches invoke and distill and is ignored here: one agent, one way to call it.
+ralph_agent_invoke()         { ralph_claude_invoke "$1" "$2"; }
+ralph_agent_distill()        { ralph_claude_distill "$1"; }
+ralph_agent_review_step()    { ralph_claude_review_step "$1"; }
+ralph_agent_model_for_tier() { ralph_claude_model_for_tier "$1"; }
+ralph_agent_usage_notes()    { ralph_claude_usage_notes; }
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  ralph_main "$@"
+fi

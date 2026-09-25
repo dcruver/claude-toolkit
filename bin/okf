@@ -826,6 +826,12 @@ OKF_TRACKED=()
 # settings.
 OKF_EXTENSIONS=()
 
+# The exact filenames in scope, as `load_bundle_globs` read them from the
+# settings. SPEC.md §6's `filenames` exists because a file with no extension
+# cannot be reached by `extensions` at all: `Dockerfile` has no dot, so
+# in_scope_extension reads it as extensionless and rules it out.
+OKF_FILENAMES=()
+
 # SPEC.md §6's `include` and `exclude`, compiled to the anchored regular
 # expressions matches_any wants, as `load_bundle_globs` left them.
 OKF_INCLUDE_RES=()
@@ -858,10 +864,11 @@ load_bundle_globs() {
   # success whatever the command substitution did, which would swallow both
   # `set -e` and the status of a settings_strings that died inside the subshell
   # having already printed why.
-  local includes excludes extensions
+  local includes excludes extensions filenames
   includes="$(settings_strings bundle include)" || exit 1
   excludes="$(settings_strings bundle exclude)" || exit 1
   extensions="$(settings_strings bundle extensions)" || exit 1
+  filenames="$(settings_strings bundle filenames)" || exit 1
 
   OKF_INCLUDE_RES=()
   OKF_EXCLUDE_RES=()
@@ -889,6 +896,15 @@ load_bundle_globs() {
     # A settings file that spells them `.java` means the same thing as `java`.
     OKF_EXTENSIONS+=("${ext#.}")
   done <<< "$extensions"
+
+  OKF_FILENAMES=()
+  local fname
+  while IFS= read -r fname; do
+    [ -n "$fname" ] || continue
+    # Whole names, not extensions: a leading dot is part of the name here, so
+    # `.envrc` is written `.envrc` and is not stripped the way `.java` is.
+    OKF_FILENAMES+=("$fname")
+  done <<< "$filenames"
 }
 
 # Whether a bundle-relative path is inside the bundle SPEC.md §6's `include` and
@@ -1229,6 +1245,28 @@ in_scope_extension() { # $1 = a bundle-relative path
   return 1
 }
 
+# Whether a path's filename is one of SPEC.md §6's `filenames`.
+#
+# The whole basename, compared exactly: `Dockerfile` matches `Dockerfile` and
+# nothing else. `Dockerfile.dev` does not, because its basename differs — a repo
+# that uses that convention lists it too. The reverse spelling needs nothing
+# here: `web.Dockerfile` has the extension `Dockerfile` and is reachable through
+# `extensions`.
+#
+# Unlike `extensions`, an empty list is no files rather than no restriction.
+# `extensions` narrows a listing that already exists; this one only ever widens
+# it, so an absent list has nothing to say and must not answer for every path.
+in_scope_filename() { # $1 = a bundle-relative path
+  [ "${#OKF_FILENAMES[@]}" -gt 0 ] || return 1
+
+  local name="${1##*/}" want
+  for want in "${OKF_FILENAMES[@]}"; do
+    [ "$name" = "$want" ] || continue
+    return 0
+  done
+  return 1
+}
+
 # Appends the given paths to OKF_IN_SCOPE, in the order given, minus the ones
 # carrying a generated marker.
 #
@@ -1352,8 +1390,10 @@ load_in_scope() {
   local path
   for path in ${OKF_TRACKED[@]+"${OKF_TRACKED[@]}"}; do
     # Extension first: it is the cheapest of the three and, on the repos §6's
-    # defaults describe, the one that rules out the most.
-    in_scope_extension "$path" || continue
+    # defaults describe, the one that rules out the most. A path it rules out
+    # may still be in scope by name — `filenames` is the only way to reach a
+    # source with no extension, such as a Dockerfile.
+    in_scope_extension "$path" || in_scope_filename "$path" || continue
     # A tracked symbolic link is a path whose content, as far as git is
     # concerned, is the target it names and not the source at the end of it.
     # Following one would put a second concept beside a file that already has
@@ -3483,7 +3523,8 @@ OKF_DEFAULT_CONFIG='{
     "root": ".",
     "include": ["src/**", "lib/**"],
     "exclude": ["**/target/**", "**/build/**", "**/node_modules/**", "**/dist/**"],
-    "extensions": ["java", "ts", "tsx", "py", "rs", "go", "js", "mjs"]
+    "extensions": ["java", "ts", "tsx", "py", "rs", "go", "js", "mjs", "yaml", "yml"],
+    "filenames": ["Dockerfile", "Containerfile"]
   },
   "tiers": {
     "tier0_max_members": 2,

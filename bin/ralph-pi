@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# ralph-pi — the ralph loop with pi (@earendil-works/pi-coding-agent) as the
+# step agent.
+#
+# Everything that is not agent-specific lives in ralph-common; this file is the
+# adapter and nothing else. See THE ADAPTER CONTRACT there.
+#
+# Differences from claude that this adapter exists to absorb:
+#   * -p is a boolean on pi; the prompt is positional, after a `--` that stops
+#     option parsing so a prompt beginning with `-` is still a prompt.
+#   * pi has no `result` event. Its transcript ends `agent_end` then
+#     `agent_settled`, and the final text is the last text block of the last
+#     assistant message inside agent_end.
+#   * `-a` is pi's analogue of claude's --permission-mode auto: it trusts
+#     project-local files for the run, which an unattended attempt needs and a
+#     headless call cannot be prompted for.
+
+# Locating the file this wrapper sources, without shelling out. tests/toolkit.sh
+# sources these wrappers on a PATH carrying nothing but bash, deliberately, so
+# that a helper reaching for a tool ralph has not declared shows up as a
+# failure rather than passing on the developer's own PATH. Parameter expansion
+# is therefore the normal path. readlink is a rescue for a hand-made symlink
+# only, and never reached by a supported install: install.sh copies bin/* onto
+# $PATH rather than symlinking it.
+_ralph_dir="${BASH_SOURCE[0]%/*}"
+[ "$_ralph_dir" = "${BASH_SOURCE[0]}" ] && _ralph_dir="."
+if [ ! -f "$_ralph_dir/ralph-common" ] && command -v readlink > /dev/null 2>&1; then
+  _ralph_self="$(readlink -f "${BASH_SOURCE[0]}")"
+  _ralph_dir="${_ralph_self%/*}"
+fi
+# shellcheck source=/dev/null
+. "$_ralph_dir/ralph-common"
+
+RALPH_AGENT="pi"
+: "${RALPH_PROG:=ralph-pi}"
+
+# Named ralph_pi_* for the same reason ralph-claude names its half ralph_claude_*:
+# ralph-uber sources both files and rebinds only the ralph_agent_* names, so the
+# two agents' implementations have to be able to coexist in one shell.
+
+# The review gate is a skill, so it has to be found before it can be run. In
+# preference order: an explicit override; the checkout this script is running
+# from (so a working copy needs no install); the installed location. pi also
+# discovers ~/.pi/agent/skills itself, but --skill is passed explicitly because
+# it is additive even under --no-skills and it turns "skill not found" into a
+# startup error rather than a gate that silently does nothing.
+ralph_pi_skill_dir() {
+  local candidate
+  if [ -n "${RALPH_PI_SKILL_DIR:-}" ]; then
+    printf '%s' "$RALPH_PI_SKILL_DIR"; return 0
+  fi
+  # PI_SKILLS_DIR is install.sh's variable for where skills are put. Honouring
+  # the same name here keeps installing and finding symmetric: overriding it for
+  # an install would otherwise put the gate somewhere this never looks.
+  for candidate in \
+    "$_ralph_dir/../skills/ralph-code-review" \
+    "${PI_SKILLS_DIR:-}${PI_SKILLS_DIR:+/ralph-code-review}" \
+    "$HOME/.pi/agent/skills/ralph-code-review"
+  do
+    [ -n "$candidate" ] || continue
+    if [ -f "$candidate/SKILL.md" ]; then
+      printf '%s' "$candidate"; return 0
+    fi
+  done
+}
+
+ralph_pi_invoke() { # $1 = prompt, $2 = jsonl path
+  local -a skill_flag=()
+  local dir
+  dir="$(ralph_pi_skill_dir)"
+  [ -n "$dir" ] && skill_flag=(--skill "$dir")
+  pi -p --mode json -a "${MODEL_FLAG[@]}" "${skill_flag[@]}" -- "$1" \
+    > "$2" 2> "$2.stderr"
+}
+
+# `// empty` at every step: a transcript truncated by a killed attempt still
+# parses as JSONL, and jq must print nothing rather than the string "null",
+# which would land in the .log as if it were the agent's answer.
+ralph_pi_distill() { # $1 = jsonl path
+  jq -r '
+    select(.type == "agent_end")
+    | (.messages // [])
+    | map(select(.role == "assistant"))
+    | (last // empty)
+    | (.content // [])
+    | map(select(.type == "text"))
+    | (last // empty)
+    | (.text // empty)
+  ' "$1" | tail -1
+}
+
+# pi has no built-in review command, so the gate is the ralph-code-review skill
+# shipped in this toolkit, invoked by the /skill:<name> form pi registers for
+# every discovered skill. The effort words match claude's levels so that a
+# --review-gate value means the same thing whichever wrapper is driving.
+ralph_pi_review_step() { # $1 = full|light|none
+  case "$1" in
+    full)
+      printf '%s' '4. Tests passing is necessary but not sufficient. Run `/skill:ralph-code-review high` on your changes. If any finding survives its verification pass, fix it, re-run tests, and re-review, all within this same attempt if you can. Only once review comes back with no surviving findings do you move to step 5.'
+      ;;
+    light)
+      printf '%s' '4. Tests passing is necessary but not sufficient. Run `/skill:ralph-code-review medium` on your changes. If any finding survives its verification pass, fix it, re-run tests, and re-review, all within this same attempt if you can. Only once review comes back with no surviving findings do you move to step 5.'
+      ;;
+    none)
+      printf '%s' '4. (No review gate configured — tests passing alone is sufficient. Move to step 5.)'
+      ;;
+  esac
+}
+
+# Tier -> model, the pi half of ralph-common's agent-neutral tier names.
+#
+# pi's --model takes a PATTERN, not an id — it fuzzy-matches and globs over
+# whatever catalog the install is pointed at (`pi --list-models`). So which
+# names are right here is a property of the machine, not of pi, and these
+# defaults are only the common case: override them per install rather than
+# editing this file, as with RALPH_PI_SKILL_DIR above.
+#
+# Assigned with `=` and not `:=`, so an override set to the empty string
+# sticks: that is how a run says "leave pi items on the agent's default"
+# rather than being handed the default back again.
+#
+# `standard` maps to nothing on purpose — MODEL_FLAG stays empty and the attempt
+# runs as pi's own default, which is what every plan without tier markers gets.
+: "${RALPH_PI_MODEL_CHEAP=chat}"
+: "${RALPH_PI_MODEL_STANDARD=}"
+: "${RALPH_PI_MODEL_DEEP=coder-pro}"
+
+ralph_pi_model_for_tier() { # $1 = cheap|standard|deep
+  case "$1" in
+    cheap)    printf '%s' "$RALPH_PI_MODEL_CHEAP" ;;
+    standard) printf '%s' "$RALPH_PI_MODEL_STANDARD" ;;
+    deep)     printf '%s' "$RALPH_PI_MODEL_DEEP" ;;
+  esac
+}
+
+ralph_pi_usage_notes() {
+  local dir; dir="$(ralph_pi_skill_dir)"
+  cat <<'EOF'
+
+Step agent notes (pi):
+  Review gate         full  -> `/skill:ralph-code-review high`
+                      light -> `/skill:ralph-code-review medium`
+                      none  -> no review command
+                      The skill ships with this toolkit; override where it is
+                      found with RALPH_PI_SKILL_DIR.
+EOF
+  printf '  Item tiers          cheap    -> %s\n' "${RALPH_PI_MODEL_CHEAP:-(the pi default)}"
+  printf '                      standard -> %s\n' "${RALPH_PI_MODEL_STANDARD:-(the pi default)}"
+  printf '                      deep     -> %s\n' "${RALPH_PI_MODEL_DEEP:-(the pi default)}"
+  cat <<'EOF'
+                      Patterns, not ids — see `pi --list-models`. Override with
+                      RALPH_PI_MODEL_CHEAP, _STANDARD or _DEEP. --model
+                      overrides all three.
+  Attempts run as     pi -p --mode json -a [--model ...] [--skill ...] -- PROMPT
+EOF
+  if [ -n "$dir" ]; then
+    printf '  Review skill        %s\n' "$dir"
+  else
+    printf '  Review skill        NOT FOUND — the review gate will not run.\n'
+  fi
+}
+
+# The contract, bound to the pi implementations above. The item's tier reaches
+# invoke and distill and is ignored here: one agent, one way to call it.
+ralph_agent_invoke()         { ralph_pi_invoke "$1" "$2"; }
+ralph_agent_distill()        { ralph_pi_distill "$1"; }
+ralph_agent_review_step()    { ralph_pi_review_step "$1"; }
+ralph_agent_model_for_tier() { ralph_pi_model_for_tier "$1"; }
+ralph_agent_usage_notes()    { ralph_pi_usage_notes; }
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  ralph_main "$@"
+fi

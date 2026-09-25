@@ -1099,6 +1099,18 @@ test_okf_preflight_names_every_missing_tool() {
   # run takes it with everything else rather than leaving it in TMPDIR.
   printf '%s\n' "$root" >> "$HARNESS_STATE/fixture_dirs"
 
+  # Every okf below runs from an empty directory, not the repo root. okf reads
+  # `./okf.json`, and the checks further down lean on there being none: a real
+  # bundle at the toolkit's own root — one `okf init` here writes — carries an
+  # `index` block that would take `okf search` past the preflight and on to a
+  # curl of its qdrant_url, which the network guard at the end reports as a
+  # failure of this test rather than a fact about the checkout. The runner
+  # puts cwd back at $TOOLKIT_ROOT after every test, so no cd back is needed.
+  mkdir -p "$root/cwd" && cd "$root/cwd" || {
+    _fail "okf preflight probe" "could not enter an okf.json-less directory: $root/cwd"
+    return 1
+  }
+
   # The control. $root/all holds every tool §3 requires of every invocation and
   # nothing else — no curl, because that one is Tier B's. Without this, each
   # check below would pass just as happily against a probe PATH so broken that
@@ -13763,7 +13775,18 @@ _okf_search_command_fallback_text() { # $1 = path to the document, $2 = start li
 _okf_search_command_sweep_probe() { # $1 = the rg command line from the document
   local sweep="$1" out rc=0 path first concepts=0 strays=0
 
-  out="$(bash -c "$sweep" 2>&1)" || rc=$?
+  # stdin closed and a wall-clock bound, because the way this line fails worst is
+  # not a bad flag but a missing path: ripgrep searches the working directory only
+  # when stdin is a terminal, so a pathless sweep run from a harness reads stdin
+  # and blocks forever. Unbounded, that hangs the whole suite rather than failing
+  # one check — which is exactly what it did before the document grew its `.`.
+  out="$(timeout 30 bash -c "$sweep" < /dev/null 2>&1)" || rc=$?
+  if [ "$rc" -eq 124 ]; then
+    _fail "the document's ripgrep sweep runs, and finds something" \
+      "it did not finish within 30s — a sweep with no path argument reads stdin:" \
+      "$sweep"
+    return 1
+  fi
   if [ "$rc" -ne 0 ]; then
     _fail "the document's ripgrep sweep runs, and finds something" \
       "it exited $rc in the chunks fixture — 1 is 'no file matched' and 2 is" \
@@ -13788,7 +13811,11 @@ _okf_search_command_sweep_probe() { # $1 = the rg command line from the document
     fi
   done <<< "$out"
 
-  if printf '%s\n' "$out" | grep -qx 'src/kitchen/Router.md'; then
+  # A leading `./` is tolerated: ripgrep prefixes every path with the path it was
+  # given, and the document's line ends in an explicit `.` precisely so it cannot
+  # be handed a pipe and read stdin instead. The prefix is ripgrep's, not a
+  # different file.
+  if printf '%s\n' "$out" | sed 's|^\./||' | grep -qx 'src/kitchen/Router.md'; then
     _pass "and it names the concept that answers the question it is drawn from"
   else
     _fail "and it names the concept that answers the question it is drawn from" \
@@ -14686,6 +14713,7 @@ _ralph_probe_bin() { # $1 = directory to build
 # Scans for -p rather than assuming a position: ralph passes --permission-mode,
 # --model and whatever else, and this must keep working when that list changes.
 prompt=""
+model=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -p)
@@ -14693,12 +14721,56 @@ while [ $# -gt 0 ]; do
       shift
       [ $# -gt 0 ] && shift
       ;;
+    --model)
+      model="${2-}"
+      shift
+      [ $# -gt 0 ] && shift
+      ;;
     *) shift ;;
   esac
 done
 printf '%s' "$prompt" > "$RALPH_PROMPT_CAPTURE"
+# Written even when empty, so "ralph passed no --model" is an empty capture
+# rather than a missing file indistinguishable from "claude never ran".
+printf '%s' "$model" > "$RALPH_MODEL_CAPTURE"
+printf 'claude' > "$RALPH_AGENT_CAPTURE"
+# claude's transcript shape: the final message is a `result` event.
+printf '%s\n' '{"type":"system","subtype":"init"}' \
+               '{"type":"result","result":"CLAUDE FINAL MESSAGE"}'
 FAKE
   chmod +x "$dir/claude" || return 1
+
+  # pi's own call shape: -p is a boolean and the prompt is positional after the
+  # `--` that stops option parsing, so this cannot reuse claude's parser.
+  cat > "$dir/pi" <<'FAKE' || return 1
+#!/usr/bin/env bash
+prompt=""
+model=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model)
+      model="${2-}"
+      shift
+      [ $# -gt 0 ] && shift
+      ;;
+    --)
+      shift
+      prompt="${1-}"
+      break
+      ;;
+    *) shift ;;
+  esac
+done
+printf '%s' "$prompt" > "$RALPH_PROMPT_CAPTURE"
+printf '%s' "$model" > "$RALPH_MODEL_CAPTURE"
+printf 'pi' > "$RALPH_AGENT_CAPTURE"
+# pi's transcript shape: no `result` event at all — the final text is the last
+# text block of the last assistant message inside `agent_end`.
+printf '%s\n' '{"type":"agent_start"}' \
+               '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"PI FINAL MESSAGE"}]}]}' \
+               '{"type":"agent_settled"}'
+FAKE
+  chmod +x "$dir/pi" || return 1
 
   cat > "$dir/mvn" <<'FAKE' || return 1
 #!/usr/bin/env bash
@@ -14714,7 +14786,8 @@ FAKE
 _ralph_run() { # $@ = flags for bin/ralph
   local bindir="$HARNESS_STATE/ralph-run-bin"
   _ralph_probe_bin "$bindir" || _abort "cannot build the stand-ins for a bin/ralph run"
-  rm -f "$HARNESS_STATE/ralph-prompt" "$HARNESS_STATE/ralph-mvn"
+  rm -f "$HARNESS_STATE/ralph-prompt" "$HARNESS_STATE/ralph-mvn" \
+        "$HARNESS_STATE/ralph-model" "$HARNESS_STATE/ralph-agent"
 
   # bash explicitly, so the run does not depend on `env` being on the PATH it
   # was given. $0 and BASH_SOURCE[0] are still the one path, so ralph's
@@ -14722,10 +14795,30 @@ _ralph_run() { # $@ = flags for bin/ralph
   PATH="$bindir:$PATH" \
   RALPH_PROMPT_CAPTURE="$HARNESS_STATE/ralph-prompt" \
   RALPH_MVN_CAPTURE="$HARNESS_STATE/ralph-mvn" \
+  RALPH_MODEL_CAPTURE="$HARNESS_STATE/ralph-model" \
+  RALPH_AGENT_CAPTURE="$HARNESS_STATE/ralph-agent" \
     bash "$TOOLKIT_ROOT/bin/ralph" "$@"
 }
 
+# The same run, through bin/ralph-uber instead — the wrapper that picks the
+# agent per item rather than the model.
+_ralph_run_uber() { # $@ = flags for bin/ralph-uber
+  local bindir="$HARNESS_STATE/ralph-run-bin"
+  _ralph_probe_bin "$bindir" || _abort "cannot build the stand-ins for a bin/ralph-uber run"
+  rm -f "$HARNESS_STATE/ralph-prompt" "$HARNESS_STATE/ralph-mvn" \
+        "$HARNESS_STATE/ralph-model" "$HARNESS_STATE/ralph-agent"
+
+  PATH="$bindir:$PATH" \
+  RALPH_PROMPT_CAPTURE="$HARNESS_STATE/ralph-prompt" \
+  RALPH_MVN_CAPTURE="$HARNESS_STATE/ralph-mvn" \
+  RALPH_MODEL_CAPTURE="$HARNESS_STATE/ralph-model" \
+  RALPH_AGENT_CAPTURE="$HARNESS_STATE/ralph-agent" \
+    bash "$TOOLKIT_ROOT/bin/ralph-uber" "$@"
+}
+
 _ralph_captured_prompt() { cat "$HARNESS_STATE/ralph-prompt" 2> /dev/null; }
+_ralph_captured_model() { cat "$HARNESS_STATE/ralph-model" 2> /dev/null; }
+_ralph_captured_agent() { cat "$HARNESS_STATE/ralph-agent" 2> /dev/null; }
 
 # There is no negative assert_contains in this harness, and this section needs
 # one: "the prompt gained nothing" is half of what the item promises.
@@ -14921,9 +15014,263 @@ test_ralph_puts_the_run_s_model_in_the_actor_it_asks_for() {
   with_fixture_repo items _ralph_prompt_refresh_model_probe
 }
 
+_ralph_tier_cheap_probe() {
+  _ralph_write_plan '[cheap] Tidy install.sh. Verify: ./tests/toolkit.sh'
+
+  assert_exit 2 _ralph_run --max-attempts 1
+  assert_eq "sonnet" "$(_ralph_captured_model)" \
+    "a [cheap] item runs on the adapter's cheap model"
+
+  # The marker stays in the text the attempt is handed, because step 5 quotes
+  # that text back as the line to check off in PLAN.md.
+  assert_contains "$(_ralph_captured_prompt)" \
+    "TASK: [cheap] Tidy install.sh" \
+    "and the marker is not stripped out of the task it was given"
+}
+
+test_ralph_runs_a_cheap_item_on_the_cheap_model() {
+  with_fixture_repo items _ralph_tier_cheap_probe
+}
+
+_ralph_tier_deep_probe() {
+  _ralph_write_plan '[deep] Redesign install.sh. Verify: ./tests/toolkit.sh'
+
+  assert_exit 2 _ralph_run --max-attempts 1
+  assert_eq "fable" "$(_ralph_captured_model)" \
+    "a [deep] item runs on the adapter's deep model"
+}
+
+test_ralph_runs_a_deep_item_on_the_deep_model() {
+  with_fixture_repo items _ralph_tier_deep_probe
+}
+
+_ralph_tier_default_probe() {
+  # Unmarked and [standard] must be the same thing, and both must be what ralph
+  # did before tiers existed: no --model at all, so claude picks its own.
+  _ralph_write_plan 'Tidy install.sh. Verify: ./tests/toolkit.sh'
+  assert_exit 2 _ralph_run --max-attempts 1
+  assert_eq "" "$(_ralph_captured_model)" \
+    "an unmarked item still passes no --model at all"
+
+  _ralph_write_plan '[standard] Tidy install.sh. Verify: ./tests/toolkit.sh'
+  assert_exit 2 _ralph_run --max-attempts 1
+  assert_eq "" "$(_ralph_captured_model)" \
+    "and an explicit [standard] item is identical to leaving it off"
+}
+
+test_ralph_leaves_standard_items_on_the_agent_default() {
+  with_fixture_repo items _ralph_tier_default_probe
+}
+
+_ralph_tier_model_override_probe() {
+  _ralph_write_plan '[deep] Redesign install.sh. Verify: ./tests/toolkit.sh'
+
+  assert_exit 2 _ralph_run --max-attempts 1 --model opus-5
+  assert_eq "opus-5" "$(_ralph_captured_model)" \
+    "--model pins even an item that asked for another tier"
+  assert_contains "$(cat .ralph/run.log)" "tier markers in PLAN.md are ignored" \
+    "and says so, rather than ignoring the markers quietly"
+}
+
+test_ralph_model_flag_overrides_every_tier() {
+  with_fixture_repo items _ralph_tier_model_override_probe
+}
+
+_ralph_tier_on_mvn_probe() {
+  _ralph_write_plan '[deep] [mvn] Build it :: goal=org.example:demo:1.0:run then=true'
+
+  # Exit 1, not 2: a malformed plan is not an attempt that failed.
+  assert_exit 1 _ralph_run --max-attempts 1
+  assert_contains "$(last_output)" "runs no LLM" \
+    "a tier on a [mvn] item is refused, and says why"
+
+  if [ -e "$HARNESS_STATE/ralph-mvn" ]; then
+    _fail "a tier on a [mvn] item stops before running anything" \
+      "mvn ran anyway"
+  else
+    _pass "a tier on a [mvn] item stops before running anything"
+  fi
+}
+
+test_ralph_rejects_a_tier_on_an_mvn_item() {
+  with_fixture_repo items _ralph_tier_on_mvn_probe
+}
+
+_ralph_tier_refresh_stamp_probe() {
+  # The refresh block names the model that is about to write the prose. Built
+  # once for the run it would name whatever was on the command line; built per
+  # item it names the tier's model, which is the one actually running.
+  _ralph_write_plan '[cheap] Rewrite src/helper.ts, which nothing documents. Verify: ./tests/toolkit.sh'
+
+  assert_exit 2 _ralph_run --max-attempts 1
+  assert_contains "$(_ralph_captured_prompt)" 'generated.by: ralph/sonnet' \
+    "a tiered item stamps concepts with the model its own tier chose"
+  _refute_contains "$(_ralph_captured_prompt)" 'ralph/<model>`, with the model you are actually' \
+    "and leaves nothing for the attempt to substitute"
+}
+
+test_ralph_stamps_concepts_with_the_item_s_own_model() {
+  with_fixture_repo items _ralph_tier_refresh_stamp_probe
+}
+
+_ralph_tier_inert_adapter_probe() {
+  # The adapter's overrides are assigned with `=`, not `:=`, so an empty value
+  # sticks instead of being handed the default back. Emptying both is how a run
+  # says "leave every item on the agent's default", and it is also the only way
+  # from here to reach the warning meant for an adapter that maps nothing.
+  _ralph_write_plan '[deep] Redesign install.sh. Verify: ./tests/toolkit.sh'
+
+  RALPH_CLAUDE_MODEL_CHEAP= RALPH_CLAUDE_MODEL_DEEP= \
+    assert_exit 2 _ralph_run --max-attempts 1
+  assert_eq "" "$(_ralph_captured_model)" \
+    "a tier mapped to nothing passes no --model at all"
+  assert_contains "$(cat .ralph/run.log)" "maps no models to them" \
+    "and ralph says the markers are inert rather than looking like they worked"
+}
+
+test_ralph_warns_when_tiers_map_to_no_models() {
+  with_fixture_repo items _ralph_tier_inert_adapter_probe
+}
+
+_ralph_uber_cheap_routes_to_pi_probe() {
+  _ralph_write_plan '[cheap] Tidy install.sh. Verify: ./tests/toolkit.sh'
+
+  assert_exit 2 _ralph_run_uber --max-attempts 1
+  assert_eq "pi" "$(_ralph_captured_agent)" \
+    "ralph-uber sends a [cheap] item to pi, not to claude"
+  assert_eq "chat" "$(_ralph_captured_model)" \
+    "and on pi's own cheap model, not a claude model id"
+
+  # The half of the routing that is easy to get wrong: the review command is
+  # baked into the prompt before the agent is launched, so an adapter that
+  # picked the agent and the review step independently would hand pi claude's
+  # /code-review, which pi does not have.
+  assert_contains "$(_ralph_captured_prompt)" '/skill:ralph-code-review high' \
+    "and the review step in its prompt is the one pi can actually run"
+  _refute_contains "$(_ralph_captured_prompt)" '`/code-review high`' \
+    "with claude's review command nowhere in it"
+}
+
+test_ralph_uber_routes_cheap_items_to_pi() {
+  with_fixture_repo items _ralph_uber_cheap_routes_to_pi_probe
+}
+
+_ralph_uber_deep_routes_to_claude_probe() {
+  _ralph_write_plan '[deep] Redesign install.sh. Verify: ./tests/toolkit.sh'
+
+  assert_exit 2 _ralph_run_uber --max-attempts 1
+  assert_eq "claude" "$(_ralph_captured_agent)" \
+    "ralph-uber sends a [deep] item to claude"
+  assert_eq "fable" "$(_ralph_captured_model)" \
+    "on claude's own deep model"
+  assert_contains "$(_ralph_captured_prompt)" '`/code-review high`' \
+    "and the review step in its prompt is claude's"
+}
+
+test_ralph_uber_routes_deep_items_to_claude() {
+  with_fixture_repo items _ralph_uber_deep_routes_to_claude_probe
+}
+
+_ralph_uber_unmarked_routes_to_claude_probe() {
+  _ralph_write_plan 'Ordinary work on install.sh. Verify: ./tests/toolkit.sh'
+
+  assert_exit 2 _ralph_run_uber --max-attempts 1
+  assert_eq "claude" "$(_ralph_captured_agent)" \
+    "an unmarked item is standard, so ralph-uber routes it to claude"
+  assert_eq "" "$(_ralph_captured_model)" \
+    "passing no --model, which leaves claude on its own default"
+  assert_contains "$(cat .ralph/run.log)" "agent claude" \
+    "and the run log names the agent that actually ran it"
+}
+
+test_ralph_uber_routes_unmarked_items_to_claude() {
+  with_fixture_repo items _ralph_uber_unmarked_routes_to_claude_probe
+}
+
+_ralph_uber_routing_override_probe() {
+  _ralph_write_plan '[deep] Redesign install.sh. Verify: ./tests/toolkit.sh'
+
+  RALPH_UBER_AGENT_DEEP=pi assert_exit 2 _ralph_run_uber --max-attempts 1
+  assert_eq "pi" "$(_ralph_captured_agent)" \
+    "a tier can be routed to the other agent without editing the wrapper"
+  assert_eq "coder-pro" "$(_ralph_captured_model)" \
+    "and the model follows the agent it was routed to"
+
+  # An unroutable value must stop the run rather than fall through to whichever
+  # agent's bindings happened to be last.
+  RALPH_UBER_AGENT_DEEP=gemini assert_exit 1 _ralph_run_uber --max-attempts 1
+  assert_contains "$(last_output)" "must be 'claude' or 'pi'" \
+    "and an agent neither wrapper implements is refused, not guessed at"
+}
+
+test_ralph_uber_routing_is_overridable_and_validated() {
+  with_fixture_repo items _ralph_uber_routing_override_probe
+}
+
+_ralph_uber_distills_per_agent_probe() {
+  # Misrouting distil is the one dispatch that fails silently: the two transcript
+  # formats share no keys, so the wrong parser yields an empty .log and an
+  # attempt whose readable record is just the fallback line.
+  local log=".ralph/logs/item-001-attempt-1.log"
+
+  _ralph_write_plan '[cheap] Tidy install.sh. Verify: ./tests/toolkit.sh'
+  assert_exit 2 _ralph_run_uber --max-attempts 1
+  assert_contains "$(cat "$log")" "PI FINAL MESSAGE" \
+    "a pi-routed item is distilled with pi's parser, not claude's"
+
+  _ralph_write_plan '[deep] Redesign install.sh. Verify: ./tests/toolkit.sh'
+  assert_exit 2 _ralph_run_uber --max-attempts 1
+  assert_contains "$(cat "$log")" "CLAUDE FINAL MESSAGE" \
+    "and a claude-routed item with claude's"
+}
+
+test_ralph_uber_distills_each_item_with_its_own_agent_parser() {
+  with_fixture_repo items _ralph_uber_distills_per_agent_probe
+}
+
 # --- add new test_* functions above this line ------------------------------
 
 # ---------------------------------------------------------------------------
+# SPEC.md §6's `filenames`, and `extensions` reaching YAML.
+#
+# `extensions` cannot name a Dockerfile: in_scope_extension reads a dotless
+# basename as having no extension and rules it out, so before `filenames` there
+# was no okf.json that could bring one into scope. YAML needed no code at all —
+# only a default list that mentions it.
+_okf_containers_probe() {
+  # The fixture's own okf.json: py by extension, the two container files by name.
+  _okf_assert_listing 'src/Containerfile
+src/Dockerfile
+src/thing.py' \
+    "okf list reaches a Dockerfile through filenames" list
+
+  # Exact basenames. `Dockerfile.dev` is a different name and stays out;
+  # `web.Dockerfile` has the extension `Dockerfile` and needs no filenames entry.
+  printf '%s\n' '{"bundle": {"include": ["src/**"], "exclude": [],
+    "extensions": ["Dockerfile"], "filenames": ["Dockerfile"]}}' > okf.json
+  _okf_assert_listing 'src/Dockerfile
+src/web.Dockerfile' \
+    "filenames matches a whole basename, not a prefix" list
+
+  # An explicitly empty list widens nothing. This is the opposite of
+  # `extensions`, where empty means no restriction: filenames only ever adds.
+  printf '%s\n' '{"bundle": {"include": ["src/**"], "exclude": [],
+    "extensions": ["py"], "filenames": []}}' > okf.json
+  _okf_assert_listing 'src/thing.py' \
+    "an empty filenames list adds nothing" list
+
+  # YAML is in scope on extensions alone, which is all it ever needed.
+  printf '%s\n' '{"bundle": {"include": ["deploy/**"], "exclude": [],
+    "extensions": ["yaml", "yml"]}}' > okf.json
+  _okf_assert_listing 'deploy/configmap.yaml
+deploy/values.yml' \
+    "okf list reaches YAML through extensions" list
+}
+
+test_okf_list_scopes_container_files_and_yaml() {
+  with_fixture_repo containers _okf_containers_probe
+}
+
 # Runner
 # ---------------------------------------------------------------------------
 

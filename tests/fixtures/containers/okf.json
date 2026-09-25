@@ -1,0 +1,10 @@
+{
+  "okf_version": "0.2",
+  "bundle": {
+    "root": ".",
+    "include": ["src/**", "deploy/**"],
+    "exclude": [],
+    "extensions": ["py"],
+    "filenames": ["Dockerfile", "Containerfile"]
+  }
+}

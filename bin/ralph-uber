@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# ralph-uber — the ralph loop with the step agent chosen per item, by tier.
+#
+# ralph-claude and ralph-pi each drive one agent and use the tier only to pick a
+# model within it. This adapter uses the tier to pick the AGENT: cheap items go
+# to pi, standard and deep items go to claude. Everything else about a run is
+# unchanged — one PLAN.md, one loop, one review gate setting.
+#
+# The point is that "cheap" and "deep" describe the work, not a vendor. An item
+# that is mechanical does not need the strongest coding agent available, and the
+# per-item granularity ralph already has is exactly the granularity at which
+# that choice is worth making.
+#
+# HOW IT IS BUILT
+# ---------------
+# Both single-agent adapters are sourced. Each names its own behaviour
+# ralph_claude_* / ralph_pi_* and then binds the four ralph_agent_* names the
+# contract asks for; sourcing both leaves the last one's bindings in place, and
+# this file then overwrites all four with dispatchers. So the claude and pi
+# halves are used here exactly as their own wrappers use them, and neither is
+# written out a second time: a fix to how pi is invoked reaches this file for
+# free, which is the whole reason for the indirection.
+#
+# Sourcing either wrapper runs nothing — each guards ralph_main behind
+# `[ "${BASH_SOURCE[0]}" = "$0" ]`, which is false when sourced. Each also
+# sources ralph-common, which is idempotent: it defines functions and sets
+# `set -euo pipefail`, and does not run a loop of its own.
+
+# Set before the sources so neither wrapper's `: "${RALPH_PROG:=...}"` claims the
+# name, exactly as bin/ralph does it.
+RALPH_PROG="ralph-uber"
+
+# Locating the files this wrapper sources, without shelling out. tests/toolkit.sh
+# sources these wrappers on a PATH carrying nothing but bash, deliberately, so
+# that a helper reaching for a tool ralph has not declared shows up as a
+# failure rather than passing on the developer's own PATH. Parameter expansion
+# is therefore the normal path. readlink is a rescue for a hand-made symlink
+# only, and never reached by a supported install: install.sh copies bin/* onto
+# $PATH rather than symlinking it.
+_ralph_dir="${BASH_SOURCE[0]%/*}"
+[ "$_ralph_dir" = "${BASH_SOURCE[0]}" ] && _ralph_dir="."
+if [ ! -f "$_ralph_dir/ralph-claude" ] && command -v readlink > /dev/null 2>&1; then
+  _ralph_self="$(readlink -f "${BASH_SOURCE[0]}")"
+  _ralph_dir="${_ralph_self%/*}"
+fi
+# shellcheck source=/dev/null
+. "$_ralph_dir/ralph-claude"
+# shellcheck source=/dev/null
+. "$_ralph_dir/ralph-pi"
+
+# Both sources above assigned RALPH_AGENT for themselves; the last one wins, so
+# it is set here afterwards rather than before. It is a display name only — it
+# reaches --help and the run log, never a command line.
+RALPH_AGENT="uber"
+
+# The routing table, and the only thing that makes this file different from the
+# two it is built out of. Overridable per run, with `=` rather than `:=` so an
+# empty value is a real answer and not a request for the default — an empty one
+# is caught below rather than silently routing nowhere.
+: "${RALPH_UBER_AGENT_CHEAP=pi}"
+: "${RALPH_UBER_AGENT_STANDARD=claude}"
+: "${RALPH_UBER_AGENT_DEEP=claude}"
+
+# Which agent runs one tier. Every dispatcher below goes through this, so the
+# four contract functions cannot disagree with each other about an item: the
+# review step baked into the prompt is written for the same agent that is handed
+# the prompt, and the transcript is distilled by the same agent's parser.
+ralph_uber_agent_for_tier() { # $1 = cheap|standard|deep
+  local agent
+  case "$1" in
+    cheap)    agent="$RALPH_UBER_AGENT_CHEAP" ;;
+    standard) agent="$RALPH_UBER_AGENT_STANDARD" ;;
+    deep)     agent="$RALPH_UBER_AGENT_DEEP" ;;
+    *)        agent="$RALPH_UBER_AGENT_STANDARD" ;;
+  esac
+  case "$agent" in
+    claude|pi) printf '%s' "$agent" ;;
+    # Loud, because the alternative is an attempt that runs on whichever agent
+    # happened to be bound last and reports nothing odd about it.
+    *)
+      echo "ralph: RALPH_UBER_AGENT_* must be 'claude' or 'pi' (tier $1 asked for: '${agent:-<empty>}')" >&2
+      exit 1
+      ;;
+  esac
+}
+
+ralph_agent_invoke() { # $1 = prompt, $2 = jsonl path, $3 = tier
+  case "$(ralph_uber_agent_for_tier "$3")" in
+    pi) ralph_pi_invoke "$1" "$2" ;;
+    *)  ralph_claude_invoke "$1" "$2" ;;
+  esac
+}
+
+# Distilled by the agent that wrote the transcript: the two formats do not
+# overlap (claude ends on a `result` event, pi on `agent_end`), so the wrong
+# parser here yields an empty .log and a silently useless record of the attempt.
+ralph_agent_distill() { # $1 = jsonl path, $2 = tier
+  case "$(ralph_uber_agent_for_tier "$2")" in
+    pi) ralph_pi_distill "$1" ;;
+    *)  ralph_claude_distill "$1" ;;
+  esac
+}
+
+# The review command differs by agent — claude has /code-review built in, pi runs
+# the ralph-code-review skill this toolkit ships. The gate MODE is the user's and
+# is passed through untouched; only its spelling is the agent's.
+ralph_agent_review_step() { # $1 = full|light|none, $2 = tier
+  case "$(ralph_uber_agent_for_tier "$2")" in
+    pi) ralph_pi_review_step "$1" ;;
+    *)  ralph_claude_review_step "$1" ;;
+  esac
+}
+
+# The model comes from whichever agent is about to run, so a tier routed to pi
+# gets a pi model pattern and never a claude model id.
+ralph_agent_model_for_tier() { # $1 = cheap|standard|deep
+  case "$(ralph_uber_agent_for_tier "$1")" in
+    pi) ralph_pi_model_for_tier "$1" ;;
+    *)  ralph_claude_model_for_tier "$1" ;;
+  esac
+}
+
+# What ralph's own log calls the agent behind one item. The default answer is
+# RALPH_AGENT, which here would be "uber" — true but useless in a mixed run,
+# where which of the two actually ran an item is the thing worth recording.
+ralph_agent_label_for_tier() { # $1 = cheap|standard|deep
+  ralph_uber_agent_for_tier "$1"
+}
+
+ralph_agent_usage_notes() {
+  local tier agent model dir
+  printf '\nStep agent notes (uber):\n'
+  printf '  Item routing        the agent is chosen per item, by tier:\n'
+  for tier in cheap standard deep; do
+    agent="$(ralph_uber_agent_for_tier "$tier")"
+    case "$agent" in
+      pi) model="$(ralph_pi_model_for_tier "$tier")" ;;
+      *)  model="$(ralph_claude_model_for_tier "$tier")" ;;
+    esac
+    printf '                      %-8s -> %-6s %s\n' \
+      "$tier" "$agent" "${model:-(that agent default)}"
+  done
+  cat <<'EOF'
+                      Route a tier elsewhere with RALPH_UBER_AGENT_CHEAP,
+                      _STANDARD or _DEEP (each 'claude' or 'pi'); choose the
+                      models with the RALPH_CLAUDE_MODEL_* / RALPH_PI_MODEL_*
+                      variables the single-agent wrappers document.
+  Review gate         spelled by whichever agent runs the item — claude's
+                      `/code-review`, or pi's `/skill:ralph-code-review`. The
+                      MODE you pass applies to both.
+                      /code-review's `ultra` level is user-triggered and
+                      billed, and is never launched from here.
+  --model             pins every item to one model name, across BOTH agents.
+                      That name has to be one they both accept, which in
+                      general it is not — prefer the per-agent variables.
+EOF
+  dir="$(ralph_pi_skill_dir)"
+  if [ -n "$dir" ]; then
+    printf '  Review skill (pi)   %s\n' "$dir"
+  else
+    printf '  Review skill (pi)   NOT FOUND — pi-routed items get no review gate.\n'
+  fi
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  ralph_main "$@"
+fi
