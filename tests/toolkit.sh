@@ -15285,7 +15285,9 @@ _ralph_isolated_run_probe() { # $1 = wrapper under bin/
     "the item is checked off on the branch"
 
   # The worktree: registered, under RALPH_WORKTREES_DIR, holding the run log.
-  wt="$(git worktree list --porcelain | sed -n 's/^worktree //p' | grep -F "$HARNESS_STATE/worktrees/" | head -n 1)"
+  # Matched on the canonical path: `git worktree list` prints /private/var/…
+  # on macOS where $HARNESS_STATE says /var/…, and grep -F compares strings.
+  wt="$(git worktree list --porcelain | sed -n 's/^worktree //p' | grep -F "$(cd "$HARNESS_STATE" && pwd -P)/worktrees/" | head -n 1)"
   if [ -n "$wt" ] && [ -d "$wt" ]; then
     _pass "the run's worktree is registered under RALPH_WORKTREES_DIR"
   else
@@ -15362,6 +15364,39 @@ _ralph_uncommitted_plan_probe() {
 
 test_ralph_refuses_an_isolated_run_on_an_uncommitted_plan() {
   with_fixture_repo items _ralph_uncommitted_plan_probe
+}
+
+# A run that dies after its worktree exists still says where the worktree is.
+# The item is [mvn] with no `then=`, which the field parser rejects with a bare
+# `exit 1` from inside the loop — past `git worktree add`, before any item runs.
+_ralph_abort_after_worktree_probe() {
+  local out branch wt
+  _ralph_write_plan '[mvn] Broken :: goal=org.example:demo:1.0:run'
+  git add PLAN.md && git commit -q -m "fixture: a malformed plan"
+
+  assert_exit 1 _ralph_run_isolated ralph --max-attempts 1
+  out="$(last_output)"
+  assert_contains "$out" "missing required 'then=' field" \
+    "the malformed item is what stopped the run"
+  if [ -e "$HARNESS_STATE/ralph-mvn" ]; then
+    _fail "the run stopped before running the item" "mvn was invoked"
+  else
+    _pass "the run stopped before running the item"
+  fi
+
+  branch="$(git for-each-ref --format='%(refname:short)' 'refs/heads/ralph/')"
+  wt="$(git worktree list --porcelain | sed -n 's/^worktree //p' | grep -F "$(cd "$HARNESS_STATE" && pwd -P)/worktrees/" | head -n 1)"
+  assert_contains "$out" "git push -u origin $branch" \
+    "an aborted run still names the branch to open a pull request from"
+  assert_contains "$out" "git worktree remove $wt" \
+    "an aborted run still says how to remove the worktree"
+
+  git worktree remove --force "$wt" 2> /dev/null || rm -rf "$wt"
+  return 0
+}
+
+test_ralph_says_where_the_worktree_is_when_a_run_aborts() {
+  with_fixture_repo items _ralph_abort_after_worktree_probe
 }
 
 # --here is the old behaviour, exactly: the checkout's branch, the checkout's

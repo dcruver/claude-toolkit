@@ -667,28 +667,47 @@ ralph_enter_worktree() {
     echo "ralph: git worktree add failed for branch $RALPH_BRANCH at $RALPH_WORKTREE — see git's message above." >&2
     exit 1
   fi
+  # The worktree exists from here on, so from here on every exit says where
+  # it is — see ralph_worktree_note.
+  trap ralph_worktree_note EXIT
   cd "$RALPH_WORKTREE" || {
     echo "ralph: cannot enter the run's worktree at $RALPH_WORKTREE" >&2
     exit 1
   }
+  # Canonical, so the path the run prints is the one `git worktree list`
+  # prints: on macOS a $TMPDIR-style RALPH_WORKTREES_DIR under /var is really
+  # /private/var, and the two do not compare equal as strings.
+  RALPH_WORKTREE="$(pwd -P)"
   PLAN="$plan_rel"
 }
 
-# Ends the run: says where the work is when it lives in a worktree, then exits
-# with the status given. Every exit the loop takes after its worktree exists
-# goes through here, so a run never finishes without telling the user which
-# branch to open a pull request from.
+# Says where the work is when it lives in a worktree. Installed as the EXIT
+# trap the moment `git worktree add` succeeds, so every way the run can end
+# after that — a clean finish, a bare `exit 1` on a malformed item, a `set -e`
+# abort, a signal — tells the user which branch to open a pull request from.
+# Under --here RALPH_WORKTREE is empty and this prints nothing.
+#
+# No tee and no pipeline: a trap that fails under `set -o pipefail` would
+# replace the run's real exit status with its own.
+ralph_worktree_note() {
+  local note
+  [[ -n "$RALPH_WORKTREE" ]] || return 0
+  printf -v note '%s\n' \
+    "ralph: this run's work is on branch $RALPH_BRANCH (cut from $RALPH_BASE), in the worktree" \
+    "ralph:   $RALPH_WORKTREE" \
+    "ralph: Your checkout was not touched. To open a pull request:" \
+    "ralph:   git push -u origin $RALPH_BRANCH" \
+    "ralph: Logs are in $RALPH_WORKTREE/.ralph/. When the branch is merged or abandoned:" \
+    "ralph:   git worktree remove $RALPH_WORKTREE"
+  printf '%s' "$note"
+  [[ -n "${RUN_LOG:-}" ]] && printf '%s' "$note" >> "$RUN_LOG" 2> /dev/null
+  return 0
+}
+
+# Ends the run with the status given. The worktree note is the EXIT trap's
+# job, so this is only an exit — kept as a name so the loop's endings read as
+# endings.
 ralph_finish() { # $1 = exit status
-  if [[ -n "$RALPH_WORKTREE" ]]; then
-    cat <<EOF | tee -a "$RUN_LOG"
-ralph: this run's work is on branch $RALPH_BRANCH (cut from $RALPH_BASE), in the worktree
-ralph:   $RALPH_WORKTREE
-ralph: Your checkout was not touched. To open a pull request:
-ralph:   git push -u origin $RALPH_BRANCH
-ralph: Logs are in $RALPH_WORKTREE/.ralph/. When the branch is merged or abandoned:
-ralph:   git worktree remove $RALPH_WORKTREE
-EOF
-  fi
   exit "$1"
 }
 
@@ -747,7 +766,9 @@ if [[ "$RUN_HERE" != "true" ]]; then
 fi
 
 mkdir -p .ralph/logs
-RUN_LOG=".ralph/run.log"
+# Absolute, so a note written from the EXIT trap lands in this run's log even
+# if a step changed directory before it failed.
+RUN_LOG="$PWD/.ralph/run.log"
 
 if [[ -n "$RALPH_WORKTREE" ]]; then
   echo "ralph: isolated run — branch $RALPH_BRANCH (from $RALPH_BASE) in worktree $RALPH_WORKTREE. Pass --here to run in the checkout instead." | tee -a "$RUN_LOG"
@@ -935,7 +956,10 @@ while true; do
 
       if "${MVN_CMD[@]}" >> "$LOG_FILE" 2>&1 && bash -c "$MVN_THEN" >> "$LOG_FILE" 2>&1; then
         LINE_NUM=$(next_item_line_number)
-        sed -i "${LINE_NUM}s/^\([[:space:]]*-[[:space:]]\)\[ \]/\1[x]/" "$PLAN"
+        # Not `sed -i`: BSD sed (macOS) takes the word after -i as a backup
+        # suffix, so `sed -i "$expr" "$PLAN"` there reads $PLAN as the script
+        # and fails. A rewrite through a temp file is the same on both seds.
+        sed "${LINE_NUM}s/^\([[:space:]]*-[[:space:]]\)\[ \]/\1[x]/" "$PLAN" > "$PLAN.tmp" && mv "$PLAN.tmp" "$PLAN"
         git add -A
         git commit -q -m "ralph: [mvn] $MVN_DESC (no LLM turn)"
         echo "ralph: item done on attempt $attempt/$MAX_ATTEMPTS (mvn, no LLM) — $(git log -1 --format='%h %s')" | tee -a "$RUN_LOG"
