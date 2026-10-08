@@ -320,7 +320,9 @@ git worktree for it beside the checkout (`<checkout>.ralph/`, or `$RALPH_WORKTRE
 and does all its work there. The checkout keeps its branch, its working tree and its
 untracked files. The run ends by naming the branch, so the result is always a pull
 request and never a surprise commit on `main`. Because the worktree starts from `HEAD`,
-an uncommitted plan is refused rather than copied in. Attempts share git history within
+a tracked plan with uncommitted edits is refused. A plan git has never seen (and the
+`SPEC.md` beside it) is copied into the worktree and kept out of the run's commits, so you
+need not commit run state to your branch; items are checked off in the worktree's copy. Attempts share git history within
 a run, not across runs. `--here` opts out and runs the loop in the checkout.
 
 A `[mvn]` item type lets `/ralph-spec` hand off deterministic Maven-plugin work

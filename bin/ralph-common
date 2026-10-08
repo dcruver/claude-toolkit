@@ -133,8 +133,10 @@ HEAD, adds a git worktree for it beside this checkout (<checkout>.ralph/, or
 $RALPH_WORKTREES_DIR), and does all its work there. This checkout is never
 touched — not its branch, its working tree, or its untracked files — and the
 run ends by naming the branch to open a pull request from. Because the
-worktree starts from HEAD, the plan must be committed first; an uncommitted
-plan is refused rather than copied. Every run is a new branch: attempts share
+worktree starts from HEAD, a plan that is tracked must have no uncommitted
+edits (a modified one is refused). A plan git has never seen is fine: it, and
+SPEC.md beside it, are copied into the worktree and kept out of the run's
+commits, and items are checked off in the worktree's copy. Every run is a new branch: attempts share
 git history within a run, not across runs. --here runs the loop in this
 checkout instead, which is how earlier versions always ran.
 
@@ -603,10 +605,11 @@ concept_refresh_prompt() { # $1 = the model ralph was given, empty when unset
 # .ralph/, every git command, and the step agents themselves act on their cwd —
 # so isolation is a `cd` before the loop starts, and nothing after it changes.
 #
-# The worktree starts from HEAD, which is the point: an uncommitted plan, or
-# an uncommitted anything, is not part of the run. That is why an isolated run
-# insists the plan is committed rather than copying it across — a copy would
-# hide exactly the drift the isolation exists to keep out.
+# The worktree starts from HEAD, which is the point: uncommitted changes are
+# not part of the run. The one exception is a plan (and its SPEC.md) that git
+# has never tracked — run state many people keep out of their branch — which is
+# copied across, see ralph_carry_untracked. A tracked plan with edits is still
+# refused: a copy would hide exactly the drift the isolation exists to keep out.
 #
 # --here is the opt-out: the loop runs in the current checkout on the current
 # branch, which is how ralph always ran before this section existed.
@@ -632,19 +635,25 @@ ralph_worktrees_dir() { # $1 = the checkout's top-level directory
 # RALPH_WORKTREE / RALPH_BRANCH / RALPH_BASE describe the run. Exits 1 with a
 # reason when the plan is not committed or git cannot add the worktree.
 ralph_enter_worktree() {
-  local toplevel plan_rel stem stamp worktrees_dir
+  local toplevel plan_rel plan_abs stem stamp worktrees_dir carry_plan=false
 
-  if ! git ls-files --error-unmatch -- "$PLAN" > /dev/null 2>&1; then
-    echo "ralph: $PLAN is not committed. An isolated run works in a fresh worktree cut from HEAD, so it can only see a plan that is in git — commit $PLAN first, or pass --here to run in this checkout instead." >&2
-    exit 1
-  fi
-  if ! git diff --quiet HEAD -- "$PLAN" 2> /dev/null; then
-    echo "ralph: $PLAN has uncommitted changes. An isolated run works in a fresh worktree cut from HEAD and would not see them — commit $PLAN first, or pass --here to run in this checkout instead." >&2
-    exit 1
-  fi
+  toplevel="$(cd "$(git rev-parse --show-toplevel)" && pwd -P)" || exit 1
 
-  toplevel="$(git rev-parse --show-toplevel)" || exit 1
-  plan_rel="$(git ls-files --full-name -- "$PLAN")" || exit 1
+  # A plan that git has never seen is carried into the worktree as a copy (see
+  # ralph_carry_untracked) rather than refused: plans are run state, and many
+  # people keep them out of their branch on purpose. A TRACKED plan with edits
+  # is still refused — the worktree would silently run the committed version.
+  if git ls-files --error-unmatch -- "$PLAN" > /dev/null 2>&1; then
+    if ! git diff --quiet HEAD -- "$PLAN" 2> /dev/null; then
+      echo "ralph: $PLAN has uncommitted changes. An isolated run works in a fresh worktree cut from HEAD and would not see them — commit $PLAN first, or pass --here to run in this checkout instead." >&2
+      exit 1
+    fi
+    plan_rel="$(git ls-files --full-name -- "$PLAN")" || exit 1
+  else
+    plan_abs="$(cd "$(dirname "$PLAN")" && pwd -P)/$(basename "$PLAN")"
+    plan_rel="${plan_abs#"$toplevel"/}"
+    carry_plan=true
+  fi
   RALPH_BASE="$(git rev-parse --abbrev-ref HEAD 2> /dev/null || echo HEAD)"
   [[ "$RALPH_BASE" == "HEAD" ]] && RALPH_BASE="$(git rev-parse --short HEAD)"
 
@@ -670,6 +679,9 @@ ralph_enter_worktree() {
   # The worktree exists from here on, so from here on every exit says where
   # it is — see ralph_worktree_note.
   trap ralph_worktree_note EXIT
+  if [[ "$carry_plan" == "true" ]]; then
+    ralph_carry_untracked "$plan_abs" "$toplevel"
+  fi
   cd "$RALPH_WORKTREE" || {
     echo "ralph: cannot enter the run's worktree at $RALPH_WORKTREE" >&2
     exit 1
@@ -679,6 +691,33 @@ ralph_enter_worktree() {
   # /private/var, and the two do not compare equal as strings.
   RALPH_WORKTREE="$(pwd -P)"
   PLAN="$plan_rel"
+}
+
+# Copies a plan git has never seen, and the SPEC.md beside it when that is
+# untracked too, into the run's worktree, at the same path relative to the
+# repo root. Neither file is committed: unless the checkout already ignores a
+# file, its path is added to the repo's info/exclude so the run's `git add -A`
+# and the step agent's commits leave it alone. (info/exclude is shared by every
+# worktree of the repo, so this also hides the file in the checkout; a file the
+# checkout already ignores, or that is tracked, is not touched.) The copy is the
+# run's state: items are checked off there, and the checkout's plan stays as
+# it was.
+ralph_carry_untracked() { # $1 = absolute plan path, $2 = the checkout's canonical top-level
+  local file rel exclude
+  exclude="$(cd "$2" && git rev-parse --git-path info/exclude)"
+  [[ "$exclude" == /* ]] || exclude="$2/$exclude"
+  for file in "$1" "$(dirname "$1")/SPEC.md"; do
+    [[ -f "$file" ]] || continue
+    git ls-files --error-unmatch -- "$file" > /dev/null 2>&1 && continue
+    rel="${file#"$2"/}"
+    mkdir -p "$RALPH_WORKTREE/$(dirname "$rel")"
+    cp "$file" "$RALPH_WORKTREE/$rel"
+    if ! git check-ignore -q -- "$file" 2> /dev/null; then
+      mkdir -p "$(dirname "$exclude")"
+      grep -qxF "/$rel" "$exclude" 2> /dev/null || printf '/%s\n' "$rel" >> "$exclude"
+    fi
+    echo "ralph: $rel is not committed — copied it into the worktree and kept it out of the run's commits. Check-offs land in the worktree's copy."
+  done
 }
 
 # Says where the work is when it lives in a worktree. Installed as the EXIT
@@ -961,7 +1000,10 @@ while true; do
         # and fails. A rewrite through a temp file is the same on both seds.
         sed "${LINE_NUM}s/^\([[:space:]]*-[[:space:]]\)\[ \]/\1[x]/" "$PLAN" > "$PLAN.tmp" && mv "$PLAN.tmp" "$PLAN"
         git add -A
-        git commit -q -m "ralph: [mvn] $MVN_DESC (no LLM turn)"
+        # --allow-empty: with a plan kept out of git (see ralph_carry_untracked) the
+        # check-off is not a change, and a plugin that edits nothing still gets
+        # its commit, which is what marks the item done in the history.
+        git commit -q --allow-empty -m "ralph: [mvn] $MVN_DESC (no LLM turn)"
         echo "ralph: item done on attempt $attempt/$MAX_ATTEMPTS (mvn, no LLM) — $(git log -1 --format='%h %s')" | tee -a "$RUN_LOG"
         ITEM_SUCCEEDED=true
         ITEMS_DONE=$((ITEMS_DONE + 1))

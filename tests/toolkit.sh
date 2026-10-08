@@ -15325,25 +15325,17 @@ test_ralph_uber_isolates_a_run_the_same_way() {
   with_fixture_repo items _ralph_isolated_run_probe ralph-uber
 }
 
-# The worktree is cut from HEAD, so a plan that is not in HEAD would not be in
-# the run at all. Refused before anything is created, on both the untracked
-# and the modified spellings.
-_ralph_uncommitted_plan_probe() {
-  local out
+# The worktree is cut from HEAD, so a TRACKED plan with edits would silently
+# run its committed version: refused before anything is created.
+_ralph_modified_plan_probe() {
   _ralph_write_plan '[mvn] Never runs :: goal=org.example:demo:1.0:run then=true'
-
-  assert_exit 1 _ralph_run_isolated ralph --max-attempts 1
-  out="$(last_output)"
-  assert_contains "$out" "PLAN.md is not committed" \
-    "an untracked plan is refused by name"
-  assert_contains "$out" "--here" \
-    "the refusal points at --here as the way to run anyway"
-
   git add PLAN.md && git commit -q -m "fixture: plan"
   printf -- '- [ ] one more\n' >> PLAN.md
   assert_exit 1 _ralph_run_isolated ralph --max-attempts 1
   assert_contains "$(last_output)" "PLAN.md has uncommitted changes" \
-    "a modified plan is refused by name"
+    "a modified tracked plan is refused by name"
+  assert_contains "$(last_output)" "--here" \
+    "the refusal points at --here as the way to run anyway"
 
   assert_eq "" "$(git for-each-ref --format='%(refname:short)' 'refs/heads/ralph/')" \
     "a refused run cuts no branch"
@@ -15362,8 +15354,44 @@ _ralph_uncommitted_plan_probe() {
   return 0
 }
 
-test_ralph_refuses_an_isolated_run_on_an_uncommitted_plan() {
-  with_fixture_repo items _ralph_uncommitted_plan_probe
+test_ralph_refuses_an_isolated_run_on_a_modified_tracked_plan() {
+  with_fixture_repo items _ralph_modified_plan_probe
+}
+
+# A plan git has never seen is run state, not something to refuse: it is copied
+# into the worktree, checked off there, and never committed to the run's branch.
+_ralph_untracked_plan_probe() {
+  local out branch wt
+  _ralph_write_plan '[mvn] Untracked plan :: goal=org.example:demo:1.0:run then=true'
+  printf '# design\n' > SPEC.md
+
+  assert_exit 0 _ralph_run_isolated ralph --max-attempts 1
+  out="$(last_output)"
+  assert_contains "$out" "PLAN.md is not committed — copied it into the worktree" \
+    "an untracked plan is carried in, and the run says so"
+
+  branch="$(git for-each-ref --format='%(refname:short)' 'refs/heads/ralph/')"
+  wt="$(git worktree list --porcelain | sed -n 's/^worktree //p' | grep -F "$(cd "$HARNESS_STATE" && pwd -P)/worktrees/" | head -n 1)"
+  assert_contains "$(cat "$wt/PLAN.md")" '- [x] [mvn] Untracked plan' \
+    "the item is checked off in the worktree's copy"
+  assert_contains "$(cat PLAN.md)" '- [ ] [mvn] Untracked plan' \
+    "the checkout's plan is left unchecked"
+  assert_contains "$(cat "$wt/SPEC.md")" '# design' \
+    "an untracked SPEC.md is carried in beside the plan"
+  if git cat-file -e "$branch:PLAN.md" 2> /dev/null || git cat-file -e "$branch:SPEC.md" 2> /dev/null; then
+    _fail "neither file is committed to the run's branch" "$(git ls-tree -r --name-only "$branch")"
+  else
+    _pass "neither file is committed to the run's branch"
+  fi
+  assert_contains "$(git log -1 --format=%s "$branch")" 'ralph: [mvn] Untracked plan' \
+    "the item still gets its commit on the branch"
+
+  git worktree remove --force "$wt" 2> /dev/null || rm -rf "$wt"
+  return 0
+}
+
+test_ralph_carries_an_untracked_plan_into_the_worktree() {
+  with_fixture_repo items _ralph_untracked_plan_probe
 }
 
 # A run that dies after its worktree exists still says where the worktree is.
