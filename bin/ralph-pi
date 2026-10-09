@@ -69,7 +69,9 @@ ralph_pi_invoke() { # $1 = prompt, $2 = jsonl path
   local dir
   dir="$(ralph_pi_skill_dir)"
   [ -n "$dir" ] && skill_flag=(--skill "$dir")
-  pi -p --mode json -a "${MODEL_FLAG[@]}" "${skill_flag[@]}" -- "$1" \
+  # ${a[@]+"${a[@]}"}: both arrays can be empty, which macOS bash 3.2 treats as
+  # unset under set -u (see ralph-claude).
+  pi -p --mode json -a ${MODEL_FLAG[@]+"${MODEL_FLAG[@]}"} ${skill_flag[@]+"${skill_flag[@]}"} -- "$1" \
     > "$2" 2> "$2.stderr"
 }
 

@@ -37,7 +37,9 @@ RALPH_AGENT="claude"
 # and neither agent's behaviour has to be written out a second time.
 
 ralph_claude_invoke() { # $1 = prompt, $2 = jsonl path
-  claude -p "$1" --permission-mode auto "${MODEL_FLAG[@]}" \
+  # ${a[@]+"${a[@]}"}, not "${a[@]}": macOS bash 3.2 treats an empty array as
+  # unset under set -u, and MODEL_FLAG is empty for an item on the agent default.
+  claude -p "$1" --permission-mode auto ${MODEL_FLAG[@]+"${MODEL_FLAG[@]}"} \
     --output-format stream-json --verbose \
     > "$2" 2> "$2.stderr"
 }
